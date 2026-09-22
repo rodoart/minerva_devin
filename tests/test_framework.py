@@ -84,9 +84,9 @@ class TestCachedProperty:
             def value(self):
                 return 7
         c = C()
-        assert "value" not in c.__dict__ or c.__dict__.get("value") != 7
+        assert "_value_cache" not in c.__dict__
         _ = c.value
-        assert c.__dict__["value"] == 7
+        assert c.__dict__["_value_cache"] == 7
 
 
 # ----------------------------------------------------------------------------
@@ -407,7 +407,7 @@ class TestCastToSchema:
         schema = StructType([StructField("num", StringType())])
         result = ppf.cast_to_schema(schema, df)
         assert result.schema["num"].dataType == StringType()
-        assert result.schema["txt"].dataType == IntegerType()   # intacta
+        assert result.schema["txt"].dataType == StringType()    # intacta (sin cast)
 
     def test_missing_column_ignored(self, spark):
         from pyspark.sql.types import StructType, StructField, StringType

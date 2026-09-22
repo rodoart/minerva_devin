@@ -20,6 +20,7 @@ from pyspark.sql.types import  StringType
 # Custom
 # ------------------------------------------------------------------------
 import libs.framework as ppf
+from libs.functions.aggregations import resolve_group_by_expressions
 import config.graph_making.ceps.group_by as ccgb
 import pipelines.graph_making.group_by as p_gm_gb
 
@@ -61,16 +62,8 @@ class CepsGroupBySubStep(p_gm_gb.StandardGroupBySubStep):
         missing_treatment: DataFrame = self.missing_treatment
         # GROUP_TXN_AGGREGATIONS son nombres "{func}_{variable}" -> Column
         # vía GROUP_BY_TXN_FEATURES (prefijo de función más largo primero).
-        aggregations = []
-        for agg_name in ccgb.GROUP_TXN_AGGREGATIONS:
-            for func_name in sorted(ccgb.GROUP_BY_TXN_FEATURES, key=len, reverse=True):
-                if agg_name.startswith(f"{func_name}_"):
-                    variable = agg_name[len(func_name) + 1:]
-                    aggregations.append(
-                        ccgb.GROUP_BY_TXN_FEATURES[func_name](variable).alias(agg_name))
-                    break
-            else:
-                raise ValueError(f"Unknown txn aggregation: {agg_name}")
+        aggregations = resolve_group_by_expressions(
+            ccgb.GROUP_TXN_AGGREGATIONS, ccgb.GROUP_BY_TXN_FEATURES)
         #
         group_by_txn:DataFrame = (self.standard_group_by_txn(
             input_df=missing_treatment,

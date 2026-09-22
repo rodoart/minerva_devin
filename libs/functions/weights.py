@@ -41,3 +41,46 @@ def get_weight(weights_column:Union[str, Column], weight_type:str) -> Column:
     if isinstance(weights_column, str):
         weights_column = col(weights_column)
     return weights_column.getItem(weight_type)
+
+
+# Catálogo de funciones de peso estándar, seleccionables por nombre desde los
+# job configs (ver `build_weight_columns`).
+STANDARD_WEIGHT_FUNCTIONS = {
+    "column": column_weight,      # peso directo de una columna
+    "composed": composed_weight,  # media simple de varias columnas
+    "ratio": ratio_weight,        # cociente numerador/denominador (0 si den <= 0)
+}
+
+
+def build_weight_columns(
+    weight_specs:Dict[str, Union[tuple, dict]],
+    functions:Dict[str, callable] = STANDARD_WEIGHT_FUNCTIONS,
+) -> Dict[str, Column]:
+    """Resuelve una especificación declarativa de pesos en columnas.
+
+    Cada entrada del spec es `nombre_peso -> spec`, donde spec puede ser:
+      - tupla ("func", arg1, arg2, ...) -> functions["func"](arg1, arg2, ...)
+      - dict {"function": "func", "args": [a1, a2, ...]}
+
+    Args:
+        weight_specs: especificación declarativa (configurable en el job config).
+        functions: catálogo nombre_función -> callable(*args) -> Column.
+
+    Returns:
+        Dict nombre_peso -> Column, apto para `build_weights_map`.
+
+    Raises:
+        KeyError: si la función nombrada no existe en el catálogo.
+        TypeError: si el spec no es tupla ni dict.
+    """
+    weight_columns:Dict[str, Column] = {}
+    for weight_name, spec in weight_specs.items():
+        if isinstance(spec, dict):
+            func_name, args = spec["function"], list(spec.get("args", []))
+        elif isinstance(spec, tuple):
+            func_name, args = spec[0], list(spec[1:])
+        else:
+            raise TypeError(
+                f"Invalid weight spec for '{weight_name}': {spec!r}")
+        weight_columns[weight_name] = functions[func_name](*args)
+    return weight_columns

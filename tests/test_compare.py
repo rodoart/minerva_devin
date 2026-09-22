@@ -25,7 +25,7 @@ class TestRenameHelpers:
 class TestTypeCheckHelpers:
     def test_isinstance_column_string_type(self, spark):
         df = spark.createDataFrame([(1, "x", 1.5)], ["num", "txt", "flt"])
-        assert DifferenceDataFrame.isinstance_column_string_type(df, "num", "int")
+        assert DifferenceDataFrame.isinstance_column_string_type(df, "num", "long")
         assert DifferenceDataFrame.isinstance_column_string_type(df, "txt", "string")
         assert DifferenceDataFrame.isinstance_column_string_type(df, "flt", ["int", "double"])
         assert not DifferenceDataFrame.isinstance_column_string_type(df, "num", "string")
@@ -101,7 +101,7 @@ class TestDifferenceDataFrame:
             DifferenceDataFrame(df1, df2, "id", tol=0.01)
 
     def test_null_id_raises(self, spark):
-        df1 = spark.createDataFrame([(None, 10.0)], ["id", "v"])
+        df1 = spark.createDataFrame([(None, 10.0)], "id INT, v DOUBLE")
         df2 = spark.createDataFrame([(1, 10.0)], ["id", "v"])
         with pytest.raises(Exception):
             DifferenceDataFrame(df1, df2, "id", tol=0.01)

@@ -8,8 +8,8 @@ Version: 1.0
 
 from pyspark.sql import DataFrame, Column
 from pyspark.sql.functions import col, coalesce, lit, when, abs as ps_abs
-from .pytest.quality import assertColumnHasNoDuplicates, assertColumnHasNoNulls
-from .pytest.schemas import assertSchemasEqual
+from .testing.quality import assertColumnHasNoDuplicates, assertColumnHasNoNulls
+from .testing.schemas import assertSchemasEqual
 from typing import Optional, Union, List, Callable, Any
 from itertools import chain
 

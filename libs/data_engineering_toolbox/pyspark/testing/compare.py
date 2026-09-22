@@ -16,6 +16,6 @@ def assertDataFrameEqual(df1: DataFrame, df2: DataFrame, id_column, tol: Optiona
     """
     # Verificar que los esquemas sean iguales
     difference_object = DifferenceDataFrame(df1, df2, id_column, tol)
-    if difference_object.difference().count() > 0:
+    if difference_object.difference.count() > 0:
         raise AssertionError("Los DataFrames son diferentes.")
     print("Los DataFrames son iguales dentro de la tolerancia especificada.")

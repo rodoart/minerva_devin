@@ -58,7 +58,7 @@ class CepsExtractSubStep(p_gm_sp.StandardExtractSubStep):
         """Historial CEP aplanado y rankeado, con *tfroms* calculados.
         """
         input_table_historic: DataFrame = (self.input_table_historic("s264_ceps_flattened_rank_rfc_by_cta_cases_replace")
-            .transform(self.calculate_tfroms)
+            .transform(lambda df_: self.calculate_tfroms(df_, "s264_ceps_flattened_rank_rfc_by_cta_cases_replace"))
         )
         return input_table_historic
         #

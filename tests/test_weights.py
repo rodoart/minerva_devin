@@ -8,6 +8,7 @@ from pyspark.sql.functions import col
 from libs.functions.weights import (
     column_weight, composed_weight, ratio_weight,
     build_weights_map, get_weight,
+    STANDARD_WEIGHT_FUNCTIONS, build_weight_columns,
 )
 
 pytestmark = pytest.mark.spark
@@ -16,7 +17,7 @@ pytestmark = pytest.mark.spark
 @pytest.fixture()
 def edges_df(spark):
     return spark.createDataFrame(
-        [("a", "b", 10.0, 2.0, 0.0), ("b", "c", 20.0, 4.0, 5.0)],
+        [("a", "b", 10.0, 2.0, 0.0), ("b", "c", 20.0, 4.0, 0.0)],
         ["src", "dst", "oper_mto", "count_txn", "zero"],
     )
 
@@ -112,3 +113,54 @@ class TestGetWeight:
                 {"monto": column_weight("oper_mto")}))
             .withColumn("w", get_weight("weights", "inexistente")))
         assert df.first()["w"] is None
+
+
+class TestStandardWeightFunctions:
+    def test_registry_keys(self):
+        assert set(STANDARD_WEIGHT_FUNCTIONS) == {"column", "composed", "ratio"}
+
+    def test_registry_functions_match(self):
+        assert STANDARD_WEIGHT_FUNCTIONS["column"] is column_weight
+        assert STANDARD_WEIGHT_FUNCTIONS["composed"] is composed_weight
+        assert STANDARD_WEIGHT_FUNCTIONS["ratio"] is ratio_weight
+
+
+class TestBuildWeightColumns:
+    def test_tuple_spec(self, edges_df):
+        weights = build_weight_columns({
+            "monto": ("column", "oper_mto"),
+            "mixto": ("composed", "oper_mto", "count_txn"),
+        })
+        df = (edges_df
+            .withColumn("weights", build_weights_map(weights))
+            .withColumn("monto_w", get_weight("weights", "monto"))
+            .withColumn("mixto_w", get_weight("weights", "mixto")))
+        row = df.first()
+        assert row["monto_w"] == 10.0
+        assert row["mixto_w"] == 6.0
+
+    def test_dict_spec(self, edges_df):
+        weights = build_weight_columns({
+            "ratio": {"function": "ratio", "args": ["oper_mto", "count_txn"]},
+        })
+        df = (edges_df
+            .withColumn("weights", build_weights_map(weights))
+            .withColumn("w", get_weight("weights", "ratio")))
+        assert df.first()["w"] == 5.0
+
+    def test_unknown_function_raises_key_error(self):
+        with pytest.raises(KeyError):
+            build_weight_columns({"w": ("funcion_inventada", "oper_mto")})
+
+    def test_invalid_spec_raises_type_error(self):
+        with pytest.raises(TypeError, match="Invalid weight spec"):
+            build_weight_columns({"w": "oper_mto"})
+
+    def test_custom_functions_catalog(self, edges_df):
+        from pyspark.sql.functions import lit as _lit
+        custom = {"uno": lambda: _lit(1.0)}
+        weights = build_weight_columns({"const": ("uno",)}, functions=custom)
+        df = (edges_df
+            .withColumn("weights", build_weights_map(weights))
+            .withColumn("w", get_weight("weights", "const")))
+        assert df.first()["w"] == 1.0

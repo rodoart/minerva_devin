@@ -103,7 +103,8 @@ def get_partitions_from_dataframe(df:DataFrame, partition_by:Union[str, List[str
         partition_by = [partition_by]
     # get partitions
     partitions = df.select(*partition_by).distinct().collect()
-    partitions = [partition.asDict() for partition in partitions]
+    partitions = [{key: str(value) for key, value in partition.asDict().items()}
+        for partition in partitions]
     return partitions
 
 def get_partition_hdfs_path(hdfs_path:HivePath, partition:Dict[str, str]) -> HivePath:

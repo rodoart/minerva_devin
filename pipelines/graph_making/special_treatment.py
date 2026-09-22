@@ -6,7 +6,10 @@
 # ------------------------------------------------------------------------
 # General
 # ------------------------------------------------------------------------
+from datetime import datetime
 from typing import List, Union, Dict, Any, Callable, Optional
+
+from dateutil.relativedelta import relativedelta
 
 # ------------------------------------------------------------------------
 # Pyspark
@@ -141,13 +144,32 @@ class StandardExtractSubStep(SubStep):
         #
         return result
         #
-    def calculate_tfroms(self, df:DataFrame) -> DataFrame:
-        """Añade `tfrom_months` y `tfrom_days` calculados sobre `information_date`."""
-        # TODO ADD lags
+    def calculate_tfroms(self, df:DataFrame, key:Optional[str] = None) -> DataFrame:
+        """Añade `tfrom_months` y `tfrom_days` calculados sobre `information_date`.
+
+        La fecha de referencia es el último día del mes vintage desplazada por
+        el `lag` (en meses) configurado en el input `key`, igual que en
+        `make_date_interval_with_lag_months`: lag > 0 retrasa la ventana (los
+        datos acaban `lag` meses antes del vintage). Sin `key` (o sin "lag" en
+        su config) se usa el fin del mes vintage sin desplazar.
+
+        Args:
+            df: DataFrame con la columna `information_date`.
+            key: clave de `self.input_hive` de la que tomar el "lag".
+        """
         information_date_column:str = "information_date"
+        lag:int = self.input_hive[key].get("lag", 0) if key is not None else 0
+        reference_date:str = str((
+            datetime.strptime(
+                self.parent.date_treatment["last_day_of_current_month_date_str"],
+                cj.DATE_STANDARD_FORMAT,
+            ).date() - relativedelta(months=lag)
+        ).strftime(cj.DATE_STANDARD_FORMAT))
         return (df
-            .transform(lambda df_: calculate_monthly_tfrom(df=df_,  current_date=str(self.parent.date_treatment["last_day_of_current_month_date_str"]), date_column=information_date_column))
-            .transform(lambda df_: calculate_daily_tfrom(df=df_,  current_date=self.parent.date_treatment["last_day_of_current_month_date_str"], date_column=information_date_column))
+            .transform(lambda df_: calculate_monthly_tfrom(df=df_,  current_date=reference_date, date_column=information_date_column,
+                date_format=cj.DATE_STANDARD_SPARK_FORMAT))
+            .transform(lambda df_: calculate_daily_tfrom(df=df_,  current_date=reference_date, date_column=information_date_column,
+                date_format=cj.DATE_STANDARD_SPARK_FORMAT))
         )
         #
     @staticmethod

@@ -71,7 +71,7 @@ class Step:
         self.input_parameters:Dict[str, Any] = kwargs.get('input_parameters', {})
         self.step_name = kwargs.get('step_name', self._make_step_name())  # Nombre del paso, si se proporciona
         self.output_parameters:Dict[str, Any] = {self.step_name:{}}
-        self.sqlContext:Union[SparkSession, HiveContext] = kwargs.get('sqlContext', None)
+        self.sqlContext:Union[SparkSession, HiveContext] = kwargs.get('sqlContext', getattr(self, 'sqlContext', None))
         self.tmp_paths:List[HivePath] = []
         self._decorated_cache: Dict[str, DataFrame] = {}
     #

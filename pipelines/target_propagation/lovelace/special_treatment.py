@@ -73,7 +73,7 @@ class LovelaceExtractSubStep(p_tp_st.StandardTargetPropagationExtractSubStep):
         """Histórico del target Lovelace con columnas tfrom calculadas.
         """
         input_table_historic: DataFrame = (self.input_table_historic("lovelace_target")
-            .transform(self.calculate_tfroms)
+            .transform(lambda df_: self.calculate_tfroms(df_, "lovelace_target"))
         )
         return input_table_historic
     #
