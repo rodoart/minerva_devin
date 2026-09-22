@@ -5,50 +5,27 @@
 # ----------------------------------------------------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------------------------------------------------
-from datetime import date, datetime
-from dateutil.relativedelta import relativedelta
-from dateutil.utils import today
-from concurrent.futures import ThreadPoolExecutor
-from itertools import product
-from typing import List, Union, Dict, TypeVar, Any, Tuple, Callable
-from threading import Lock
-from functools import reduce
 import logging
+from typing import List, Union, Dict
+from threading import Lock
 
 write_lock = Lock()
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Pyspark
 # ----------------------------------------------------------------------------------------------------------------------
-from pyspark.sql import DataFrame, Window, HiveContext, SparkSession, Column
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import (coalesce, col, countDistinct, lower, regexp_replace, to_date, trim,
-    udf, unix_timestamp, when, lit, size, expr, levenshtein, concat_ws, explode,
-    sum as spark_sum, desc, array_sort, array_contains, length,
-    regexp_extract, row_number, create_map, count as spark_count, max as spark_max, first,
-    min as spark_min, array, struct, array_union, upper, date_format, split, translate
-)
-from pyspark.sql.types import (StructType, StructField, StringType,
-    IntegerType, LongType, ArrayType, DateType, DoubleType, ShortType, LongType,
-    DecimalType
-)
+from pyspark.sql.functions import (col, when, lit)
+from pyspark.sql.types import StringType
 # ----------------------------------------------------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------------------------------------------------
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 
-import data_engineering_toolbox.pyspark.tools.parquet_treatment as dtb_pt_pt
-import data_engineering_toolbox.pyspark.tools.partitions_lags as dtb_pt_pl
-import data_engineering_toolbox.pyspark.tools.utils as dtb_pt_ut
 import libs.framework as ppf
 
-from config.ceps.rfc_nom_ranking import (CURP_PATTERN, RFC_FISICA_PATTERN,
-    RFC_FISICA_SIN_HOMOCLAVE_PATTERN, RFC_MORAL_PATTERN, TC_PATTERN,
-    CLABE_PATTERN, RFC_NULL_SYNONYMS, NOM_NULL_SYNONYMS,
-    RFC_CURP_KIND_PRIORITY, RFC_BY_CTA_PRIORITY_WINDOW, RFC_BY_NOM_PRIORITY_WINDOW
-)
-from config.job import DATE_STANDARD_SPARK_FORMAT, DATE_MONTH_SPARK_FORMAT
+logger = logging.getLogger(__name__)
 
 ########################################################################################################################
 # FUNCTIONS
@@ -60,8 +37,12 @@ from config.job import DATE_STANDARD_SPARK_FORMAT, DATE_MONTH_SPARK_FORMAT
 
 
 class CepsTxnReplacementStep(ppf.Step):
-    """Step orquestador del pipeline de ranking RFC/CURP por nombre y cuenta (CEP).
-    ...
+    """Step orquestador del reemplazo de RFC/CURP faltantes o inválidos en transacciones CEP.
+
+    Usa los casos de reemplazo rankeados por `CepsRfcNomRankingStep` (por cuenta
+    y por nombre) para rellenar `rfc_curp`/`rfc_curp_kind` de ordenante y
+    beneficiario, y persiste el resultado en
+    `rfc_curp_analysis_s264_ceps_replaced`.
     """
     def __init__(self,
         date_treatment: Dict[str,str],
@@ -84,11 +65,18 @@ class CepsTxnReplacementStep(ppf.Step):
         super().__init__(*args, **super_class_kwargs)
     #
     def step_action(self) -> Dict[str, dict]:
+        """Colecta el DataFrame final con RFC/CURP reemplazados (`rfc_curp_analysis_s264_ceps_replaced`)."""
         return ppf.collect_step_output(self, self.rfc_curp_analysis_s264_ceps_replaced, "rfc_curp_analysis_s264_ceps_replaced")
     #
     def standard_load_parquet_or_table(self, config_dict_key, input_or_output:str = "input") -> DataFrame:
         """Carga estándar de una tabla/parquet particionado con validación de historial.
-        ...
+
+        Args:
+            config_dict_key: Clave de la tabla dentro de `input_hive`/`output_hive`.
+            input_or_output: "input" lee de `input_hive`; otro valor usa `output_hive`.
+
+        Returns:
+            DataFrame cargado para la fecha `vintage_date` de los parámetros de entrada.
         """
         config_dict = self.input_hive if input_or_output == "input" else self.output_hive
         return ppf.standard_load_parquet_or_table(
@@ -101,16 +89,23 @@ class CepsTxnReplacementStep(ppf.Step):
     # @ppf.dynamic_unpartitioned_parquet(path_key="s264_ceps_flattened_rank_rfc_by_cta_cases_replace")
     @ppf.cached_property
     def s264_ceps_flattened_rank_rfc_by_cta_cases_replace(self) -> DataFrame:
+        """Casos de reemplazo por cuenta (parquet no particionado del pipeline de ranking)."""
         return (self.sqlContext.read.parquet(str(self.input_hive["s264_ceps_flattened_rank_rfc_by_cta_cases_replace"]["table_or_hdfs"])))
     #
     #
     # @ppf.dynamic_unpartitioned_parquet(path_key="s264_ceps_flattened_rank_rfc_by_nom_cases_replace")
     @ppf.cached_property
     def s264_ceps_flattened_rank_rfc_by_nom_cases_replace(self) -> DataFrame:
+        """Casos de reemplazo por nombre (parquet no particionado del pipeline de ranking)."""
         return (self.sqlContext.read.parquet(str(self.input_hive["s264_ceps_flattened_rank_rfc_by_nom_cases_replace"]["table_or_hdfs"])))
     #
     @ppf.cached_property
     def rfc_curp_analysis_s264_ceps(self) -> DataFrame:
+        """Análisis RFC/CURP de CEPs depurado para el reemplazo.
+
+        Elimina `tfrom` y los flags auxiliares `is_*` de ordenante/beneficiario
+        y renombra `id_kind_*` a `rfc_curp_kind_*`.
+        """
         return (self.standard_load_parquet_or_table("rfc_curp_analysis_s264_ceps", input_or_output="input")
             .drop("tfrom")
             .drop(*['is_curp_ord', 'is_rfc_fisica_ord', 'is_rfc_moral_ord',
@@ -125,6 +120,7 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacement_rfc_by_cta_id_ban_nom(self) -> DataFrame:
+        """Reemplazo prioridad 1: mejor RFC por (cta, id_ban, nom), con nombre y banco no nulos."""
         s264_ceps_flattened_rank_rfc_by_cta_cases_replace: DataFrame = self.s264_ceps_flattened_rank_rfc_by_cta_cases_replace
         return (s264_ceps_flattened_rank_rfc_by_cta_cases_replace
             .filter(col("nom").isNotNull())
@@ -137,6 +133,7 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacement_rfc_by_cta_id_ban(self) -> DataFrame:
+        """Reemplazo prioridad 2: mejor RFC por (cta, id_ban)."""
         s264_ceps_flattened_rank_rfc_by_cta_cases_replace: DataFrame = self.s264_ceps_flattened_rank_rfc_by_cta_cases_replace
         return (s264_ceps_flattened_rank_rfc_by_cta_cases_replace
             .filter(col("_rank_by_id_ban") == 1)
@@ -147,6 +144,7 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacement_rfc_by_cta(self) -> DataFrame:
+        """Reemplazo prioridad 3: mejor RFC por cuenta (`cta`)."""
         s264_ceps_flattened_rank_rfc_by_cta_cases_replace: DataFrame = self.s264_ceps_flattened_rank_rfc_by_cta_cases_replace
         return (s264_ceps_flattened_rank_rfc_by_cta_cases_replace
             .filter(col("rank_rfc_by_cta") == 1)
@@ -158,6 +156,7 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacement_rfc_by_nom_id_ban(self) -> DataFrame:
+        """Reemplazo prioridad 4: mejor RFC por (nom, id_ban), con nombre y banco no nulos."""
         s264_ceps_flattened_rank_rfc_by_nom_cases_replace: DataFrame = self.s264_ceps_flattened_rank_rfc_by_nom_cases_replace
         return (s264_ceps_flattened_rank_rfc_by_nom_cases_replace
             .filter(col("nom").isNotNull())
@@ -170,6 +169,7 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacement_rfc_by_nom(self) -> DataFrame:
+        """Reemplazo prioridad 5: mejor RFC por nombre (`nom`)."""
         s264_ceps_flattened_rank_rfc_by_nom_cases_replace: DataFrame = self.s264_ceps_flattened_rank_rfc_by_nom_cases_replace
         return (s264_ceps_flattened_rank_rfc_by_nom_cases_replace
             .filter(col("rank_rfc_by_nom") == 1)
@@ -181,6 +181,15 @@ class CepsTxnReplacementStep(ppf.Step):
     #
     @ppf.cached_property
     def replacements(self) -> Dict[str, Dict[str, Union[DataFrame, List[str]]]]:
+        """Diccionario de fuentes de reemplazo con sus claves de join.
+
+        Returns
+        -------
+        Dict[str, Dict[str, Union[DataFrame, List[str]]]]
+            Mapa nombre_fuente -> {"df": DataFrame, "join_keys": [...]}, en
+            orden de prioridad decreciente: (cta, id_ban, nom), (cta, id_ban),
+            (cta), (nom, id_ban) y (nom).
+        """
         replacement_rfc_by_cta_id_ban_nom:DataFrame = self.replacement_rfc_by_cta_id_ban_nom
         replacement_rfc_by_cta_id_ban:DataFrame = self.replacement_rfc_by_cta_id_ban
         replacement_rfc_by_cta:DataFrame = self.replacement_rfc_by_cta
@@ -209,6 +218,24 @@ class CepsTxnReplacementStep(ppf.Step):
         }
     #
     def replace_rfc_with_ceps_ranked(self, input_df:DataFrame) -> DataFrame:
+        """Sustituye RFC/CURP nulos o inválidos usando las fuentes de reemplazo priorizadas.
+
+        Para cada lado de la transacción ("ben", "ord") recorre
+        `self.replacements` en orden, hace left join por sus `join_keys` y
+        rellena `rfc_curp_*`, `rfc_curp_kind_*`, `cta_*`, `nom_*`, `id_ban_*` y
+        `tag_rep_src_*` cuando el RFC original es nulo o de tipo "invalid" y el
+        candidato es válido. Cada 3 joins hace checkpoint a parquet en
+        `tmp_replaced_joined_hdfs` para cortar el linaje (reutilizándolo si ya
+        existe).
+
+        Args:
+            input_df: DataFrame con columnas `rfc_curp_{ben,ord}` y
+                `rfc_curp_kind_{ben,ord}`.
+
+        Returns:
+            DataFrame con los RFC/CURP reemplazados y trazabilidad de la fuente
+            en `tag_rep_src_ben`/`tag_rep_src_ord`.
+        """
         replaced_joined_hdfs: HivePath = HivePath(str(self.output_hive["tmp_replaced_joined_hdfs"]["table_or_hdfs"]))
         replacements = self.replacements
         #
@@ -221,7 +248,7 @@ class CepsTxnReplacementStep(ppf.Step):
         current_save = 0
         #
         for suffix in ["ben", "ord"]:
-            print(f"Processing suffix: {suffix}")
+            logger.info("Processing suffix: %s", suffix)
             for key, replacement in replacements.items():
                 tmp_parquet_hdfs = replaced_joined_hdfs.joinpath(f"{key}_{suffix}.parquet")
                 current_save += 1
@@ -229,9 +256,9 @@ class CepsTxnReplacementStep(ppf.Step):
                     if current_save % skip_saves != 0:
                         raise Exception("Force save to avoid skipping")
                     df_replaced = self.sqlContext.read.parquet(str(tmp_parquet_hdfs))
-                    print(f"Loaded cached replacement: {key}")
+                    logger.info("Loaded cached replacement: %s", key)
                 except:
-                    print(f"Processing replacement: {key}")
+                    logger.info("Processing replacement: %s", key)
                     replacement_column_renames = [col(column).alias(f"{column}_{suffix}") if column in replacement["join_keys"] else col(column).alias(f"{column}_{suffix}_rep") for column in replacement["df"].columns]
                     replacement_join_keys_renamed = [ f"{column}_{suffix}" for column in replacement["join_keys"]]
                     replacement_df = replacement["df"].select(*replacement_column_renames)
@@ -285,12 +312,13 @@ class CepsTxnReplacementStep(ppf.Step):
                             .parquet(str(tmp_parquet_hdfs))
                         )
                         df_replaced = self.sqlContext.read.parquet(str(tmp_parquet_hdfs))
-                        print(f"Saved replacement: {key} to {tmp_parquet_hdfs}")
+                        logger.info("Saved replacement: %s to %s", key, tmp_parquet_hdfs)
         return df_replaced
     #
     @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="rfc_curp_analysis_s264_ceps_replaced")
     def rfc_curp_analysis_s264_ceps_replaced(self) -> DataFrame:
+        """DataFrame final con los RFC/CURP reemplazados y las columnas `vintage`/`cohort`."""
         rfc_curp_analysis_s264_ceps:DataFrame = self.rfc_curp_analysis_s264_ceps
         return (
             self.replace_rfc_with_ceps_ranked(rfc_curp_analysis_s264_ceps)

@@ -13,11 +13,11 @@ from pyspark.sql.types import StructType
 
 # custom
 from ...path import HivePath
-from ..tools.partitions_lags import SparkTwoPartitionMonthlyInterval
-from ..tools.partitions_lags import (get_partitions_from_dataframe,
+from .partition_lags import SparkTwoPartitionMonthlyInterval
+from .partition_lags import (get_partitions_from_dataframe,
     get_partitions_from_parquet_path, get_partitions_from_hive_table,
     delete_partition_from_table, get_partition_hdfs_path)
-from .utils import is_table_or_parquet, convert_partitions_to_spark_filter, check_if_table_exists
+from . import is_table_or_parquet, convert_partitions_to_spark_filter, check_if_table_exists
 
 class SparkLoadTableOrParquet:
     """

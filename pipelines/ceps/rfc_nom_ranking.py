@@ -5,41 +5,27 @@
 # ----------------------------------------------------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------------------------------------------------
-from datetime import date, datetime
-from dateutil.relativedelta import relativedelta
-from dateutil.utils import today
-from concurrent.futures import ThreadPoolExecutor
-from itertools import product
-from typing import List, Union, Dict, TypeVar, Any, Tuple, Callable
+from typing import Dict, Any, Callable
 from threading import Lock
-from functools import reduce
-import logging
 
 write_lock = Lock()
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Pyspark
 # ----------------------------------------------------------------------------------------------------------------------
-from pyspark.sql import DataFrame, Window, HiveContext, SparkSession, Column
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql import DataFrame, Window
 
-from pyspark.sql.functions import (coalesce, col, countDistinct, lower, regexp_replace, to_date, trim,
-    udf, unix_timestamp, when, lit, size, expr, levenshtein, concat_ws, explode,
-    sum as spark_sum, desc, array_sort, array_contains, length,
-    regexp_extract, row_number, create_map, count as spark_count, max as spark_max, first,
-    min as spark_min, array, struct, array_union, upper, date_format, split, translate
+from pyspark.sql.functions import (col, regexp_replace, to_date, trim,
+    when, lit, concat_ws,
+    sum as spark_sum, row_number, create_map, count as spark_count, max as spark_max,
+    upper, date_format, split, translate
 )
-from pyspark.sql.types import (StructType, StructField, StringType,
-    IntegerType, LongType, ArrayType, DateType, DoubleType, ShortType,
-    LongType, DecimalType)
+from pyspark.sql.types import StringType
 # ----------------------------------------------------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------------------------------------------------
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 
-import data_engineering_toolbox.pyspark.tools.parquet_treatment as dtb_pt_pt
-import data_engineering_toolbox.pyspark.tools.partitions_lags as dtb_pt_pl
-import data_engineering_toolbox.pyspark.tools.utils as dtb_pt_ut
 import libs.framework as ppf
 
 from config.ceps.rfc_nom_ranking import (CURP_PATTERN, RFC_FISICA_PATTERN,
@@ -57,7 +43,20 @@ norm = lambda raw_col: upper(regexp_replace(trim(col(raw_col)), r"[A-Z]$", ""))
 
 def add_id_validation_flags(df: DataFrame, raw_col: str, suffix: str) -> DataFrame:
     """Clasifica el tipo de identificador fiscal/bancario de una columna de texto.
-    ...
+
+    Normaliza la columna in-place (`norm`: trim + upper + sin sufijo de un
+    carácter) y añade flags binarios `is_<tipo>_<suffix>` para CURP, RFC física,
+    RFC moral, RFC física sin homoclave, tarjeta (TC) y CLABE, además de
+    `is_any_valid_<suffix>` y la etiqueta categórica `id_kind_<suffix>`
+    ("invalid" si ningún patrón coincide).
+
+    Args:
+        df: DataFrame de entrada.
+        raw_col: Nombre de la columna de texto a clasificar.
+        suffix: Sufijo de las columnas generadas (ej. "ord", "ben").
+
+    Returns:
+        DataFrame con la columna normalizada y los flags de clasificación.
     """
     #
     normalized = norm(raw_col)
@@ -98,7 +97,16 @@ def add_id_validation_flags(df: DataFrame, raw_col: str, suffix: str) -> DataFra
 
 def banamex_nom_reorder(col_name:str) -> Callable[..., DataFrame]:
     """Factory de transformación que limpia delimitadores en nombres tipo Banamex.
-    ...
+
+    Solo si el valor contiene "," o "/", los sustituye por espacios y colapsa
+    los espacios repetidos (ej. "APELLIDO,NOMBRE/APELLIDO2" ->
+    "APELLIDO NOMBRE APELLIDO2"); en otro caso deja el valor intacto.
+
+    Args:
+        col_name: Nombre de la columna de nombre a transformar.
+
+    Returns:
+        Función `DataFrame -> DataFrame` aplicable con `DataFrame.transform`.
     """
     def _transform(df:DataFrame) -> DataFrame:
         return df.withColumn(
@@ -119,7 +127,15 @@ def banamex_nom_reorder(col_name:str) -> Callable[..., DataFrame]:
 
 def limpiar_acentos(col_name:str) -> Callable[..., DataFrame]:
     """Factory de transformación que translitera caracteres acentuados a ASCII.
-    ...
+
+    Sustituye vocales acentuadas, eñes, diéresis y "@" por su equivalente ASCII
+    en la columna `col_name`.
+
+    Args:
+        col_name: Nombre de la columna a transliterar.
+
+    Returns:
+        Función `DataFrame -> DataFrame` aplicable con `DataFrame.transform`.
     """
     def _transform(df) -> Any:
         return df.withColumn(
@@ -135,7 +151,15 @@ def limpiar_acentos(col_name:str) -> Callable[..., DataFrame]:
 
 def normalizar_espacios(col_name:str) -> Callable[..., DataFrame]:
     """Factory de transformación que homologa separadores y colapsa espacios.
-    ...
+
+    Convierte los caracteres `-_/.,;:` en espacios, reduce secuencias de
+    espacios a uno solo y aplica trim sobre la columna `col_name`.
+
+    Args:
+        col_name: Nombre de la columna a normalizar.
+
+    Returns:
+        Función `DataFrame -> DataFrame` aplicable con `DataFrame.transform`.
     """
     def _transform(df) -> Any:
         return df.withColumn(
@@ -164,7 +188,9 @@ mapping_RFC_CURP_KIND_PRIORITY = create_map([lit(x) for x in sum(RFC_CURP_KIND_P
 
 class SubStep(ppf.Step):
     """Clase base para las sub-etapas del pipeline `CepsRfcNomRankingStep`.
-    ...
+
+    Hereda los atributos del step padre (rutas Hive, tratamiento de fechas,
+    cohorte, etc.) mediante `ppf.inherit_parent_step_attributes`.
     """
     def __init__(self, parent: "CepsHistoryStep", *args, **kwargs) -> None:
         super().__init__(parent, *args, **kwargs)
@@ -173,7 +199,10 @@ class SubStep(ppf.Step):
 
 class CepsRfcNomRankingStep(ppf.Step):
     """Step orquestador del pipeline de ranking RFC/CURP por nombre y cuenta (CEP).
-    ...
+
+    Encadena dos substeps: `CepsExtractStep` (extracción, limpieza y aplanado
+    del historial CEP) y `CepsRankStep` (ranking del RFC/CURP canónico por
+    cuenta y por nombre para los casos de reemplazo).
     """
     def __init__(self,
         date_treatment: Dict[str,str],
@@ -197,13 +226,23 @@ class CepsRfcNomRankingStep(ppf.Step):
 
     def step_action(self) -> Dict[str, Any]:
         """Ejecuta el pipeline disparando el substep terminal (`ceps_rank_step`).
-        ...
+
+        Returns
+        -------
+        Dict[str, Any]
+            Salida colectada del substep bajo la clave "ceps_rank_step".
         """
         return ppf.run_substep_and_collect(self, self.ceps_rank_step, "ceps_rank_step")
     #
     def standard_load_parquet_or_table(self, config_dict_key, input_or_output:str = "input") -> DataFrame:
         """Carga estándar de una tabla/parquet particionado con validación de historial.
-        ...
+
+        Args:
+            config_dict_key: Clave de la tabla dentro de `input_hive`/`output_hive`.
+            input_or_output: "input" lee de `input_hive`; otro valor usa `output_hive`.
+
+        Returns:
+            DataFrame cargado para la fecha `vintage_date` de los parámetros de entrada.
         """
         config_dict = self.input_hive if input_or_output == "input" else self.output_hive
         return ppf.standard_load_parquet_or_table(
@@ -216,29 +255,44 @@ class CepsRfcNomRankingStep(ppf.Step):
     @ppf.cached_property
     def ceps_extract_step(self) -> "CepsExtractStep":
         """Substep de extracción/preparación (lazy, cacheado).
-        ...
+
+        Returns
+        -------
+        CepsExtractStep
+            Instancia del substep de extracción ligada a este step padre.
         """
         return CepsExtractStep(self)
     #
     @ppf.cached_property
     def ceps_rank_step(self) -> "CepsRankStep":
         """Substep de ranking (lazy, cacheado) con dependencia en la extracción.
-        ...
+
+        Returns
+        -------
+        CepsRankStep
+            Instancia del substep de ranking; declara `ceps_extract_step` como
+            `previous_step` para forzar el orden de ejecución.
         """
         return CepsRankStep(self, previous_step=[self.ceps_extract_step])
 
 
 class CepsExtractStep(SubStep):
     """Substep de extracción y preparación del historial CEP (SPEI).
-    ...
+
+    Carga el historial crudo, normaliza nombres/RFC/cuentas, clasifica el tipo
+    de identificador de ordenante y beneficiario y aplana el resultado a
+    formato largo (`s264_ceps_flattened`).
     """
     def step_action(self) -> Dict[str, dict]:
+        """Colecta el DataFrame aplanado (`s264_ceps_flattened`)."""
         return ppf.collect_step_output(self, self.s264_ceps_flattened, "s264_ceps_flattened")
     #
     @ppf.cached_property
     def s264_ceps(self) -> DataFrame:
         """Extrae el historial de CEPs (Comprobantes Electrónicos de Pago) desde Hive.
-        ...
+
+        Renombra las columnas del emisor con el sufijo `_ord` (ordenante) y las
+        del receptor con `_ben` (beneficiario), y elimina la columna `tfrom`.
         """
         result:DataFrame = (
             self.standard_load_parquet_or_table("s264_ceps")
@@ -372,7 +426,10 @@ class CepsExtractStep(SubStep):
     @ppf.dynamic_partitioned_table_or_parquet(path_key="rfc_curp_analysis_s264_ceps")
     def rfc_curp_analysis_s264_ceps(self) -> DataFrame:
         """Clasifica el tipo de identificador (RFC/CURP/CLABE/TC/invalid) de cada transacción.
-        ...
+
+        Aplica `add_id_validation_flags` sobre `rfc_curp_ord` y `rfc_curp_ben` y
+        añade las columnas de particionado `process_date`, `mis_date`,
+        `vintage` y `cohort`.
         """
         s264_ceps_cleaned:DataFrame = self.s264_ceps_cleaned
         return (s264_ceps_cleaned
@@ -388,7 +445,11 @@ class CepsExtractStep(SubStep):
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened")
     def s264_ceps_flattened(self) -> DataFrame:
         """Aplana la estructura ordenante/beneficiario a formato largo (una entidad por fila).
-        ...
+
+        Proyecta ordenante y beneficiario al esquema común `nom`, `cta`,
+        `id_ban`, `tipo_cta`, `rfc_curp`, `rfc_curp_kind`, `is_rfc_curp_valid`,
+        `fec_informacion`, `oper_mto`, `hora_oper`; los une con `unionByName` y
+        añade las columnas de particionado.
         """
         rfc_curp_analysis_s264_ceps:DataFrame = self.rfc_curp_analysis_s264_ceps[0]
         #
@@ -433,16 +494,25 @@ class CepsExtractStep(SubStep):
 
 class CepsRankStep(SubStep):
     """Substep de ranking que determina el RFC/CURP canónico por cuenta y por nombre.
-    ...
+
+    Agrega el historial aplanado por combinación entidad-identificador, ordena
+    los candidatos con las ventanas de prioridad de config y materializa los
+    casos de reemplazo por cuenta (`rank_rfc_by_cta_cases_replace`) y por
+    nombre (`rank_rfc_by_nom_cases_replace`).
     """
     def step_action(self) -> Dict[str, dict]:
+        """Colecta los casos de reemplazo por nombre (`s264_ceps_flattened_rank_rfc_by_nom_cases_replace`)."""
         return ppf.collect_step_output(self, self.s264_ceps_flattened_rank_rfc_by_nom_cases_replace, "s264_ceps_flattened_rank_rfc_by_nom_cases_replace")
     #
     @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened")
     def s264_ceps_flattened(self) -> DataFrame:
         """Recarga el DataFrame aplanado persistido por `CepsExtractStep`.
-        ...
+
+        Returns
+        -------
+        DataFrame
+            `s264_ceps_flattened` sin la columna `tfrom`.
         """
         return (self.standard_load_parquet_or_table("s264_ceps_flattened")
             .drop("tfrom")
@@ -451,8 +521,13 @@ class CepsRankStep(SubStep):
     @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened_groupby")
     def s264_ceps_flattened_groupby(self) -> DataFrame:
-        """Agrega el histórico aplanado por combinación única entidad-identificador,
-        ...
+        """Agrega el histórico aplanado por combinación única entidad-identificador.
+
+        Agrupa por `cta`, `nom`, `id_ban`, `tipo_cta`, `rfc_curp` y
+        `rfc_curp_kind` calculando el conteo de operaciones (`cnt`), el monto
+        total (`tot_oper_mto`), la última fecha-hora de operación, la suma de
+        validez del RFC, el flag de terminación "XXX" y la prioridad del tipo
+        de identificador (`RFC_CURP_KIND_PRIORITY`).
         """
         s264_ceps_flattened:DataFrame = self.parent.ceps_extract_step.s264_ceps_flattened[0]
         #
@@ -485,7 +560,11 @@ class CepsRankStep(SubStep):
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened_ranks")
     def s264_ceps_flattened_ranks(self) -> DataFrame:
         """Rankea los RFC/CURP candidatos por cuenta y por nombre para elegir el canónico.
-        ...
+
+        Añade los conteos acumulados por cuenta (`cnt_rfc_by_cta`) y por nombre
+        (`cnt_rfc_by_nom`) y los rankings `rank_rfc_by_cta` / `rank_rfc_by_nom`
+        (row_number sobre las ventanas de prioridad de config), dejándolos en
+        null cuando la clave de partición (`cta`/`nom`) es nula.
         """
         s264_ceps_flattened_groupby:DataFrame = self.s264_ceps_flattened_groupby[0]
         return (s264_ceps_flattened_groupby
@@ -500,12 +579,15 @@ class CepsRankStep(SubStep):
             .withColumn("rank_rfc_by_nom", when(col("nom").isNull(), None).otherwise(col("rank_rfc_by_nom")))
         )
         #
-        3
     @ppf.cached_property
     @ppf.dynamic_unpartitioned_parquet(path_key="s264_ceps_flattened_rank_rfc_by_cta_cases_replace")
     def s264_ceps_flattened_rank_rfc_by_cta_cases_replace(self) -> DataFrame:
-        """
-        ...
+        """Casos de reemplazo de RFC por cuenta: mejor candidato por (cta, nom, id_ban) y por (cta, id_ban).
+
+        Conserva solo filas con `rfc_curp` y `cta` no nulos, calcula los
+        rankings `_rank_by_nom_id_ban` y `_rank_by_id_ban` (row_number ordenado
+        por `rank_rfc_by_cta`) y elimina las columnas auxiliares de
+        agregación/ranking.
         """
         s264_ceps_flattened_ranks:DataFrame = self.s264_ceps_flattened_ranks[0]
         #
@@ -546,7 +628,15 @@ class CepsRankStep(SubStep):
     @ppf.cached_property
     @ppf.dynamic_unpartitioned_parquet(path_key="s264_ceps_flattened_rank_rfc_by_nom_cases_replace")
     def s264_ceps_flattened_rank_rfc_by_nom_cases_replace(self) -> DataFrame:
-        """
+        """Casos de reemplazo de RFC por nombre: mejor candidato por (nom, id_ban).
+
+        Conserva solo filas con `rfc_curp` y `nom` no nulos, calcula
+        `_rank_by_id_ban` (row_number por `nom`+`id_ban` ordenado por
+        `rank_rfc_by_nom`) y elimina las columnas auxiliares de
+        agregación/ranking.
+
+        Ejemplo de salida:
+
         +-------------------+--------------------------+-------+-------------+-------------+-------+---------------+----------------+
         |cta                |nom                       |id_ban |rfc_curp     |rfc_curp_kind|tfrom  |rank_rfc_by_nom|_rank_by_id_ban |
         +-------------------+--------------------------+-------+-------------+-------------+-------+---------------+----------------+

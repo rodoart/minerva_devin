@@ -1,6 +1,8 @@
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, isnan, when, count
 from ...pyspark.counts import count_nulls, count_duplicates
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 def assertColumnHasNoNulls(df: DataFrame, column: str) -> None:
@@ -16,7 +18,7 @@ def assertColumnHasNoNulls(df: DataFrame, column: str) -> None:
     null_count = count_nulls(df, column)
     if null_count > 0:
         raise AssertionError(f"La columna '{column}' tiene {null_count} valores nulos.")
-    print(f"La columna '{column}' no tiene valores nulos.")
+    logger.info("La columna '%s' no tiene valores nulos.", column)
 
 
 
@@ -33,4 +35,4 @@ def assertColumnHasNoDuplicates(df: DataFrame, column: str) -> None:
     duplicate_count = count_duplicates(df, column)
     if duplicate_count > 0:
         raise AssertionError(f"La columna '{column}' tiene {duplicate_count} valores duplicados.")
-    print(f"La columna '{column}' no tiene valores duplicados.")
+    logger.info("La columna '%s' no tiene valores duplicados.", column)

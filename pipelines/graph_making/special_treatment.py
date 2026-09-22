@@ -13,19 +13,17 @@ from typing import List, Union, Dict, Any, Callable, Optional
 # ------------------------------------------------------------------------
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import (coalesce, col, to_date,
-    unix_timestamp, lit, floor, months_between, to_timestamp, mean as spark_mean
+from pyspark.sql.functions import (col, to_date,
+    unix_timestamp, lit, floor, months_between, to_timestamp
 )
 # ------------------------------------------------------------------------
 # Custom
 # ------------------------------------------------------------------------
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
+from libs.functions.missing_treatment import apply_missing_treatment
 
 import libs.framework as ppf
 import config.job as cj
-
-from importlib import reload
-reload(cj)
 ##########################################################################
 # FUNCTIONS
 ##########################################################################
@@ -35,6 +33,7 @@ def calculate_monthly_tfrom(
     date_column:str,
     date_format: Optional[str] = cj.DATE_MONTH_SPARK_FORMAT
 ) -> DataFrame:
+    """Añade `tfrom_months`: meses completos entre `date_column` y `current_date`."""
     if date_format is None:
         date_format = cj.DATE_MONTH_SPARK_FORMAT
     #
@@ -49,6 +48,7 @@ def calculate_daily_tfrom(
     date_column:str,
     date_format: Optional[str] = cj.DATE_STANDARD_SPARK_FORMAT
 ) -> DataFrame:
+    """Añade `tfrom_days`: días completos entre `date_column` y `current_date`."""
     if date_format is None:
         date_format = cj.DATE_STANDARD_SPARK_FORMAT
     #
@@ -57,34 +57,6 @@ def calculate_daily_tfrom(
         floor((unix_timestamp(to_timestamp(lit(current_date), date_format)) - unix_timestamp(to_timestamp(col(date_column), date_format))) / (3600*24))
     )
 
-def fill_missings_with_value(df: DataFrame, columns: List[str], fill_value: Any) -> DataFrame:
-    """Rellena los valores nulos de las columnas especificadas con un valor fijo.
-    """
-    selection = [coalesce(col(column), lit(fill_value)).alias(column) if column in columns else column for column in df.columns]
-    return df.select(*selection)
-
-
-def fill_missings_with_mean(df: DataFrame, columns: List[str]) -> DataFrame:
-    """Rellena los valores nulos de las columnas especificadas con la media de cada columna.
-    """
-    means = df.select([spark_mean(col(column)).alias(column) for column in columns]).collect()[0].asDict()
-    selection = [coalesce(col(column), lit(means[column])).alias(column) if column in columns else column for column in df.columns]
-    return df.select(*selection)
-
-def fill_missings_with_mean_without_ignoring_null_counts(df: DataFrame, columns: List[str]) -> DataFrame:
-    """Rellena los valores nulos de las columnas especificadas con la media de cada columna,
-    """
-    means = df.select([spark_mean(coalesce(col(column),lit(0))).alias(column) for column in columns]).collect()[0].asDict()
-    selection = [coalesce(col(column), lit(means[column])).alias(column) if column in columns else column for column in df.columns]
-    return df.select(*selection)
-
-
-MISSING_TREATMENT_FUNCTION_RELATIONS = {
-    "mean": fill_missings_with_mean,
-    "mean_with_nulls": fill_missings_with_mean_without_ignoring_null_counts,
-    "value": fill_missings_with_value
-}
-
 
 ##########################################################################
 # Process
@@ -92,7 +64,10 @@ MISSING_TREATMENT_FUNCTION_RELATIONS = {
 
 
 class SubStep(ppf.Step):
-    """Clase base para las sub-etapas del pipeline `CepsRfcNomRankingStep`.
+    """Clase base para las sub-etapas del pipeline `StandardSpecialTreatment`.
+
+    Hereda los atributos del step padre (rutas Hive, tratamiento de fechas,
+    cohorte, etc.) mediante `ppf.inherit_parent_step_attributes`.
     """
     def __init__(self, parent: "StandardSpecialTreatment", *args, **kwargs) -> None:
         super().__init__(parent, *args, **kwargs)
@@ -100,7 +75,10 @@ class SubStep(ppf.Step):
 
 
 class StandardSpecialTreatment(ppf.Step):
-    """
+    """Step orquestador base del *special treatment* para la construcción del grafo.
+
+    Expone el substep de extracción (`standard_extract_step`); las
+    implementaciones concretas definen su `step_action` y el substep a disparar.
     """
 
     def __init__(self,
@@ -125,9 +103,17 @@ class StandardSpecialTreatment(ppf.Step):
         #
     def standard_load_parquet_or_table(self, config_dict_key, input_or_output:str = "input") -> DataFrame:
         """Carga estándar de una tabla/parquet particionado con validación de historial.
+
+        Args:
+            config_dict_key: Clave de la tabla dentro de `input_hive`/`output_hive`.
+            input_or_output: "input" lee de `input_hive`; otro valor usa `output_hive`.
+
+        Returns:
+            DataFrame cargado para la fecha `vintage_date` de los parámetros de entrada.
         """
         config_dict = self.input_hive if input_or_output == "input" else self.output_hive
         return ppf.standard_load_parquet_or_table(
+            config_dict=config_dict,
             config_dict_key=config_dict_key,
             current_date=self.input_parameters['vintage_date'],
             session=self.sqlContext,
@@ -136,14 +122,15 @@ class StandardSpecialTreatment(ppf.Step):
     # For testting purposes only
     @ppf.cached_property
     def standard_extract_step(self) -> "StandardExtractSubStep":
-        """
-        """
+        """Substep de extracción (lazy, cacheado); solo para pruebas."""
         return StandardExtractSubStep(self)
 
 
 class StandardExtractSubStep(SubStep):
+    """Substep base de extracción: carga históricos, calcula `tfroms` y aplica *missing treatment*."""
     #
     def input_table_historic(self, key:str) -> DataFrame:
+        """Carga una tabla histórica de entrada aplicando el `select` opcional de su config."""
         selection:List[str] = self.input_hive[key].get("select", [])
         #
         result:DataFrame = (
@@ -155,6 +142,7 @@ class StandardExtractSubStep(SubStep):
         return result
         #
     def calculate_tfroms(self, df:DataFrame) -> DataFrame:
+        """Añade `tfrom_months` y `tfrom_days` calculados sobre `information_date`."""
         # TODO ADD lags
         information_date_column:str = "information_date"
         return (df
@@ -168,26 +156,13 @@ class StandardExtractSubStep(SubStep):
         column_treatment_dict:Dict[str, Union[str, Callable, List[Any]]]
     ) -> DataFrame:
         """Aplica un tratamiento de valores nulos a las columnas especificadas.
-        """
-        for column, treatment in column_treatment_dict.items():
-            if isinstance(treatment, list) and len(treatment) >=2:
-                treatment_type = treatment[0]
-                args_ = treatment[1:]
-                if treatment_type in MISSING_TREATMENT_FUNCTION_RELATIONS:
-                    df = MISSING_TREATMENT_FUNCTION_RELATIONS[treatment_type](df, [column], *args_)
-                else:
-                    raise ValueError(f"Unsupported missing treatment '{treatment_type}' for column '{column}'.")
 
-            #
-            elif isinstance(treatment, str) or (isinstance(treatment, list) and len(treatment) == 1):
-                if isinstance(treatment, list):
-                    treatment = treatment[0]
-                if treatment in MISSING_TREATMENT_FUNCTION_RELATIONS:
-                    df = MISSING_TREATMENT_FUNCTION_RELATIONS[treatment](df, [column])
-                else:
-                    raise ValueError(f"Unsupported missing treatment '{treatment}' for column '{column}'.")
-            elif callable(treatment):
-                df = treatment(df)
-            else:
-                raise ValueError(f"Invalid treatment type for column '{column}': {type(treatment)}. Must be str or callable.")
-        return df
+        Args:
+            df: DataFrame de entrada.
+            column_treatment_dict: Mapa columna -> tratamiento (literal, callable
+                o lista de valores) interpretado por `apply_missing_treatment`.
+
+        Returns:
+            DataFrame con los faltantes imputados.
+        """
+        return apply_missing_treatment(df, column_treatment_dict)

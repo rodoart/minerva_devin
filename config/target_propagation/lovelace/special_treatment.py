@@ -1,4 +1,4 @@
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from ...job import sbx as job_config
 from pyspark.sql.functions import col
 
@@ -23,7 +23,7 @@ input = {
         "lag": -3,
         "history": 2,
         "information_date_mode":"all",
-        "minimum_requiered_history": False,
+        "minimum_required_history": False,
         "select":
 
         [

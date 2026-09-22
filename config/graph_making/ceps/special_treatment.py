@@ -1,6 +1,5 @@
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from ...job import sbx as job_config
-from pyspark.sql import Window
 from pyspark.sql.functions import col,lpad
 from pyspark.sql.types import StringType
 from ...ceps.txn_replacement import output as ceps_txn_replacement_output
@@ -23,7 +22,7 @@ input = {
         "lag": GRAPH_GLOBAL_LAG,
         "history": GRAPH_TOTAL_HISTORY_IN_MONTHS,
         "information_date_mode":ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["information_date_mode"],
-        "minimum_requiered_history": False,
+        "minimum_required_history": False,
         "select":
 
         [

@@ -7,7 +7,7 @@ from pyspark.sql.types import StructType, StructField, StringType, ArrayType, Lo
 from pyspark.sql.functions import coalesce, col, struct, array, lit, concat, when, expr
 from pyspark.sql.column import Column
 
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 
 ################################################################################
 
@@ -486,8 +486,6 @@ class HistoryColumnDataFrame:
         reference_fields = {field.name: field.dataType for field in history_schema.elementType.fields}
 
         # Identificar los campos faltantes en df_1
-        missing_fields = {name: dtype for name, dtype in reference_fields.items() if name not in current_fields}
-
         # Generar una expresión para agregar los campos faltantes con valores nulos
         add_missing_fields_expr = ", ".join(
             f"x.{name} AS {name}"  if name in current_fields else f"CAST(NULL AS {dtype.simpleString()}) AS {name}"

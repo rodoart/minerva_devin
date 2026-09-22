@@ -6,7 +6,7 @@
 # Pyspark
 # --------------------------------------------------------------------------------------
 from pyspark.sql import Window
-from pyspark.sql.functions import (col, lpad, min as spark_min,
+from pyspark.sql.functions import (col, min as spark_min,
     max as spark_max, mean as spark_mean, stddev as spark_std,
     sum as spark_sum, count, countDistinct, last, first, coalesce, lit,
     collect_set
@@ -16,18 +16,13 @@ from pyspark.sql.functions import (col, lpad, min as spark_min,
 # CUSTOM
 # --------------------------------------------------------------------------------------
 
-from data_engineering_toolbox.path import HivePath
-import data_engineering_toolbox.pyspark.tools as pdt
+from libs.data_engineering_toolbox.path import HivePath
+import libs.data_engineering_toolbox.pyspark.tools as pdt
 
 import config.job as c_j
 import config.ceps.txn_replacement as cc_tr
 import config.graph_making.ceps.special_treatment as c_gmc_st
 import config.graph_making as c_gmc
-
-from importlib import reload
-
-for module in [c_j, cc_tr, c_gmc_st, c_gmc, pdt]:
-    reload(module)
 
 ##########################################################################################
 # CONFIGURATION
@@ -86,7 +81,13 @@ GROUP_TXN_AGGREGATIONS = [
     "min_oper_mto",
     "max_oper_mto",
     "mean_oper_mto",
-    "so_txn_number",
+    "sum_oper_mto",              # requerido por EDGES_VARS
+    "count_oper_mto",            # -> count_txn en edges
+    "max_tfrom_days",            # requerido por EDGES_VARS
+    "weighted_mean_oper_mto",    # requerido por EDGES_VARS y WEIGHT_COLUMNS
+    "weighted_sum_oper_mto",     # requerido por EDGES_VARS y WEIGHT_COLUMNS
+    "weighted_count_oper_mto",   # -> weighted_count_txn en edges
+    "so_oper_mto",               # outlier-ness de montos (la columna txn_number no existe)
 ]
 
 
@@ -94,7 +95,7 @@ GROUP_TXN_AGGREGATIONS = [
 
 # GROUP BY IDs
 # Currently, the input columns are extracted from the special treatment input configuration. The source and destination columns are identified by th
-INPUT_COLUMNS = [column if isinstance(column, str) else pdt.get_column_alias(column) for column in special_treatment_input["s264_ceps_flattened_rank_rfc_by_cta_cases_replace"]["columns"]]
+INPUT_COLUMNS = [column if isinstance(column, str) else pdt.get_column_alias(column) for column in special_treatment_input["s264_ceps_flattened_rank_rfc_by_cta_cases_replace"]["select"]]
 ID_SRC_COLUMNS = "id_src"
 ID_DST_COLUMNS = "id_dst"
 

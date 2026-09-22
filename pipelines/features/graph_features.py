@@ -6,10 +6,8 @@
 # ------------------------------------------------------------------------------
 # General
 # ------------------------------------------------------------------------------
-from tabnanny import check
-from typing import List, Union, Dict, Any,  Callable, Optional
-import re
-import unicodedata
+import inspect
+from typing import List, Union, Dict, Any, Optional
 
 
 # ------------------------------------------------------------------------------
@@ -17,24 +15,19 @@ import unicodedata
 # ------------------------------------------------------------------------------
 from pyspark.sql import Column, DataFrame
 
-from pyspark.sql.functions import (coalesce, col, to_date,
-    unix_timestamp, lit,  floor,  months_between, to_timestamp, mean as spark_mean,
-    min as spark_min, max as spark_max, sum as spark_sum, count as spark_count,
-    countDistinct, stddev as spark_std
-)
-
 from graphframes import GraphFrame
 # ------------------------------------------------------------------------------
 # Custom
 # ------------------------------------------------------------------------------
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from libs.framework.utils import sanitize_name
 
+import libs.functions.features as lff
+import libs.functions.weights as lfw
 import libs.framework as ppf
-import config.job as cj
 
-from importlib import reload
-reload(cj)
+import logging
+logger = logging.getLogger(__name__)
 ###############################################################################
 # FUNCTIONS
 ###############################################################################
@@ -62,6 +55,24 @@ class SubStep(ppf.Step):
         node_final_columns: List[str] = ["id"],
         *args, **kwargs
     ) -> GraphFrame:
+        """Construye (y cachea) el `GraphFrame` a partir de aristas y nodos.
+
+        Aplica `column_renames`, deriva la columna `weight` desde `weights`
+        según el tipo de peso pedido y fija el directorio de checkpoint.
+        El grafo se cachea como propiedad `graph_<weight>` (o `graph_default`).
+
+        Args:
+            edges_df: DataFrame de aristas (con `src`, `dst` y pesos).
+            nodes_df: DataFrame de nodos (con `id`).
+            checkpoint_hdfs: directorio HDFS para checkpoints de GraphFrames.
+            weight: tipo de peso a extraer de la columna `weights` (opcional).
+            column_renames: renombrados previos sobre aristas/nodos (opcional).
+            edge_final_columns: columnas finales del DataFrame de aristas.
+            node_final_columns: columnas finales del DataFrame de nodos.
+
+        Returns:
+            GraphFrame con las columnas finales seleccionadas.
+        """
         def make_graph(*args, **kwargs) -> GraphFrame:
             edges_df:DataFrame = kwargs.get("edges_df")
             nodes_df:DataFrame = kwargs.get("nodes_df")
@@ -74,7 +85,7 @@ class SubStep(ppf.Step):
                         nodes_df = nodes_df.withColumnRenamed(old_name, new_name)
             #
             if weight is not None and "weights" in edges_df.columns:
-                edges_df = edges_df.withColumn("weight", col("weights").getItem(weight))
+                edges_df = edges_df.withColumn("weight", lfw.get_weight("weights", weight))
             #
             self.define_checkpoint(checkpoint_hdfs=checkpoint_hdfs)
             return GraphFrame(
@@ -112,17 +123,23 @@ class SubStep(ppf.Step):
         def make_graph_and_feature(*args, **kwargs) -> DataFrame:
             graph = self.get_graph(edges_df=self.edges, nodes_df=self.nodes,**kwargs)
             feature_method = getattr(self, f"{feature_name}_ft")
-            return feature_method(graph, **kwargs)
+            # Excluir los kwargs de get_graph: el resto son params de la feature
+            get_graph_params = inspect.signature(self.get_graph).parameters
+            feature_kwargs = {k: v for k, v in kwargs.items()
+                              if k not in get_graph_params}
+            return feature_method(graph, **feature_kwargs)
         #
-        print(f"Defining feature property: {name} at {feature_path}")
+        logger.info("Defining feature property: %s at %s", name, feature_path)
         return self.get_cached_decorated_table_or_parquet_property(
             method=make_graph_and_feature,
             property_name=name,
             path=feature_path,
+            input_or_output="output",
             **kwargs
         )
         #
     def define_checkpoint(self, checkpoint_hdfs:HivePath) -> None:
+        """Fija el directorio de checkpoint de Spark en HDFS."""
         self.sqlContext.sparkContext.setCheckpointDir("hdfs://"+str(checkpoint_hdfs))
         #
     def run_selected_features(self,
@@ -183,7 +200,9 @@ class SubStep(ppf.Step):
 
 
 class StandardGraphFeaturesStep(ppf.Step):
-    """
+    """Etapa estándar de cálculo de features de grafo sobre aristas/nodos.
+
+    Orquesta las sub-etapas de features no ponderadas y ponderadas.
     """
     def __init__(self,
         date_treatment: Dict[str,str],
@@ -218,51 +237,44 @@ class StandardGraphFeaturesStep(ppf.Step):
     # For testting purposes only
     @ppf.cached_property
     def standard_graph_features_un_weighted_step(self) -> "StandardGraphFeaturesUnWeightedStep":
-        """
-        """
+        """Sub-etapa de features de grafo no ponderadas (solo para tests)."""
         return StandardGraphFeaturesUnWeightedStep(self)
 
 
 class StandardGraphFeaturesUnWeightedStep(SubStep):
+    """Sub-etapa de features de grafo **no ponderadas** (unweighted)."""
     #
     @staticmethod
     def pagerank_ft(
         graph:GraphFrame,
         **kwargs
     ) -> DataFrame:
-        max_iter = kwargs.get("max_iter", 10)
-        reset_prob = kwargs.get("reset_prob", 0.15)
-        return graph.pageRank(maxIter=max_iter, resetProbability=reset_prob).vertices
+        """PageRank estándar por nodo."""
+        return lff.pagerank(graph, **kwargs)
     #
     @staticmethod
     def degrees_ft(
         graph:GraphFrame,
         **kwargs
     ) -> DataFrame:
-        # in degrees
-        in_degrees_df = graph.inDegrees.withColumnRenamed("inDegree", "in_degree")
-        out_degrees_df = graph.outDegrees.withColumnRenamed("outDegree", "out_degree")
-        degrees_df = (
-            in_degrees_df.join(out_degrees_df, on="id", how="outer")
-            .withColumn("in_degree", coalesce(col("in_degree"), lit(0)))
-            .withColumn("out_degree", coalesce(col("out_degree"), lit(0)))
-            .withColumn("total_degree", col("in_degree") + col("out_degree"))
-        )
-        return degrees_df
+        """Grado de entrada, salida y total por nodo."""
+        return lff.degrees(graph)
     #
     @staticmethod
     def components_ft(
         graph:GraphFrame,
         **kwargs
     ) -> DataFrame:
-        return graph.connectedComponents().withColumnRenamed("component", "component_id")
+        """Componente conexa a la que pertenece cada nodo."""
+        return lff.components(graph)
     #
     @staticmethod
     def triangle_count_ft(
         graph:GraphFrame,
         **kwargs
     ) -> DataFrame:
-        return graph.triangleCount().withColumnRenamed("count", "triangle_count")
+        """Número de triángulos en los que participa cada nodo."""
+        return lff.triangle_count(graph)
     #
     # def k_core_ft(self, graph:GraphFrame, k:int) -> DataFrame:
     #     return graph.kCore(k).withColumnRenamed("core", f"k_core_{k}")
@@ -278,12 +290,7 @@ class StandardGraphFeaturesWeightedStep(SubStep):
         **kwargs
     ) -> DataFrame:
         """PageRank ponderado por el peso de las aristas. ..."""
-        return (
-            graph
-            .pageRank(maxIter=max_iter, resetProbability=reset_prob)
-            .vertices
-            .withColumnRenamed("pagerank", "weighted_pagerank")
-        )
+        return lff.weighted_pagerank(graph, max_iter=max_iter, reset_prob=reset_prob)
     #
     @staticmethod
     def weighted_degrees_ft(
@@ -291,22 +298,7 @@ class StandardGraphFeaturesWeightedStep(SubStep):
         **kwargs
     ) -> DataFrame:
         """Fuerza (strength) ponderada: suma de pesos entrantes/salientes por nodo. ..."""
-        edges = graph.edges
-        #
-        in_strength = (
-            edges.groupBy(col("dst").alias("id"))
-            .agg(spark_sum("weight").alias("in_strength"))
-        )
-        out_strength = (
-            edges.groupBy(col("src").alias("id"))
-            .agg(spark_sum("weight").alias("out_strength"))
-        )
-        return (
-            in_strength.join(out_strength, on="id", how="outer")
-            .withColumn("in_strength", coalesce(col("in_strength"), lit(0.0)))
-            .withColumn("out_strength", coalesce(col("out_strength"), lit(0.0)))
-            .withColumn("total_strength", col("in_strength") + col("out_strength"))
-        )
+        return lff.weighted_degrees(graph)
     #
     @staticmethod
     def weighted_edge_stats_ft(
@@ -315,28 +307,7 @@ class StandardGraphFeaturesWeightedStep(SubStep):
         **kwargs
     ) -> DataFrame:
         """Estadísticas de peso de aristas incidentes por nodo (in + out). ..."""
-        if aggregations is None:
-            standard_features = {
-                "min": spark_min,
-                "max": spark_max,
-                "mean": lambda c: spark_mean(col(c)),
-                "std": lambda c: coalesce(spark_std(col(c)), lit(0.0)),
-                "count": spark_count,
-                "sum": spark_sum,
-            }
-            aggregations = [func(variable).alias(f"{func_name}_{variable}") for variable in ["weight"] for func_name, func in standard_features.items()]
-        #
-        edges = graph.edges
-        incident = (
-            edges.select(col("src").alias("id"), col("weight"))
-            .union(edges.select(col("dst").alias("id"), col("weight")))
-        )
-        return (
-            incident.groupBy("id")
-            .agg(
-                *aggregations
-            )
-        )
+        return lff.weighted_edge_stats(graph, aggregations=aggregations)
     #
     @staticmethod
     def weighted_components_ft(
@@ -344,21 +315,7 @@ class StandardGraphFeaturesWeightedStep(SubStep):
         **kwargs
     ) -> DataFrame:
         """Componentes conexas enriquecidas con el peso total de cada componente. ..."""
-        components = (
-            graph.connectedComponents()
-        )
-        #
-        # Peso total por componente: unir cada arista a la componente de su src.
-        src_comp = components.select(
-            col("id").alias("src"),
-            col("component"),
-        )
-        comp_weight = (
-            graph.edges.join(src_comp, on="src", how="inner")
-            .groupBy("component")
-            .agg(spark_sum("weight").alias("component_weight"))
-        )
-        return components.join(comp_weight, on="component", how="left")
+        return lff.weighted_components(graph)
     #
     @staticmethod
     def weighted_triangle_count_ft(
@@ -367,10 +324,5 @@ class StandardGraphFeaturesWeightedStep(SubStep):
         **kwargs
     ) -> DataFrame:
         """Conteo de triángulos por nodo (estructural, no ponderado) + fuerza. ..."""
-        triangles = (
-            graph.triangleCount()
-            .withColumnRenamed("count", "triangle_count")
-        )
-        strength = StandardGraphFeaturesWeightedStep.weighted_degrees_ft(graph).select("id", "total_strength")
-        return triangles.join(strength, on="id", how="left")
+        return lff.weighted_triangle_count(graph)
         #

@@ -7,7 +7,6 @@
 # --------------------------------------------------------------------------------------
 
 
-from pyspark.sql.functions import col
 from pyspark.sql.functions import max as spark_max, greatest
 
 # --------------------------------------------------------------------------------------
@@ -19,7 +18,7 @@ import config.target_propagation.lovelace.special_treatment as ctp_l_st
 import config.graph_making.ceps.group_by as ctp_gb_st
 import config.graph_making.ceps.edges_and_nodes as ctp_en_st
 
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from ...job import sbx as job_config
 
 ##########################################################################################
@@ -52,6 +51,30 @@ TARGETS = {
 
 
 TARGET_SELECTION_FUNCTION = greatest
+
+
+# --------------------------------------------------------------------------------------
+# PROPAGATION
+# --------------------------------------------------------------------------------------
+
+# Tipos de peso sobre los que se propaga el target (claves del mapa `weights` en edges).
+WEIGHT_TYPES = list(ctp_en_st.WEIGHT_COLUMNS.keys())
+
+# Hiperparámetros de la difusión de contagio (standard_propagate_target).
+PROPAGATION_MAX_ITER = 3
+PROPAGATION_ALPHA = 0.15
+PROPAGATION_KEEP_SEED_FLOOR = True
+
+# Features de contagio generadas: una por weight_type.
+PROPAGATION_FEATURES = [
+    {f"contagion_{weight_type}": {
+        "weight_type": weight_type,
+        "max_iter": PROPAGATION_MAX_ITER,
+        "alpha": PROPAGATION_ALPHA,
+        "keep_seed_floor": PROPAGATION_KEEP_SEED_FLOOR,
+    }}
+    for weight_type in WEIGHT_TYPES
+]
 
 
 
@@ -89,12 +112,12 @@ output = {
         "process_date_mode":"last"
     },
     "edges_norm": {"table_or_hdfs": current_hdfs.joinpath("edges_norm"),#simple
-        "keep_or_delete": "keep"
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
     },
     "target_propagation": {"table_or_hdfs": current_hdfs.joinpath("target_propagation"),#simple
         "keep_or_delete": "keep"
     },
     "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple
-        "keep_or_delete": "keep"
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
     }
 }

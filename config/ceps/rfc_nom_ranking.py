@@ -1,4 +1,4 @@
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from ..job import sbx as job_config
 from pyspark.sql import Window
 from pyspark.sql.functions import col
@@ -40,7 +40,7 @@ col("RFC_CURP_KIND_PRIORITY").isNull().asc(),
 col("rfc_curp_ends_with_xxx").asc(), # bad
 col("RFC_CURP_KIND_PRIORITY").asc(), # bad
 col("cnt_rfc_by_cta").desc(),
-col("tot_oper_sto").desc(),        # good
+col("tot_oper_mto").desc(),        # good
 col("lst_fec_informacion_hora_oper").asc(), # good
 col("rfc_curp").asc()
 )
@@ -55,7 +55,7 @@ col("rfc_curp_ends_with_xxx").asc(),  # bad
 col("RFC_CURP_KIND_PRIORITY").asc(),  # bad
 col("cnt_rfc_by_cta").desc(),
 col("cnt_rfc_by_nom").desc(),         # good
-col("tot_oper_sto").desc(),           # good
+col("tot_oper_mto").desc(),           # good
 col("lst_fec_informacion_hora_oper").asc(), # good
 col("rfc_curp").asc()
 )
@@ -95,14 +95,6 @@ output = {
 "process_date_mode":"last"
 },
 "s264_ceps_flattened_groupby": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_groupby"),
-"information_date_column": "mis_date",
-"process_date_column": "process_date",
-"lag": 0,
-"history": CEPS_MAXIMUM_HISTORY_IN_MONTHS,
-"information_date_mode":"each",
-"process_date_mode":"last"
-},
-"s264_ceps_flattened_ranks": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_ranks"),
 "information_date_column": "mis_date",
 "process_date_column": "process_date",
 "lag": 0,

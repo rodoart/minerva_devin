@@ -4,7 +4,6 @@ from pyspark.sql import DataFrame, SparkSession
 from pathlib import Path
 
 from ...path.hdfs import is_successful, exists, rmdir
-from ...context import get_remote
 
 import string
 import random
@@ -55,10 +54,10 @@ def load_or_create_df(origin:str) -> Callable[..., Callable[..., DataFrame | tup
             if isinstance(result, (tuple, list)):
                 for value in result:
                     if isinstance(value, DataFrame):
-                        save_table(value, origin)
+                        save_to_parquet(value, origin)
                         break
             elif isinstance(result, DataFrame):
-                save_table(result, origin)
+                save_to_parquet(result, origin)
             else:
                 AssertionError('The result does not contain any '
                     +'DataFrame')

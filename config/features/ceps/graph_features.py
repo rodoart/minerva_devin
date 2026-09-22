@@ -5,32 +5,19 @@
 # --------------------------------------------------------------------------------------
 # Pyspark
 # --------------------------------------------------------------------------------------
-from pyspark.sql import Window
-from pyspark.sql.functions import (col, lpad, min as spark_min,
-    max as spark_max, mean as spark_mean, stddev as spark_std,
-    sum as spark_sum, count, countDistinct, last, first, coalesce, lit,
-    collect_set
-)
+from libs.functions.features import STANDARD_WEIGHT_STATS
 
 # --------------------------------------------------------------------------------------
 # CUSTOM
 # --------------------------------------------------------------------------------------
 
-from data_engineering_toolbox.path import HivePath
-import data_engineering_toolbox.pyspark.tools as pdt
+from libs.data_engineering_toolbox.path import HivePath
 
 import config.job as c_j
 import config.ceps.txn_replacement as cc_tr
 import config.graph_making.ceps.special_treatment as c_gmc_st
 import config.graph_making.ceps.group_by as c_gmc_gb
 import config.graph_making.ceps.edges_and_nodes as c_gmc_ean
-
-import config.graph_making as c_gmc
-
-from importlib import reload
-
-for module in [c_j, cc_tr, c_gmc_st, c_gmc, pdt, c_gmc_ean]:
-    reload(module)
 
 
 ##########################################################################################
@@ -52,18 +39,8 @@ edges_and_nodes_output = c_gmc_ean.output
 # GRAPH
 
 # features to be calculated for the edges, this vars can be used to estimate the weight.
-WEIGHTED_EDGE_STARTS_FEATURES = {
-    "min": spark_min,
-    "max": spark_max,
-    "mean": lambda c: spark_mean(col(c)),
-    "std": lambda c: coalesce(spark_std(col(c)), lit(0.0)),
-    "count": count,
-    "countDistinct": countDistinct,
-    "sum": spark_sum,
-    "curt": lambda c: spark_sum(col(c)**3)/spark_sum(col(c)**2)**(3/2),
-    "skew": lambda c: spark_sum(col(c)**3)/spark_sum(col(c)**2)**(3/2),
-    "so": lambda c: spark_sum(col(c)**4)/spark_sum(col(c)**2)**(4/2)
-}
+# Catálogo importable: libs.functions.features.STANDARD_WEIGHT_STATS
+WEIGHTED_EDGE_STARTS_FEATURES = STANDARD_WEIGHT_STATS
 
 # Define the aggregations for the weighted edge features, DON'T MOVE THIS, IT IS USED IN THE GRAPH FEATURES STEP.
 WEIGHTED_EDGE_STARTS_FEATURES_AGGREGATIONS = [
@@ -71,7 +48,7 @@ WEIGHTED_EDGE_STARTS_FEATURES_AGGREGATIONS = [
     "min_weight",
     "max_weight",
     "mean_weight",
-    "so_txn_number"
+    "so_weight"
 ]
 
 WEIGHTED_EDGE_STARTS_FEATURES_AGGREGATIONS = [
@@ -88,6 +65,19 @@ GRAPH_RENAMES = {
 
 GRAPH_ALL_FEATURE_PREFIXES = [
     "weighted"
+]
+
+# Features de grafo a ejecutar (nombre -> kwargs). Las "weighted_*" reciben
+# `weight`: clave del mapa `weights` de las aristas (ver WEIGHT_COLUMNS).
+GRAPH_CENTRALITY_FEATURES = [
+    {"pagerank": None},
+    {"degrees": None},
+    {"components": None},
+    {"triangle_count": None},
+    {"weighted_pagerank": {"weight": "composed"}},
+    {"weighted_degrees": {"weight": "composed"}},
+    {"weighted_edge_stats": {"weight": "composed"}},
+    {"weighted_triangle_count": {"weight": "composed"}},
 ]
 
 
@@ -136,6 +126,6 @@ output = {
         "keep_or_delete": "keep"
     },
     "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple
-        "keep_or_delete": "keep"
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
     }
 }

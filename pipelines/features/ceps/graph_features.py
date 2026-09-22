@@ -5,7 +5,6 @@
 # ----------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------
-from calendar import c
 from typing import Dict, Any, List
 
 # ----------------------------------------------------------------------------
@@ -13,61 +12,53 @@ from typing import Dict, Any, List
 # ----------------------------------------------------------------------------
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import (col, to_date, when, lit, concat_ws,
-    date_format
-)
-from pyspark.sql.types import StringType
-
-from graphframes import GraphFrame
 # ----------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------
 import libs.framework as ppf
-import config.graph_making.ceps.group_by as ccgb
-import config.graph_making.ceps.edges_and_nodes as ccgen
 import config.features.ceps.graph_features as cfgf
 
-
 import pipelines.features.graph_features as p_f_cgf
-
-from libs.data_engineering_toolbox.path import HivePath
-
-
-from importlib import reload
-
-for module in [ccgen, ccgb, p_f_cgf, cfgf]:
-    reload(module)
 
 ##########################################################################
 # CLASSES
 ##########################################################################
 
 class CepsGraphFeaturesStep(p_f_cgf.StandardGraphFeaturesStep):
+    """Step CEPS de features de grafo: ejecuta las variantes unweighted y weighted.
+    """
     def step_action(self) -> Dict[str, Any]:
-        return ppf.run_substep_and_collect(self, self.ceps_edges_and_nodes_step, "ceps_edges_and_nodes_step")
+        """Ejecuta las sub-etapas unweighted y weighted y recoge sus salidas."""
+        ppf.run_substep_and_collect(self, self.ceps_graph_features_un_weighted_step, "ceps_graph_features_un_weighted_step")
+        return ppf.run_substep_and_collect(self, self.ceps_graph_features_weighted_step, "ceps_graph_features_weighted_step")
     #
     @ppf.cached_property
     def ceps_graph_features_un_weighted_step(self) -> "CepsGraphFeaturesUnWeightedStep":
-        """
+        """Sub-etapa de features de grafo no ponderadas.
         """
         return CepsGraphFeaturesUnWeightedStep(self, previous_step=self.previous_step[0])
     @ppf.cached_property
     def ceps_graph_features_weighted_step(self) -> "CepsGraphFeaturesWeightedStep":
-        """
+        """Sub-etapa de features de grafo ponderadas.
         """
         return CepsGraphFeaturesWeightedStep(self, previous_step=self.previous_step[0])
 
 
 class CepsGraphFeaturesUnWeightedStep(p_f_cgf.StandardGraphFeaturesUnWeightedStep):
+    """Sub-etapa CEPS: features de centralidad sin peso sobre el grafo de transferencias.
+    """
     def step_action(self) -> Dict[str, Any]:
+        """Ejecuta las features no ponderadas seleccionadas y recoge sus salidas."""
         return ppf.collect_step_output(self, self.run_un_weighted_features, "run_un_weighted_features")
     #
     @ppf.cached_property
     def edges(self) -> DataFrame:
+        """Aristas del grafo (tabla `edges` particionada)."""
         return self.standard_load_parquet_or_table("edges")
     #
     @ppf.cached_property
     def nodes(self) -> DataFrame:
+        """Nodos del grafo (tabla `nodes` particionada)."""
         return self.standard_load_parquet_or_table("nodes")
     #
     @ppf.cached_property
@@ -86,15 +77,20 @@ class CepsGraphFeaturesUnWeightedStep(p_f_cgf.StandardGraphFeaturesUnWeightedSte
 
 
 class CepsGraphFeaturesWeightedStep(p_f_cgf.StandardGraphFeaturesWeightedStep):
+    """Sub-etapa CEPS: features ponderadas por el peso de las aristas.
+    """
     def step_action(self) -> Dict[str, Any]:
+        """Ejecuta las features ponderadas seleccionadas y recoge sus salidas."""
         return ppf.collect_step_output(self, self.run_weighted_features, "run_weighted_features")
     #
     @ppf.cached_property
     def edges(self) -> DataFrame:
+        """Aristas del grafo (tabla `edges` particionada)."""
         return self.standard_load_parquet_or_table("edges")
     #
     @ppf.cached_property
     def nodes(self) -> DataFrame:
+        """Nodos del grafo (tabla `nodes` particionada)."""
         return self.standard_load_parquet_or_table("nodes")
     #
     @ppf.cached_property

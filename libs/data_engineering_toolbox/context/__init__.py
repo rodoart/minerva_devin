@@ -1,5 +1,4 @@
-from pyspark import SparkConf, SparkContext
-from pyspark.sql import SparkSession, HiveContext
+from pyspark.sql import SparkSession
 from typing import Optional
 
 

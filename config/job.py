@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 
 _today = os.environ['RG49392_TODAY']
 

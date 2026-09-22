@@ -1,8 +1,8 @@
+import logging
 from copy import deepcopy
 from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 from functools import reduce
-from pandas.core import missing
 from pyspark.sql import DataFrame, Column, SparkSession
 from pyspark.sql.functions import col
 from pyspark.sql.utils import AnalysisException
@@ -13,7 +13,9 @@ from functools import cached_property
 
 from ...path import HivePath
 from ...general.date_treatment import make_date_interval_with_lag_months
-from .utils import is_table_or_parquet
+from . import is_table_or_parquet
+
+logger = logging.getLogger(__name__)
 
 def get_partitions_from_parquet_path(parquet_hdfs: Union[HivePath, str], session: Optional[SparkSession]=None) -> List[Dict[str, str]]:
     """
@@ -206,7 +208,8 @@ class SparkTwoPartition:
         Returns:
             List[Dict[str, date]]: Lista de particiones.
         """
-        print(self.are_attribute_partition_columns_real())
+        logger.debug("are_attribute_partition_columns_real: %s",
+            self.are_attribute_partition_columns_real())
         if self.are_attribute_partition_columns_real():
             if self.are_partitions_columns_the_same_number():
                 result = deepcopy(self.real_partitions)
@@ -773,7 +776,7 @@ class SparkTwoPartitionMonthlyInterval(SparkTwoPartition):
             while True:
                 try:
                     return self._get_pairs_with_modes_base()
-                except Exception as e:
+                except Exception:
                     if abs(self._currently_incremented_lag) == abs(self.incremental_lag):
                         break
                     self.increment_lag_by_one()
@@ -849,4 +852,4 @@ class SparkTwoPartitionMonthlyInterval(SparkTwoPartition):
             self._currently_incremented_lag = self._currently_incremented_lag - 1
         #
         self.date_interval = make_date_interval_with_lag_months(self.current_date, self.history, self.lag)
-        print(f"Warning: Lag incremented, new lag value is {self.lag}")
+        logger.warning("Lag incremented, new lag value is %s", self.lag)

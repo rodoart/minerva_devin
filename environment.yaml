@@ -1,0 +1,22 @@
+name: minerva_devin
+dependencies:
+  - python=3.10.18
+  - packaging=24.2
+  - spark=3.3.2.3
+  - pip
+  - cxx-compiler
+  - abseil-cpp
+  - google-re2
+  - protobuf=4.23.4
+  - postgresql=15
+  - conda-pack
+  - pytest=8.3.*
+  - sqlalchemy>=1.4.36,<2.0
+  - pandas>=1.5.3,<2.0
+  - plotly
+  - pyarrow>=10.0.1,<11.0
+  - regex
+  - pip:
+      - graphframes
+      - inflection
+      - python-dateutil

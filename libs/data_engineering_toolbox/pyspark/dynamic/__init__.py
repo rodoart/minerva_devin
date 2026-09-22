@@ -3,7 +3,7 @@ from pyspark.sql.functions import col
 
 
 from subprocess import call
-from typing import Union, Callable, Optional, List, Any, Callable
+from typing import Union, Callable, Optional, List, Any
 from pathlib import Path
 
 from ..path import HivePath

@@ -39,21 +39,6 @@ spark = notebook(spark_name, "datalabs", spark_port, jars=str(jar_linux), archiv
 from importlib import reload
 
 # ----------------------------------------------------------------------------
-# Spark
-# ----------------------------------------------------------------------------
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import (min as spark_min, max as spark_max,
-    explode, count as spark_count, first, col, array_distinct, flatten,
-    collect_list, size,  collect_set, slice as spark_slice, greatest,
-    lit, coalesce, sum as spark_sum, when
-)
-
-from graphframes import GraphFrame
-from graphframes.lib import AggregateMessages as AM
-
-
-
-# ----------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------
 import pipelines.ceps.rfc_nom_ranking as p_c_rnr
@@ -67,12 +52,9 @@ import pipelines.graph_making.ceps.edges_and_nodes as p_gm_en
 import pipelines.features.ceps.graph_features as p_f_cgf
 import pipelines.target_propagation.lovelace.special_treatment as p_tp_l_st
 import pipelines.features.ceps.target_propagation_features as p_f_tp
+import pipelines.features.ceps.vector_assembler as p_f_va
 
 import libs.framework as fw
-
-from importlib import reload
-import libs.data_engineering_toolbox.pyspark.tools.parquet_treatment as dtb_pt_pt
-from libs.data_engineering_toolbox.path import HivePath
 
 import config.job as cj
 import config.ceps.rfc_nom_ranking as ccrbr
@@ -83,11 +65,12 @@ import config.graph_making.ceps.edges_and_nodes as ccgen
 import config.features.ceps.graph_features as cfgf
 import config.target_propagation.lovelace.special_treatment as ctp_l_st
 import config.features.ceps.target_propagation_features as cfcf
+import config.features.ceps.vector_assembler as cvas
 
 
-for lib_ in [p_c_rnr, dtb_pt_pt, cj, ccrbr, fw, p_c_txn_rpl, cctr,
+for lib_ in [p_c_rnr, cj, ccrbr, fw, p_c_txn_rpl, cctr,
     p_gm_st, ccspt, p_gm_gb, ccgb, p_gm_gb_or, ccgen, p_gm_en, cfgf, p_f_cgf,
-    p_tp_l_st, ctp_l_st, cfcf, p_f_tp
+    p_tp_l_st, ctp_l_st, cfcf, p_f_tp, p_f_va, cvas
 ]:
     reload(lib_)
 
@@ -194,3 +177,33 @@ nodes_join_target.show(10)
 |014416259000118001|       [0]|            [VAZQUEZ ROMERO M,..| [002180090285429669]|   [40002]|      2025-05-02|      10518.45| 202507|   SBX|           0.7177...
 |              ...|       [0]|         [URDAPILLETA Y SA,..| [002540901255735240]|   [40002]|      2025-05-02|      10518.45| 202507|   SBX|3.201464369358513E-4...
 """
+
+
+#############################################################
+# VECTOR ASSEMBLER (features a nivel numcliente)
+#############################################################
+
+vector_assembler_step = p_f_va.CepsVectorAssemblerStep(
+    date_treatment=cj.date_treatment,
+    input_hive=cvas.input,
+    output_hive=cvas.output,
+    is_dynamic=True,
+    cohort=cj.COHORT,
+    sqlContext=spark,
+    previous_step=[target_propagation_features_step]
+)
+
+numcliente_features_vector = vector_assembler_step.lovelace_ceps_assembler_step.numcliente_features_vector[0]
+numcliente_features_vector.show(10)
+
+
+#############################################################
+# CLEANUP DE PARQUETS INTERMEDIOS
+#############################################################
+
+# Los outputs marcados "keep_or_delete": "delete" (edges_norm, checkpoint)
+# se pueden borrar una vez finalizado el flujo:
+#
+# deleted = vector_assembler_step.delete_tmp_paths()
+#
+# equivalente a: python main.py --cleanup  (o --cleanup-only sin ejecutar)

@@ -25,11 +25,6 @@ import pipelines.graph_making.special_treatment as p_gm_sp
 import config.graph_making.ceps.special_treatment as cgmcst
 import config.job as cj
 
-from importlib import reload
-
-for module in [cgmcst, cj, p_gm_sp]:
-    reload(module)
-
 ##########################################################################
 # CLASSES
 ##########################################################################

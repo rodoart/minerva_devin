@@ -1,9 +1,10 @@
-from data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.path import HivePath
 from ..job import sbx as job_config
-from pyspark.sql import Window
-from pyspark.sql.functions import col
 
-from .rfc_nom_ranking import (CEPS_MAXIMUM_HISTORY_IN_MONTHS, input as rfc_nom_ranking_input, output as rfc_nom_ranking_output
+import logging
+logger = logging.getLogger(__name__)
+
+from .rfc_nom_ranking import (CEPS_MAXIMUM_HISTORY_IN_MONTHS, output as rfc_nom_ranking_output
 )
 
 
@@ -17,7 +18,7 @@ input = {
     "s264_ceps_flattened_rank_rfc_by_nom_cases_replace": rfc_nom_ranking_output["s264_ceps_flattened_rank_rfc_by_nom_cases_replace"],
     "rfc_curp_analysis_s264_ceps": rfc_nom_ranking_output["rfc_curp_analysis_s264_ceps"]
 }
-print("input", input, sep="\n")
+logger.debug("input: %s", input)
 
 output = {
     "tmp_replaced_joined_hdfs": { #simple

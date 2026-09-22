@@ -6,14 +6,15 @@ Version: 0.2
 
 Objects to manage quickly paths in hive and linux.
 """
+from __future__ import annotations
 from pathlib import PurePosixPath
 from fnmatch import fnmatch
-from typing import List, Optional, Dict, Callable, Union
+from typing import Optional, Dict, Callable, Union
 from operator import itemgetter
 from multiprocessing.pool import ThreadPool
 
 
-from data_engineering_toolbox.path.hdfs import mkdir, exists, _ls, is_dir, is_file, touch, rmdir, mv, hdfs_command
+from .hdfs import mkdir, exists, _ls, is_dir, is_file, touch, rmdir, mv, hdfs_command
 
 
 
@@ -31,6 +32,8 @@ class HivePath(type(PurePosixPath())):
     #
     #
     def __init__(self, *pathsegments, **kwargs) -> None:
+        # Python 3.13: el parsing de pathlib ocurre en __init__ (en <3.13 era __new__).
+        super().__init__(*pathsegments)
         # Load kwargs
         empty_dict = {key:None for key in self.DICT_NAMES if key not in list(kwargs.keys())}
         empty_dict.update(kwargs)
@@ -129,9 +132,9 @@ class HivePath(type(PurePosixPath())):
     #
     def _iter_terminal_dirs(self, sorted_by_time=False)->list:
         paths = [hive for hive in self.listdirs(True, sorted_by_time)]
-        parents = [hive.parents for hive in paths]
+        all_parents = {parent for hive in paths for parent in hive.parents}
         for path in paths:
-            if path not in parents:
+            if path not in all_parents:
                 yield path
     #
     #

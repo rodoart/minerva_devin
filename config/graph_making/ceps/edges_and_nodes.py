@@ -5,30 +5,21 @@
 # --------------------------------------------------------------------------------------
 # Pyspark
 # --------------------------------------------------------------------------------------
-from pyspark.sql import Window
-from pyspark.sql.functions import (col, lpad, min as spark_min,
-    max as spark_max, mean as spark_mean, stddev as spark_std,
-    sum as spark_sum, count, countDistinct, last, first, coalesce, lit,
-    collect_set
-)
+from pyspark.sql.functions import col
+
+from libs.functions.weights import column_weight, composed_weight
 
 # --------------------------------------------------------------------------------------
 # CUSTOM
 # --------------------------------------------------------------------------------------
 
-from data_engineering_toolbox.path import HivePath
-import data_engineering_toolbox.pyspark.tools as pdt
+from libs.data_engineering_toolbox.path import HivePath
 
 import config.job as c_j
 import config.ceps.txn_replacement as cc_tr
 import config.graph_making.ceps.special_treatment as c_gmc_st
 import config.graph_making.ceps.group_by as c_gmc_gb
 import config.graph_making as c_gmc
-
-from importlib import reload
-
-for module in [c_j, cc_tr, c_gmc_st, c_gmc, pdt]:
-    reload(module)
 
 ##########################################################################################
 # CONFIGURATION
@@ -60,12 +51,12 @@ EDGES_VARS = [
 
 # TODO: Make a library of standard weight functions, and make it configurable in the job config.
 WEIGHT_COLUMNS = {
-    "weighted_mean_oper_mto": col("weighted_mean_oper_mto"),
-    "weighted_sum_oper_mto": col("weighted_sum_oper_mto"),
-    "weighted_count_txn": col("weighted_count_txn"),
-    "mean_oper_mto": col("mean_oper_mto"),
-    "count_txn": col("count_txn"),
-    "composed": (col("weighted_mean_oper_mto") + col("mean_oper_mto")) / 2
+    "weighted_mean_oper_mto": column_weight("weighted_mean_oper_mto"),
+    "weighted_sum_oper_mto": column_weight("weighted_sum_oper_mto"),
+    "weighted_count_txn": column_weight("weighted_count_txn"),
+    "mean_oper_mto": column_weight("mean_oper_mto"),
+    "count_txn": column_weight("count_txn"),
+    "composed": composed_weight("weighted_mean_oper_mto", "mean_oper_mto")
 }
 
 # NODE STEP
