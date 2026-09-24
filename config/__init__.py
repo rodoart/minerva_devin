@@ -15,22 +15,22 @@ if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
 
-# check if os.environ['RG49392_TODAY'] exists:
-# RG49392_TODAY = fecha de ejecución del job ("hoy"); de ella derivan el
+# check if os.environ['MINERVA_TODAY'] exists:
+# MINERVA_TODAY = fecha de ejecución del job ("hoy"); de ella derivan el
 # vintage (mes de corte de los datos) y la process_date de todas las salidas.
-if 'RG49392_TODAY' not in os.environ:
-    raise EnvironmentError("The environment variable 'RG49392_TODAY' is not set. Please set it before running the code.")
+if 'MINERVA_TODAY' not in os.environ:
+    raise EnvironmentError("The environment variable 'MINERVA_TODAY' is not set. Please set it before running the code.")
 
 ##########################################################################################
 # CONFIGURATION AND PARAMETERS:
 ##########################################################################################
 from .job import DATE_STANDARD_FORMAT # IMPORTANT: this import must be after the path configuration, otherwise it will fail because job.py won't be found
-# check if os.environ['RG49392_TODAY'] is in yyyy-mm-dd format
+# check if os.environ['MINERVA_TODAY'] is in yyyy-mm-dd format
 # (se valida parseándola con DATE_STANDARD_FORMAT="%Y-%m-%d", definido en job.py)
 try:
-    datetime.strptime(os.environ['RG49392_TODAY'], DATE_STANDARD_FORMAT)
+    datetime.strptime(os.environ['MINERVA_TODAY'], DATE_STANDARD_FORMAT)
 except ValueError:
-    raise ValueError("The environment variable 'RG49392_TODAY' is not in the correct format. Please set it in 'yyyy-mm-dd' format.")
+    raise ValueError("The environment variable 'MINERVA_TODAY' is not in the correct format. Please set it in 'yyyy-mm-dd' format.")
 
 # check if pyspark lib is loaded
 # (fail-fast en el driver: todo el pipeline depende de pyspark)

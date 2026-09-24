@@ -34,7 +34,7 @@ para generar features de contagio a nivel `numcliente`.
 
 ## Configuración (`config/`)
 
-- `job.py` — parámetros del job: fechas (`RG49392_TODAY`), `MAIN_LAG_IN_MONTHS=1`,
+- `job.py` — parámetros del job: fechas (`MINERVA_TODAY`), `MAIN_LAG_IN_MONTHS=1`,
   `COHORT="SBX"`, `vintage` (yyyymm del mes objetivo) y `sbx` con el root HDFS:
   `/data/gcprcmsbx/work/hive/gcprcmsbx_work/rg49392/minerva/ceps_history/{vintage}`.
 - Un módulo de config por step define los dicts `input`/`output` (tabla Hive o
@@ -43,7 +43,7 @@ para generar features de contagio a nivel `numcliente`.
 ## Flujo del pipeline (según `run_order.py`)
 
 Script de desarrollo (`5.1-rg49392-dev-target_propagation`). Crea la sesión
-Spark con variables de entorno `RG49392_*` / `VENV_ZIP_*` / `GRAPHFRAMES_JAR`
+Spark con variables de entorno `MINERVA_*` / `VENV_ZIP_*` / `GRAPHFRAMES_JAR`
 y encadena los steps con `previous_step`:
 
 1. **`CepsRfcNomRankingStep`** (`pipelines/ceps/rfc_nom_ranking.py`)
@@ -106,7 +106,7 @@ media ponderada por monto/antigüedad).
 ## Entorno
 
 - Requiere PySpark 3.3.2 + `jars/graphframes-0.81-spark3.0-s_2.12.jar`.
-- Variables de entorno: `RG49392_WORKSPACE_LINUX`, `RG49392_QUEUE`,
-  `RG49392_PORT`, `RG49392_NAME`, `RG49392_TODAY`, `VENV_ZIP_LINUX`,
-  `VENV_ZIP_HDFS`, `GRAPHFRAMES_JAR`.
+- Variables de entorno: `MINERVA_WORKSPACE_DIR_LINUX`, `PYSPARK_QUEUE`,
+  `PYSPARK_PORT`, `MINERVA_NAME`, `MINERVA_TODAY`, `MINERVA_VENV_TAR_GZ_LINUX`,
+  `MINERVA_VENV_TAR_GZ_HDFS`, `GRAPHFRAMES_JAR`.
 - `pipelines/__init__.py` añade el root y `libs/` a `sys.path`.

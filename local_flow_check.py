@@ -20,13 +20,13 @@ from datetime import datetime
 from pathlib import Path
 
 # --- env vars ANTES de importar config -------------------------------------------------
-os.environ.setdefault("RG49392_TODAY", "2025-08-31")
-os.environ.setdefault("RG49392_WORKSPACE_LINUX", "/tmp")
-os.environ.setdefault("RG49392_QUEUE", "datalabs")
-os.environ.setdefault("RG49392_PORT", "4040")
-os.environ.setdefault("RG49392_NAME", "minerva_local_test")
-os.environ.setdefault("VENV_ZIP_LINUX", "unused")
-os.environ.setdefault("VENV_ZIP_HDFS", "unused")
+os.environ.setdefault("MINERVA_TODAY", "2025-08-31")
+os.environ.setdefault("MINERVA_WORKSPACE_DIR_LINUX", "/tmp")
+os.environ.setdefault("PYSPARK_QUEUE", "datalabs")
+os.environ.setdefault("PYSPARK_PORT", "4040")
+os.environ.setdefault("MINERVA_NAME", "minerva_local_test")
+os.environ.setdefault("MINERVA_VENV_TAR_GZ_LINUX", "unused")
+os.environ.setdefault("MINERVA_VENV_TAR_GZ_HDFS", "unused")
 os.environ.setdefault("GRAPHFRAMES_JAR", "unused")
 
 logging.basicConfig(level=logging.INFO,

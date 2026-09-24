@@ -1,8 +1,8 @@
 from pyspark.sql import DataFrame
 from ...pyspark.counts import count_nulls, count_duplicates
 
-import logging
-logger = logging.getLogger(__name__)
+from ...context.logging import get_logger
+logger = get_logger(__name__)
 
 
 def assertColumnHasNoNulls(df: DataFrame, column: str) -> None:

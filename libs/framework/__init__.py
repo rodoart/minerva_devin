@@ -20,11 +20,12 @@ from pyspark.sql.utils import AnalysisException
 
 from libs.data_engineering_toolbox.path import HivePath
 from libs.data_engineering_toolbox.pyspark.tools.parquet_treatment import SparkLoadPartitionedTableOrParquet, overwrite_partition, overwrite_two_partition
-from libs.framework.utils import sanitize_name
+from libs.framework.utils import sanitize_property_name
 
 import time
 
-logger = logging.getLogger(__name__)
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 
 
 
@@ -119,7 +120,7 @@ class Step:
                 kwargs["path"] = HivePath(kwargs["path"])
             if "property_name" not in kwargs:
                 cleaned_path = str(kwargs["path"]).replace("=", "").replace("'", "").replace("-", "_")
-                property_name = sanitize_name(cleaned_path.split("/")[-2] + "_" + cleaned_path.split("/")[-1])
+                property_name = sanitize_property_name(cleaned_path.split("/")[-2] + "_" + cleaned_path.split("/")[-1])
             else:
                 property_name = kwargs["property_name"]
             assert "method" in kwargs, "method must be provided in kwargs"
@@ -129,7 +130,7 @@ class Step:
                 decorator_key = kwargs["path"]
         elif "config_dict_key" in kwargs:
             if "property_name" not in kwargs:
-                property_name = sanitize_name(kwargs["config_dict_key"])
+                property_name = sanitize_property_name(kwargs["config_dict_key"])
             else:
                 property_name = kwargs["property_name"]
             #

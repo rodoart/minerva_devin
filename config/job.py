@@ -5,7 +5,7 @@ from dateutil.relativedelta import relativedelta
 
 from libs.data_engineering_toolbox.path import HivePath
 
-_today = os.environ['RG49392_TODAY']  # fecha de ejecución del job en formato yyyy-mm-dd (validada en config/__init__.py)
+_today = os.environ['MINERVA_TODAY']  # fecha de ejecución del job en formato yyyy-mm-dd (validada en config/__init__.py)
 
 
 # parameters
@@ -19,7 +19,7 @@ IS_DYNAMIC = True                          # modo dinámico: los steps reutiliza
 
 
 # date treatment
-_today_date = datetime.strptime(os.environ['RG49392_TODAY'], DATE_STANDARD_FORMAT).date()  # "hoy" como objeto date
+_today_date = datetime.strptime(os.environ['MINERVA_TODAY'], DATE_STANDARD_FORMAT).date()  # "hoy" como objeto date
 _current_month_date = _today_date - relativedelta(day=1) - relativedelta(months=MAIN_LAG_IN_MONTHS)  # día 1 del mes vintage (mes objetivo = hoy - MAIN_LAG_IN_MONTHS)
 _first_day_of_next_month_date = _current_month_date + relativedelta(months=1)  # primer día del mes siguiente al vintage (cota superior exclusiva del periodo)
 _last_day_of_current_month_date = _first_day_of_next_month_date - relativedelta(days=1)  # último día del mes vintage (cierre del periodo de datos)

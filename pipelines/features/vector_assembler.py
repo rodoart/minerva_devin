@@ -7,6 +7,7 @@
 # General
 # ------------------------------------------------------------------------------
 from typing import Union, Dict
+from functools import reduce
 
 
 # ------------------------------------------------------------------------------
@@ -18,8 +19,8 @@ from pyspark.sql import DataFrame
 # Custom
 # ------------------------------------------------------------------------------
 from libs.data_engineering_toolbox.path import HivePath
-
 import libs.framework as ppf
+from libs.framework.utils import sanitize_column_name
 ###############################################################################
 # Process
 ###############################################################################
@@ -101,16 +102,44 @@ class StandardVectorAssemblerSubStep(SubStep):
     def get_partitioned_input(self, config_dict_key:str) -> DataFrame:
         """Carga particionada (mis_date/process_date) con lag/history del config."""
         return self.standard_load_parquet_or_table(config_dict_key)
-        #
+    #
+    @staticmethod
+    def _partition_suffix(base:HivePath, leaf:HivePath) -> str:
+        """Convierte los segmentos de partición relativos a `base` en un
+        sufijo de columna seguro: `max_iter=10/reset_prob=0.15` -> `max_iter_10_reset_prob_0.15`.
+        """
+        return "_".join(
+            sanitize_column_name(part)
+            for part in leaf.relative_to(base).parts
+        )
+    #
     def get_merge_schema_input(self, property_path:Union[str, HivePath]) -> DataFrame:
-        """Carga un parquet padre con subdirs de esquema distinto (mergeSchema).
+        """Carga un parquet padre con subdirs parametrizados (una variante por
+        combinación de particiones), renombrando la(s) columna(s) de feature
+        con el sufijo derivado de los segmentos de partición y uniendo por
+        `id` (join, no union) para mantener `id` único en el resultado.
+
+        Ejemplo de leaf: `.../weighted_pagerank/max_iter=10/reset_prob=0.15/weight=weighted_mean_oper_mto`
+        -> columna final: `weighted_pagerank_max_iter_10_reset_prob_0.15_weight_weighted_mean_oper_mto`
 
         Útil para outputs parametrizados por nombre de subdirectorio, como
         `target_propagation/weight_type=.../...` donde cada variante añade su
-        propia columna `contagion_<weight>`. Lectura directa (sin decorador):
-        el decorador leería sin mergeSchema y perdería columnas.
+        propia columna `contagion_<weight>`.
         """
-        return (self.sqlContext.read
-            .option("mergeSchema", "true")
-            .parquet(str(property_path)))
+        base = HivePath(property_path)
+        base_name = base.name    # ej. "weighted_pagerank"
+        leaves = list(base.listparquets(recursive=True))
+        df = None
+
+        for leaf in leaves:
+            suffix = self._partition_suffix(base, leaf)
+            sub_df = (self.sqlContext.read
+                .option("mergeSchema", "true")
+                .parquet(str(leaf)))
+            feature_cols = [c for c in sub_df.columns if c != "id"]
+            sub_df = sub_df.select(
+                "id",
+                *[sub_df[c].alias(f"{c}_{suffix}") for c in feature_cols])
+            df = sub_df if df is None else df.join(sub_df, "id")
+        return df
         #

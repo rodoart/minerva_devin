@@ -84,11 +84,11 @@ GRAPH_CENTRALITY_FEATURES = [
     {"pagerank": None},                                  # PageRank no ponderado por nodo (max_iter=10, reset_prob=0.15 por defecto)
     {"degrees": None},                                   # grado de entrada/salida/total por nodo
     {"components": None},                                # id de la componente conexa de cada nodo
-    {"triangle_count": None},                            # nº de triángulos en los que participa cada nodo
-    {"weighted_pagerank": {"weight": "composed"}},       # PageRank ponderado por el peso "composed" de las aristas
-    {"weighted_degrees": {"weight": "composed"}},        # fuerza (strength) in/out/total con peso "composed"
-    {"weighted_edge_stats": {"weight": "composed"}},     # estadísticas del peso de aristas incidentes (in+out)
-    {"weighted_triangle_count": {"weight": "composed"}}, # triángulos por nodo + fuerza ponderada
+    # {"triangle_count": None},                          # nº de triángulos en los que participa cada nodo
+    {"weighted_pagerank": {"weight": "count_txn"}},      # PageRank ponderado por el peso "composed" de las aristas
+    {"weighted_degrees": {"weight": "count_txn"}},       # fuerza (strength) in/out/total con peso "composed"
+    {"weighted_edge_stats": {"weight": "count_txn"}},    # estadísticas del peso de aristas incidentes (in+out)
+    # {"weighted_triangle_count": {"weight": "composed"}}, # triángulos por nodo + fuerza ponderada
 ]
 
 

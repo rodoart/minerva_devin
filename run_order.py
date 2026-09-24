@@ -7,25 +7,25 @@ import os
 from pathlib import Path
 
 # Read environment variables
-WORKSPACE = Path(os.environ['RG49392_WORKSPACE_LINUX'])
-spark_queue = os.environ['RG49392_QUEUE']
-spark_port = int(os.environ['RG49392_PORT'])
-spark_name = os.environ['RG49392_NAME']
-__today = os.environ['RG49392_TODAY']
+WORKSPACE = Path(os.environ['MINERVA_WORKSPACE_DIR_LINUX'])
+spark_queue = os.environ['PYSPARK_QUEUE']
+spark_port = int(os.environ['PYSPARK_PORT'])
+spark_name = os.environ['MINERVA_NAME']
+__today = os.environ['MINERVA_TODAY']
 
 # Add workspace to sys.path
 os.chdir(WORKSPACE)
-ven_zip_linux = os.environ['VENV_ZIP_LINUX']
-ven_zip_hdfs = os.environ['VENV_ZIP_HDFS']
+ven_zip_linux = os.environ['MINERVA_VENV_TAR_GZ_LINUX']
+ven_zip_hdfs = os.environ['MINERVA_VENV_TAR_GZ_HDFS']
 
 jar_linux = os.environ['GRAPHFRAMES_JAR']
 
 # Custom libraries
-from libs.data_engineering_toolbox.context import notebook
+from libs.data_engineering_toolbox.context import SparkSessionBuilder
 
 
 # spark.stop()
-spark = notebook(spark_name, "datalabs", spark_port, jars=str(jar_linux), archive=f"hdfs://{str(ven_zip_hdfs)}")
+spark = SparkSessionBuilder().build()
 
 
 ##########################################################################

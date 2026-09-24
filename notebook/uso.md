@@ -22,17 +22,17 @@ El acceso a HDFS/YARN se configura por env vars (las valida `main.py`):
 
 | Variable | Uso |
 |---|---|
-| `RG49392_WORKSPACE_LINUX` | Ruta de trabajo local del usuario |
-| `RG49392_QUEUE` | Cola YARN (se usa `datalabs` en `main.py`/`run_order.py`) |
-| `RG49392_PORT` | Puerto de la Spark UI |
-| `RG49392_NAME` | Nombre de la aplicación Spark |
-| `RG49392_TODAY` | Fecha del proceso `YYYY-MM-DD` (validada por `config/__init__.py`; define `process_date` y el vintage mensual) |
-| `VENV_ZIP_LINUX` / `VENV_ZIP_HDFS` | Zip del venv (local y su ruta HDFS `hdfs://...` para `archive`) |
+| `MINERVA_WORKSPACE_DIR_LINUX` | Ruta de trabajo local del usuario |
+| `PYSPARK_QUEUE` | Cola YARN (se usa `datalabs` en `main.py`/`run_order.py`) |
+| `PYSPARK_PORT` | Puerto de la Spark UI |
+| `MINERVA_NAME` | Nombre de la aplicación Spark |
+| `MINERVA_TODAY` | Fecha del proceso `YYYY-MM-DD` (validada por `config/__init__.py`; define `process_date` y el vintage mensual) |
+| `MINERVA_VENV_TAR_GZ_LINUX` / `MINERVA_VENV_TAR_GZ_HDFS` | Zip del venv (local y su ruta HDFS `hdfs://...` para `archive`) |
 | `GRAPHFRAMES_JAR` | Path del jar `graphframes-0.81-spark3.0-s2.12.jar` |
 | `HADOOP_CONF_DIR` | Config de Hadoop para comandos HDFS (`HivePath.*`) |
 | `PYLIB` | Opcional: zips pyspark/py4j del cluster |
 
-El vintage se deriva de `RG49392_TODAY` en `config/job.py` (`vintage`, `vintage_date`, `process_date`, `date_treatment`).
+El vintage se deriva de `MINERVA_TODAY` en `config/job.py` (`vintage`, `vintage_date`, `process_date`, `date_treatment`).
 
 ## 2. Ejecución
 

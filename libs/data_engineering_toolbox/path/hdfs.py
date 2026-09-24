@@ -172,7 +172,7 @@ _LS_PRINT_PATTERN = re.compile(
     '([d\-]{1})' # file_type
     +'([rwx\-\+]{9,10})' # permissions
     +'\s+'
-    +'([\-d]{1})' # copies
+    +'([\-\d]{1})' # copies
     +'\s+'
     +'([a-z0-9]+)' # user
     +'\s+'
@@ -182,9 +182,8 @@ _LS_PRINT_PATTERN = re.compile(
     +'\s+'
     +'(\d{4}-\d{2}-\d{2} \d{2}:\d{2})' # date_and_time
     +'\s+'
-    +'([\w\/\d\.\-\=]+)' #'path
+    +'([\w\/\d\.\-\=\:]+)' # path (incluye ':' para hdfs://host:port/...)
 )
-
 _DATETIME_FORMAT = '%Y-%m-%d %H:%M'
 
 

@@ -5,30 +5,32 @@ Ejecuta el flujo completo de extracción, features de grafo, propagación de
 target y VectorAssembler a nivel numcliente.
 
 Requiere las variables de entorno:
-    RG49392_WORKSPACE_LINUX, RG49392_QUEUE, RG49392_PORT, RG49392_NAME,
-    RG49392_TODAY, VENV_ZIP_LINUX, VENV_ZIP_HDFS, GRAPHFRAMES_JAR
+    MINERVA_WORKSPACE_DIR_LINUX, PYSPARK_QUEUE, PYSPARK_PORT, MINERVA_NAME,
+    MINERVA_TODAY, MINERVA_VENV_TAR_GZ_LINUX, MINERVA_VENV_TAR_GZ_HDFS, GRAPHFRAMES_JAR
 
 Uso:
     python main.py [--level INFO] [--log-file run.log] [--build-only]
                    [--cleanup | --cleanup-only]
 """
 import argparse
-import logging
 import os
 import sys
 import time
 
-logger = logging.getLogger("minerva")
+from typing import Optional
+
+from libs.data_engineering_toolbox.context.logging import get_logger, setup_logging
+logger = get_logger(__name__)
 
 REQUIRED_ENV_VARS = [
-    "RG49392_WORKSPACE_LINUX",
-    "RG49392_QUEUE",
-    "RG49392_PORT",
-    "RG49392_NAME",
-    "RG49392_TODAY",
-    "VENV_ZIP_LINUX",
-    "VENV_ZIP_HDFS",
-    "GRAPHFRAMES_JAR",
+    "MINERVA_WORKSPACE_DIR_LINUX",
+    "PYSPARK_QUEUE",
+    "PYSPARK_PORT",
+    "MINERVA_NAME",
+    "MINERVA_TODAY",
+    "MINERVA_VENV_TAR_GZ_LINUX",
+    "MINERVA_VENV_TAR_GZ_HDFS",
+    "MINERVA_GRAPHFRAMES_JAR_HDFS",
 ]
 
 
@@ -51,17 +53,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def configure_logging(level:str, log_file:str = None) -> None:
-    handlers = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file))
-    logging.basicConfig(
-        level=getattr(logging, level),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=handlers,
-        force=True,
-    )
+def configure_logging(level:str, log_file:Optional[str] = None) -> None:
+    setup_logging(level=level, force_reload=True, log_file=log_file)
 
 
 def check_environment() -> None:
@@ -74,16 +67,10 @@ def check_environment() -> None:
 
 def build_spark():
     """Crea la SparkSession remota del clúster (mismos parámetros que run_order)."""
-    from libs.data_engineering_toolbox.context import notebook
-    spark = notebook(
-        os.environ["RG49392_NAME"],
-        "datalabs",
-        int(os.environ["RG49392_PORT"]),
-        jars=str(os.environ["GRAPHFRAMES_JAR"]),
-        archive=f"hdfs://{os.environ['VENV_ZIP_HDFS']}",
-    )
+    from libs.data_engineering_toolbox.context import SparkSessionBuilder
+    spark = SparkSessionBuilder().build()
     logger.info("SparkSession creada (app=%s, queue=datalabs)",
-        os.environ["RG49392_NAME"])
+        os.environ["MINERVA_NAME"])
     return spark
 
 
@@ -115,7 +102,8 @@ def build_pipeline(spark):
     import config.target_propagation.lovelace.special_treatment as ctp_l_st
     import config.features.ceps.target_propagation_features as cfcf
     import config.features.ceps.vector_assembler as cvas
-
+    #
+    configure_logging(level="WARNING")
     logger.info("Construyendo cadena de steps del pipeline")
 
     ceps_rfs_nom_ranking_step = p_c_rnr.CepsRfcNomRankingStep(
@@ -206,7 +194,7 @@ def build_pipeline(spark):
 
 def main() -> int:
     args = parse_args()
-    configure_logging(args.level, args.log_file)
+
     logger.info("=== Inicio del pipeline Minerva ===")
     start = time.time()
     try:

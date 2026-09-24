@@ -72,25 +72,27 @@ class TestCheckEnvironment:
 
 
 class TestMainFlow:
-    def test_fails_without_env_vars(self, monkeypatch, capsys):
+    def test_fails_without_env_vars(self, monkeypatch, caplog):
         for var in main.REQUIRED_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
-        with patch.object(sys, "argv", ["main.py"]):
+        with patch.object(sys, "argv", ["main.py"]), \
+             caplog.at_level(logging.ERROR):
             exit_code = main.main()
         assert exit_code == 1
-        assert "El pipeline falló" in capsys.readouterr().out
+        assert "El pipeline falló" in caplog.text
 
-    def test_build_only_skips_execute(self, monkeypatch, capsys):
+    def test_build_only_skips_execute(self, monkeypatch, caplog):
         for var in main.REQUIRED_ENV_VARS:
             monkeypatch.setenv(var, "x")
         fake_step = type("FakeStep", (), {"step_name": "fake_step"})()
         with patch.object(main, "build_spark", return_value="SPARK"), \
              patch.object(main, "build_pipeline", return_value=fake_step) as bp, \
-             patch.object(sys, "argv", ["main.py", "--build-only"]):
+             patch.object(sys, "argv", ["main.py", "--build-only"]), \
+             caplog.at_level(logging.INFO):
             exit_code = main.main()
         assert exit_code == 0
         assert bp.call_count == 1
-        assert "build-only" in capsys.readouterr().out
+        assert "build-only" in caplog.text
 
     def test_execute_called_on_last_step(self, monkeypatch):
         for var in main.REQUIRED_ENV_VARS:

@@ -422,8 +422,8 @@ class TestCastToSchema:
 # ----------------------------------------------------------------------------
 
 class TestDynamicUnpartitionedParquet:
-    def test_computes_writes_and_reloads(self, spark, tmp_path):
-        path = str(tmp_path / "out")
+    def test_computes_writes_and_reloads(self, spark, tmp_hdfs):
+        path = str(tmp_hdfs / "out")
 
         class S(DummyStep):
             sqlContext = spark
@@ -435,7 +435,7 @@ class TestDynamicUnpartitionedParquet:
         s.is_dynamic = True
         df = s.make()
         assert df.count() == 1
-        assert (tmp_path / "out").exists()
+        assert (tmp_hdfs / "out").exists()
 
         # segunda llamada: recarga del parquet (no re-computa)
         class S2(DummyStep):
@@ -451,8 +451,8 @@ class TestDynamicUnpartitionedParquet:
         assert s2.calls == 0                      # no recomputó
         assert df2.collect()[0]["n"] == 1         # datos originales
 
-    def test_not_dynamic_always_computes(self, spark, tmp_path):
-        path = str(tmp_path / "out2")
+    def test_not_dynamic_always_computes(self, spark, tmp_hdfs):
+        path = str(tmp_hdfs / "out2")
 
         class S(DummyStep):
             sqlContext = spark
@@ -468,8 +468,8 @@ class TestDynamicUnpartitionedParquet:
         s.make()
         assert s.calls == 2
 
-    def test_keep_or_delete_appends_tmp_path(self, spark, tmp_path):
-        path = str(tmp_path / "tmp_out")
+    def test_keep_or_delete_appends_tmp_path(self, spark, tmp_hdfs):
+        path = str(tmp_hdfs / "tmp_out")
 
         class S(DummyStep):
             sqlContext = spark
@@ -484,11 +484,11 @@ class TestDynamicUnpartitionedParquet:
         assert len(s.tmp_paths) == 1
         assert str(s.tmp_paths[0]) == path
 
-    def test_config_dict_key_simple_dict_uses_unpartitioned(self, spark, tmp_path):
+    def test_config_dict_key_simple_dict_uses_unpartitioned(self, spark, tmp_hdfs):
         """Un dict de config de 2 claves (table_or_hdfs + keep_or_delete) debe
         elegir el decorador unpartitioned; uno particionado (>=7 claves) elige
         el decorador particionado."""
-        path = str(tmp_path / "edges_out")
+        path = str(tmp_hdfs / "edges_out")
         s = make_step(output_hive={
             "edges": {"table_or_hdfs": path, "keep_or_delete": "keep"}})
         s.is_dynamic = True
@@ -499,4 +499,4 @@ class TestDynamicUnpartitionedParquet:
             method=lambda *a, **k: spark.createDataFrame([(1,)], ["n"]),
         )
         assert df.count() == 1
-        assert (tmp_path / "edges_out").exists()
+        assert (tmp_hdfs / "edges_out").exists()

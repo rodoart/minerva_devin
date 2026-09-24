@@ -13,7 +13,7 @@ minerva_devin/
 ├── environment.yaml          # env conda (spark 3.3.2, py3.10, graphframes vía pip)
 ├── jars/graphframes-0.81-spark3.0-s_2.12.jar
 ├── config/                   # dicts input/output por step (única fuente de rutas)
-│   ├── __init__.py           # sys.path root + validación de RG49392_TODAY/pyspark
+│   ├── __init__.py           # sys.path root + validación de MINERVA_TODAY/pyspark
 │   ├── job.py                # fechas, vintage, cohort=SBX, root HDFS
 │   ├── ceps/                 # rfc_nom_ranking, txn_replacement
 │   ├── graph_making/ceps/    # special_treatment, group_by, edges_and_nodes
@@ -215,7 +215,7 @@ Suite de pytest (~200 tests). Ejecución: `python -m pytest tests/`.
 - **`conftest.py`** — fixtures: `spark` (SparkSession local[2], salta si no hay
   pyspark), `graphframes` (salta si el jar no carga), `checkpoint_dir`,
   `df_factory`. Markers: `spark`, `graphframes`.
-- **Puros** (corren en cualquier entorno): `test_sanitize_name` (utils.py
+- **Puros** (corren en cualquier entorno): `test_sanitize_property_name` (utils.py
   cargado aislado vía importlib, evita importar el paquete con deps Spark),
   `test_hive_path` (path ops + `_ls`/`exists`/`is_dir` con monkeypatch),
   `test_date_treatment`, `test_main` (argparse, env vars, logging, flujo con
@@ -245,7 +245,7 @@ Suite de pytest (~200 tests). Ejecución: `python -m pytest tests/`.
 - `libs/data_engineering_toolbox/__init__.py`: el sys.path hack PYLIB + assert
   HADOOP_CONF_DIR rompía cualquier import fuera del cluster → ahora
   condicional + warning.
-- `sanitize_name` no colapsa `-` (solo `_`): documentado en test.
+- `sanitize_property_name` no colapsa `-` (solo `_`): documentado en test.
 
 ## Pendiente según el concept design
 

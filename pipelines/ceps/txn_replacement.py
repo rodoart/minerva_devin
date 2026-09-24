@@ -5,7 +5,6 @@
 # ----------------------------------------------------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------------------------------------------------
-import logging
 from typing import List, Union, Dict
 from threading import Lock
 
@@ -25,7 +24,8 @@ from libs.data_engineering_toolbox.path import HivePath
 
 import libs.framework as ppf
 
-logger = logging.getLogger(__name__)
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 
 ########################################################################################################################
 # FUNCTIONS

@@ -175,9 +175,10 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
                 df, {c: ["value", cvas.FILL_NULLS_VALUE] for c in self.vector_columns}
             )
         #
-        return assemble_vector(
+        return (assemble_vector(
             df,
             feature_columns=self.vector_columns,
             output_column=cvas.VECTOR_OUTPUT_COLUMN,
             handle_invalid=cvas.HANDLE_INVALID,
         )
+        .drop(*self.vector_columns))

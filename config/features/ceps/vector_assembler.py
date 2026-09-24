@@ -32,7 +32,7 @@ job_config = c_j.sbx  # config del job (raíz HDFS, fechas, cohortes)
 # --------------------------------------------------------------------------------------
 
 # Columna del pivote externo con la lista de numclientes (se renombra a "numcliente").
-PIVOT_COLUMN = "num_cliente"
+PIVOT_COLUMN = "numcliente"
 
 # Columna array de los nodos que contiene los numclientes asociados a cada id.
 NODE_ID_ARRAY_COLUMN = "numcliente"
@@ -80,7 +80,7 @@ current_hdfs = _general_root_hdfs.joinpath("features/ceps/vector_assembler")  # 
 input = {
     # Pivote externo: misma fuente que lovelace_target; de ella solo se toma la
     # lista de numclientes (cast a string + distinct) para los que se genera vector.
-    "pivot": {"table_or_hdfs": ctp_l_st.input["lovelace_target"]["table_or_hdfs"],
+    "pivot": {"table_or_hdfs": ctp_l_st.output["target_numcliente"]["table_or_hdfs"],
         "pivot_column": PIVOT_COLUMN},     # columna que se renombra a "numcliente"
     "nodes": ccen.output["nodes"],          # nodos del grafo: aportan el array `numcliente` y oper_mto (peso)
     "nodes_join_target_lovelace": cfcf.output["nodes_join_target_lovelace"],  # nodos + etiqueta target_lovelace
@@ -94,12 +94,13 @@ input = {
 #                      leído con mergeSchema; las variantes se colapsan a una fila
 #                      por `id` (max de cada columna contagion_*).
 _GRAPH_FEATURE_KEYS = [  # claves de `output` de graph_features leídas como fuentes "simple"
-    "pagerank", "degrees", "components", "triangle_count",
+    "pagerank", "degrees", "components",
+    # "triangle_count",
     "weighted_pagerank", "weighted_degrees", "weighted_edge_stats",
-    "weighted_triangle_count",
+    # "weighted_triangle_count",
 ]
 FEATURE_SOURCES = {
-    key: {"mode": "simple", "path": cfgf.output[key]["table_or_hdfs"]}
+    key: {"mode": "merge_schema", "path": cfgf.output[key]["table_or_hdfs"]}
     for key in _GRAPH_FEATURE_KEYS
 }
 # Scores de contagio: el padre target_propagation contiene un subdir por

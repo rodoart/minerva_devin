@@ -11,8 +11,8 @@ import pytest
 
 pytest.importorskip("pyspark")
 
-# config.job exige RG49392_TODAY en import; los tests usan un vintage fijo.
-os.environ.setdefault("RG49392_TODAY", "2025-08-31")
+# config.job exige MINERVA_TODAY en import; los tests usan un vintage fijo.
+os.environ.setdefault("MINERVA_TODAY", "2025-08-31")
 
 import libs.framework as ppf
 from pipelines.graph_making.special_treatment import StandardExtractSubStep

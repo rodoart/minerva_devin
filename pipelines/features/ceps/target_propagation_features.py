@@ -22,7 +22,7 @@ from pyspark.sql.functions import (col,
 # Custom
 # ------------------------------------------------------------------------------
 from libs.data_engineering_toolbox.path import HivePath
-from libs.framework.utils import sanitize_name
+from libs.framework.utils import sanitize_path_name
 from libs.functions.missing_treatment import apply_missing_treatment
 
 import libs.functions.features as lff
@@ -33,8 +33,8 @@ import config.features.ceps.target_propagation_features as cfcf
 
 import libs.framework as ppf
 
-import logging
-logger = logging.getLogger(__name__)
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 ###############################################################################
 # Process
 ###############################################################################
@@ -247,7 +247,7 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
             **kwargs
         }
         naming_items = [
-            (sanitize_name(k), sanitize_name(v)) for k, v in all_kwargs.items()
+            (sanitize_path_name(k), sanitize_path_name(v)) for k, v in all_kwargs.items()
             if k in naming_kwargs and isinstance(v, (str, int, float, bool))
         ]
         #
@@ -330,7 +330,7 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
             **kwargs
         }
         naming_items = [
-            (sanitize_name(k), sanitize_name(v)) for k, v in all_kwargs.items()
+            (sanitize_path_name(k), sanitize_path_name(v)) for k, v in all_kwargs.items()
             if k in naming_kwargs and isinstance(v, (str, int, float, bool))
         ]
         #

@@ -1,4 +1,3 @@
-import logging
 from copy import deepcopy
 from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
@@ -15,7 +14,8 @@ from ...path import HivePath
 from ...general.date_treatment import make_date_interval_with_lag_months
 from . import is_table_or_parquet
 
-logger = logging.getLogger(__name__)
+from ...context.logging import get_logger
+logger = get_logger(__name__)
 
 def get_partitions_from_parquet_path(parquet_hdfs: Union[HivePath, str], session: Optional[SparkSession]=None) -> List[Dict[str, str]]:
     """

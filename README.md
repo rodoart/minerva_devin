@@ -10,7 +10,7 @@ hasta nivel `numcliente`, listo para `pyspark.ml` (`VectorAssembler`).
 conda env create -f environment.yaml && conda activate minerva_devin
 
 # env vars requeridas (ver notebook.md/uso.md §1)
-export RG49392_TODAY=2025-08-31  # ... y el resto
+export MINERVA_TODAY=2025-08-31  # ... y el resto
 
 python main.py                   # ejecuta el flujo completo (9 steps)
 python main.py --build-only      # smoke test de la cadena sin ejecutar
@@ -44,6 +44,6 @@ python -m pytest tests/          # tests unitarios
   `arquitectura.md` (estructura y decisiones de refactor), `screenshots/`
   (capturas fuente del código).
 
-Variables de entorno requeridas: `RG49392_WORKSPACE_LINUX`, `RG49392_QUEUE`,
-`RG49392_PORT`, `RG49392_NAME`, `RG49392_TODAY`, `VENV_ZIP_LINUX`,
-`VENV_ZIP_HDFS`, `GRAPHFRAMES_JAR` (+ `HADOOP_CONF_DIR` para operaciones HDFS).
+Variables de entorno requeridas: `MINERVA_WORKSPACE_DIR_LINUX`, `PYSPARK_QUEUE`,
+`PYSPARK_PORT`, `MINERVA_NAME`, `MINERVA_TODAY`, `MINERVA_VENV_TAR_GZ_LINUX`,
+`MINERVA_VENV_TAR_GZ_HDFS`, `GRAPHFRAMES_JAR` (+ `HADOOP_CONF_DIR` para operaciones HDFS).

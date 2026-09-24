@@ -20,14 +20,14 @@ from graphframes import GraphFrame
 # Custom
 # ------------------------------------------------------------------------------
 from libs.data_engineering_toolbox.path import HivePath
-from libs.framework.utils import sanitize_name
+from libs.framework.utils import sanitize_property_name, sanitize_path_name
 
 import libs.functions.features as lff
 import libs.functions.weights as lfw
 import libs.framework as ppf
 
-import logging
-logger = logging.getLogger(__name__)
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 ###############################################################################
 # FUNCTIONS
 ###############################################################################
@@ -95,7 +95,7 @@ class SubStep(ppf.Step):
         #
         return self.get_cached_decorated_table_or_parquet_property(
             method=make_graph,
-            property_name=f"graph_{sanitize_name(value=weight) or 'default'}",
+            property_name=f"graph_{sanitize_property_name(value=weight) or 'default'}",
             edges_df=edges_df,
             nodes_df=nodes_df
         )
@@ -108,7 +108,7 @@ class SubStep(ppf.Step):
                              "aggregations"]   # <- objetos Column: NO al path
         # Solo escalares simples definen identidad/path.
         naming_items = [
-            (sanitize_name(k), sanitize_name(v)) for k, v in kwargs.items()
+            (sanitize_path_name(k), sanitize_path_name(v)) for k, v in kwargs.items()
             if k not in not_naming_kwargs and isinstance(v, (str, int, float, bool))
         ]
         subdir = "/".join(f"{k}={v}" for k, v in naming_items)

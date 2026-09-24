@@ -12,6 +12,7 @@ from fnmatch import fnmatch
 from typing import Optional, Dict, Callable, Union
 from operator import itemgetter
 from multiprocessing.pool import ThreadPool
+import sys
 
 
 from .hdfs import mkdir, exists, _ls, is_dir, is_file, touch, rmdir, mv, hdfs_command
@@ -32,12 +33,17 @@ class HivePath(type(PurePosixPath())):
     #
     #
     def __init__(self, *pathsegments, **kwargs) -> None:
-        # Python 3.13: el parsing de pathlib ocurre en __init__ (en <3.13 era __new__).
-        super().__init__(*pathsegments)
+        # En Python >= 3.13 el parsing de pathlib se movió a __init__.
+        # En Python < 3.13 (tu caso: 3.10.18), PurePath no define __init__
+        # con argumentos: __new__ ya hizo todo el trabajo.
+        if sys.version_info >= (3, 13):
+            super().__init__(*pathsegments)
+        else:
+            super().__init__()
         # Load kwargs
-        empty_dict = {key:None for key in self.DICT_NAMES if key not in list(kwargs.keys())}
+        empty_dict = {key: None for key in self.DICT_NAMES if key not in list(kwargs.keys())}
         empty_dict.update(kwargs)
-        empty_dict.pop('path')
+        empty_dict.pop('path', None)  # evita KeyError si 'path' no viene en kwargs
         self.__dict__.update(empty_dict)
     #
     #

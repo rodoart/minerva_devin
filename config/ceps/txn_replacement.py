@@ -1,8 +1,10 @@
 from libs.data_engineering_toolbox.path import HivePath
 from ..job import sbx as job_config   # config del job (raíz HDFS de salidas, cohorte, lag, is_dynamic)
 
-import logging
-logger = logging.getLogger(__name__)
+
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
+
 
 # Se reutilizan la historia máxima y los outputs del pipeline de ranking:
 # este step lee como entrada exactamente lo que CepsRfcNomRankingStep escribió
