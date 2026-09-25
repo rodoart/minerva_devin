@@ -90,6 +90,7 @@ def build_pipeline(spark):
     import pipelines.features.ceps.graph_features as p_f_cgf
     import pipelines.target_propagation.lovelace.special_treatment as p_tp_l_st
     import pipelines.features.ceps.target_propagation_features as p_f_tp
+    import pipelines.features.ceps.cluster_features as p_f_clf
     import pipelines.features.ceps.vector_assembler as p_f_va
     # --- configs ---
     import config.job as cj
@@ -101,6 +102,7 @@ def build_pipeline(spark):
     import config.features.ceps.graph_features as cfgf
     import config.target_propagation.lovelace.special_treatment as ctp_l_st
     import config.features.ceps.target_propagation_features as cfcf
+    import config.features.ceps.cluster_features as cclf
     import config.features.ceps.vector_assembler as cvas
     #
     configure_logging(level="WARNING")
@@ -177,6 +179,15 @@ def build_pipeline(spark):
         sqlContext=spark,
         previous_step=[target_propagation_step],
     )
+    cluster_features_step = p_f_clf.CepsClusterFeaturesStep(
+        date_treatment=cj.date_treatment,
+        input_hive=cclf.input,
+        output_hive=cclf.output,
+        is_dynamic=True,
+        cohort=cj.COHORT,
+        sqlContext=spark,
+        previous_step=[target_propagation_features_step],
+    )
     vector_assembler_step = p_f_va.CepsVectorAssemblerStep(
         date_treatment=cj.date_treatment,
         input_hive=cvas.input,
@@ -184,10 +195,10 @@ def build_pipeline(spark):
         is_dynamic=True,
         cohort=cj.COHORT,
         sqlContext=spark,
-        previous_step=[target_propagation_features_step],
+        previous_step=[cluster_features_step],
     )
 
-    logger.info("Cadena construida: 9 steps (último: %s)",
+    logger.info("Cadena construida: 10 steps (último: %s)",
         vector_assembler_step.step_name)
     return vector_assembler_step
 

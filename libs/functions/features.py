@@ -330,6 +330,38 @@ def join_target(
 
 
 ###############################################################################
+# CLUSTER FEATURES
+###############################################################################
+
+def cluster_group_stats(
+    nodes:DataFrame,
+    group_column:str,
+    aggregate_columns:List[str],
+    stats:Optional[Dict[str, Callable[..., Column]]] = None,
+    prefix:str = "cluster"
+) -> DataFrame:
+    """Estadísticos intra-grupo por nodo.
+
+    Agrega `aggregate_columns` por `group_column` y re-une por `id`, de modo que
+    cada nodo queda enriquecido con las estadísticas del grupo al que pertenece.
+
+    Columnas resultantes: `{prefix}_{group_column}_size` (nº de miembros) +
+    `{prefix}_{group_column}_{stat}_{column}` por cada stat y columna agregada.
+    """
+    if stats is None:
+        stats = STANDARD_WEIGHT_STATS
+    grouped = nodes.groupBy(group_column).agg(
+        spark_count("*").alias(f"{prefix}_{group_column}_size"),
+        *[func(c).alias(f"{prefix}_{group_column}_{func_name}_{c}")
+          for c in aggregate_columns for func_name, func in stats.items()],
+    )
+    return (
+        nodes.select("id", group_column)
+        .join(grouped, on=group_column, how="left")
+    )
+
+
+###############################################################################
 # REGISTRY
 ###############################################################################
 

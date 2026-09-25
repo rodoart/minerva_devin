@@ -5,7 +5,7 @@
 # ----------------------------------------------------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------------------------------------------------
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
 from threading import Lock
 
 write_lock = Lock()
@@ -13,10 +13,10 @@ write_lock = Lock()
 # ----------------------------------------------------------------------------------------------------------------------
 # Pyspark
 # ----------------------------------------------------------------------------------------------------------------------
-from pyspark.sql import DataFrame, Window
+from pyspark.sql import DataFrame, Window, Column
 
 from pyspark.sql.functions import (col, regexp_replace, to_date, trim,
-    when, lit, concat_ws,
+    when, lit, concat_ws, coalesce,
     sum as spark_sum, row_number, create_map, count as spark_count, max as spark_max,
     upper, date_format, split, translate
 )
@@ -31,15 +31,19 @@ import libs.framework as ppf
 from config.ceps.rfc_nom_ranking import (CURP_PATTERN, RFC_FISICA_PATTERN,
     RFC_FISICA_SIN_HOMOCLAVE_PATTERN, RFC_MORAL_PATTERN, TC_PATTERN,
     CLABE_PATTERN, RFC_NULL_SYNONYMS, NOM_NULL_SYNONYMS,
-    RFC_CURP_KIND_PRIORITY, RFC_BY_CTA_PRIORITY_WINDOW, RFC_BY_NOM_PRIORITY_WINDOW
+    RFC_CURP_KIND_PRIORITY, RFC_BY_CTA_PRIORITY_WINDOW, RFC_BY_NOM_PRIORITY_WINDOW,
+    SOURCE_PRIORITY, S264_SOURCE, BXICO_SOURCE
 )
 from config.job import DATE_STANDARD_SPARK_FORMAT, DATE_MONTH_SPARK_FORMAT
+
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 
 ########################################################################################################################
 # FUNCTIONS
 ########################################################################################################################
 
-norm = lambda raw_col: upper(regexp_replace(trim(col(raw_col)), r"[A-Z]$", ""))
+norm = lambda raw_col: upper(regexp_replace(trim(col(raw_col)), r"\s+[A-Z]$", ""))
 
 def add_id_validation_flags(df: DataFrame, raw_col: str, suffix: str) -> DataFrame:
     """Clasifica el tipo de identificador fiscal/bancario de una columna de texto.
@@ -180,6 +184,131 @@ def normalizar_espacios(col_name:str) -> Callable[..., DataFrame]:
 
 
 mapping_RFC_CURP_KIND_PRIORITY = create_map([lit(x) for x in sum(RFC_CURP_KIND_PRIORITY.items(), ())])
+mapping_SOURCE_PRIORITY = create_map([lit(x) for x in sum(SOURCE_PRIORITY.items(), ())])
+
+
+def merge_name_parts(*part_cols:str) -> Column:
+    """Concatena las partes de un nombre sin duplicar las ya contenidas.
+
+    Construye el nombre completo a partir de columnas de partes (nombres y
+    apellidos): cada parte se añade solo si no es nula/vacía y no está ya
+    contenida en el nombre acumulado. Cubre los casos del catálogo Banxico en
+    los que `nombre_1` ya trae nombre_1+nombre_2 o incluso los apellidos, y
+    `apellido_paterno` trae ambos apellidos.
+
+    Args:
+        part_cols: Nombres de columna en orden de concatenación.
+
+    Returns:
+        Columna `nom` con las partes unidas por espacio (null si todas son
+        nulas/vacías).
+    """
+    merged = lit(None).cast("string")
+    for part_col in part_cols:
+        p = col(part_col)
+        merged = (when(p.isNull() | (trim(p) == ""), merged)
+            .when(merged.isNull(), p)
+            .when(merged.contains(p), merged)
+            .otherwise(concat_ws(" ", merged, p)))
+    return merged
+
+
+def build_ban_catalog(s264_ceps:DataFrame) -> DataFrame:
+    """Catálogo `nom_ban` normalizado -> `id_ban` derivado del histórico s264.
+
+    Une los bancos emisores y receptores del CEP (columnas ya renombradas a
+    `_ord`/`_ben`), normaliza el nombre del banco igual que los nombres de
+    cliente (acentos + separadores + upper) y deduplica quedándose con el
+    `id_ban` máximo por nombre.
+
+    Args:
+        s264_ceps: DataFrame del CEP con `id_ban_ord`/`nom_ban_ord` e
+            `id_ban_ben`/`nom_ban_ben`.
+
+    Returns:
+        DataFrame `nom_ban_key`, `id_ban` para cruzar `banco_cta` del
+        catálogo Banxico.
+    """
+    ord_cat = s264_ceps.select(
+        col("id_ban_ord").alias("id_ban"), col("nom_ban_ord").alias("nom_ban"))
+    ben_cat = s264_ceps.select(
+        col("id_ban_ben").alias("id_ban"), col("nom_ban_ben").alias("nom_ban"))
+    return (ord_cat.unionByName(ben_cat)
+        .filter(col("id_ban").isNotNull() & col("nom_ban").isNotNull())
+        .transform(limpiar_acentos("nom_ban"))
+        .transform(normalizar_espacios("nom_ban"))
+        .withColumn("nom_ban_key", upper(trim(col("nom_ban"))))
+        .groupBy("nom_ban_key")
+        .agg(spark_max("id_ban").alias("id_ban"))
+    )
+
+
+def prepare_bxico_catalog(
+    bxico_cat:DataFrame,
+    ban_catalog:DataFrame
+) -> DataFrame:
+    """Prepara el catálogo Banxico proyectándolo al esquema de `s264_ceps_flattened`.
+
+    Pasos:
+      1. Dedup por `cta` quedándose con la fila de `fecha_de_subida` más
+         reciente (desempate determinista por rfc/curp).
+      2. Limpieza de cada parte del nombre con el MISMO proceso que
+         `s264_ceps_cleaned` (norm -> null synonyms -> banamex -> acentos ->
+         espacios) y `nom` vía `merge_name_parts` sin duplicar partes.
+      3. `rfc_curp`: RFC válido primero, si no CURP válido, si no el primer
+         no-nulo; validado con los mismos criterios (`add_id_validation_flags`).
+      4. `id_ban` cruzando `banco_cta` (nombre del banco) con `ban_catalog`.
+      5. `source` = "bxico_rfc_curp_cat"; `oper_mto` = 0.0.
+
+    Las columnas que el aplanado tiene y aquí no se generan (tipo_cta,
+    hora_oper, particiones) las rellena el `unionByName(allowMissingColumns)`
+    con null.
+    """
+    name_cols = ["nombre_1", "nombre_2", "apellido_paterno", "apellido_materno"]
+    df = (bxico_cat
+        .filter(col("cta").isNotNull())
+        .withColumn("cta", trim(col("cta")))
+        .withColumn("_rn", row_number().over(
+            Window.partitionBy("cta").orderBy(
+                to_date(col("fecha_de_subida"), DATE_STANDARD_SPARK_FORMAT).desc_nulls_last(),
+                col("rfc").asc_nulls_last(),
+                col("curp").asc_nulls_last(),
+            )))
+        .filter(col("_rn") == 1).drop("_rn"))
+    for name_col in name_cols:
+        df = (df
+            .withColumn(name_col, norm(name_col))
+            .withColumn(name_col, when(col(name_col).isin(NOM_NULL_SYNONYMS), None).otherwise(col(name_col)))
+            .transform(banamex_nom_reorder(name_col))
+            .transform(limpiar_acentos(name_col))
+            .transform(normalizar_espacios(name_col)))
+    df = (df
+        .withColumn("nom", merge_name_parts(*name_cols))
+        .transform(lambda d: add_id_validation_flags(d, "rfc", "bx_rfc"))
+        .transform(lambda d: add_id_validation_flags(d, "curp", "bx_curp"))
+        .withColumn("rfc_curp",
+            when(col("is_any_valid_bx_rfc") == 1, col("rfc"))
+            .when(col("is_any_valid_bx_curp") == 1, col("curp"))
+            .otherwise(coalesce(col("rfc"), col("curp"))))
+        .transform(lambda d: add_id_validation_flags(d, "rfc_curp", "bx"))
+        .transform(limpiar_acentos("banco_cta"))
+        .transform(normalizar_espacios("banco_cta"))
+        .withColumn("nom_ban_key", upper(trim(col("banco_cta"))))
+        .join(ban_catalog, "nom_ban_key", "left")
+    )
+    return df.select(
+        col("nom"),
+        col("cta"),
+        col("id_ban"),
+        col("rfc_curp"),
+        col("id_kind_bx").alias("rfc_curp_kind"),
+        col("is_any_valid_bx").alias("is_rfc_curp_valid"),
+        date_format(
+            to_date(col("fecha_de_subida"), DATE_STANDARD_SPARK_FORMAT),
+            DATE_STANDARD_SPARK_FORMAT).alias("fec_informacion"),
+        lit(0.0).alias("oper_mto"),
+        lit(BXICO_SOURCE).alias("source"),
+    )
 
 ########################################################################################################################
 # Process
@@ -195,6 +324,24 @@ class SubStep(ppf.Step):
     def __init__(self, parent: "CepsHistoryStep", *args, **kwargs) -> None:
         super().__init__(parent, *args, **kwargs)
         ppf.inherit_parent_step_attributes(self, parent)
+    #
+    def optional_input(self, config_dict_key:str, input_or_output:str = "input") -> Optional[DataFrame]:
+        """Carga un input opcional: `None` si no está configurado o no se puede leer.
+
+        Permite que fuentes como el catálogo Banxico (`bxico_rfc_curp_cat`) sean
+        prescindibles: si la tabla/path no existe o falla la carga, el pipeline
+        continúa sin ellas.
+        """
+        config_dict = self.input_hive if input_or_output == "input" else self.output_hive
+        if config_dict_key not in config_dict:
+            return None
+        try:
+            return self.standard_load_parquet_or_table(config_dict_key, input_or_output)
+        except Exception as exc:
+            logger.warning(
+                "Input opcional %r no disponible (%s); se continúa sin él",
+                config_dict_key, exc)
+            return None
 
 
 class CepsRfcNomRankingStep(ppf.Step):
@@ -485,6 +632,7 @@ class CepsExtractStep(SubStep):
         #
         return (
             s264_ceps_flattened_ord.unionByName(s264_ceps_flattened_ben)
+            .withColumn("source", lit(S264_SOURCE))   # origen: transacciones CEP (vs catálogo Banxico)
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
             .withColumn("mis_date", date_format(to_date(col("fec_informacion"), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
@@ -519,6 +667,27 @@ class CepsRankStep(SubStep):
         )
         #   #
     @ppf.cached_property
+    def bxico_rfc_curp_cat(self) -> Optional[DataFrame]:
+        """Catálogo oficial de clientes de Banxico (input opcional).
+
+        `None` si la tabla no está configurada o no se puede leer: en ese caso
+        el ranking sigue solo con s264_ceps.
+        """
+        return self.optional_input("bxico_rfc_curp_cat")
+        #
+    @ppf.cached_property
+    def ban_catalog(self) -> DataFrame:
+        """Catálogo `nom_ban` normalizado -> `id_ban` derivado de s264_ceps."""
+        return build_ban_catalog(self.parent.ceps_extract_step.s264_ceps)
+        #
+    @ppf.cached_property
+    def bxico_flattened(self) -> Optional[DataFrame]:
+        """Catálogo Banxico proyectado al esquema aplanado (`source` = bxico_rfc_curp_cat)."""
+        if self.bxico_rfc_curp_cat is None:
+            return None
+        return prepare_bxico_catalog(self.bxico_rfc_curp_cat, self.ban_catalog)
+        #
+    @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened_groupby")
     def s264_ceps_flattened_groupby(self) -> DataFrame:
         """Agrega el histórico aplanado por combinación única entidad-identificador.
@@ -531,22 +700,35 @@ class CepsRankStep(SubStep):
         """
         s264_ceps_flattened:DataFrame = self.parent.ceps_extract_step.s264_ceps_flattened[0]
         #
+        # `source` puede faltar en parquets escritos antes de integrar el catálogo.
+        if "source" not in s264_ceps_flattened.columns:
+            s264_ceps_flattened = s264_ceps_flattened.withColumn("source", lit(S264_SOURCE))
+        #
+        # Integración del catálogo Banxico (opcional): compite como un candidato
+        # más dentro del groupby/ranking con `source` = bxico_rfc_curp_cat.
+        bxico_flattened = self.bxico_flattened
+        if bxico_flattened is not None:
+            s264_ceps_flattened = s264_ceps_flattened.unionByName(
+                bxico_flattened, allowMissingColumns=True)
+        #
         s264_ceps_flattened_prepared = (s264_ceps_flattened
             .withColumn("fec_informacion_hora_oper", concat_ws("#", col("fec_informacion"), col("hora_oper")))
             .drop("fec_informacion", "hora_oper")
             .withColumn("rfc_curp_ends_with_xxx", when(col("rfc_curp").endswith("XX"), 1).otherwise(0))
             .withColumn("RFC_CURP_KIND_PRIORITY", mapping_RFC_CURP_KIND_PRIORITY[col("rfc_curp_kind")])
+            .withColumn("SOURCE_PRIORITY", mapping_SOURCE_PRIORITY[col("source")])
         )
         #
         return (s264_ceps_flattened_prepared
-            .groupBy("cta", "nom", "id_ban", "tipo_cta", "rfc_curp", "rfc_curp_kind")
+            .groupBy("cta", "nom", "id_ban", "tipo_cta", "rfc_curp", "rfc_curp_kind", "source")
             .agg(
                 spark_count("*").alias("cnt"),
                 spark_sum("oper_mto").alias("tot_oper_mto"),
                 spark_max("fec_informacion_hora_oper").alias("lst_fec_informacion_hora_oper"),
                 spark_sum("is_rfc_curp_valid").alias("is_rfc_curp_valid"),
                 spark_max("rfc_curp_ends_with_xxx").alias("rfc_curp_ends_with_xxx"),
-                spark_max("RFC_CURP_KIND_PRIORITY").alias("RFC_CURP_KIND_PRIORITY")
+                spark_max("RFC_CURP_KIND_PRIORITY").alias("RFC_CURP_KIND_PRIORITY"),
+                spark_max("SOURCE_PRIORITY").alias("SOURCE_PRIORITY")
             )
             .withColumn("fec_informacion", split(col("lst_fec_informacion_hora_oper"), "#").getItem(0))
             .withColumn("hora_oper", split(col("lst_fec_informacion_hora_oper"), "#").getItem(1))
@@ -620,7 +802,8 @@ class CepsRankStep(SubStep):
             .drop("tipo_cta", "hora_oper","cnt_rfc_by_nom", "rank_rfc_by_nom",
                 "cnt", "tot_oper_mto", "lst_fec_informacion_hora_oper",
                 "is_rfc_curp_valid", "rfc_curp_ends_with_xxx",
-                "RFC_CURP_KIND_PRIORITY", "cnt_rfc_by_cta", "process_date",
+                "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY",
+                "cnt_rfc_by_cta", "process_date",
                 "mis_date", "fec_informacion")
                 .drop("tfrom")
         )
@@ -666,7 +849,8 @@ class CepsRankStep(SubStep):
             .drop("tipo_cta", "hora_oper","cnt_rfc_by_nom", "rank_rfc_by_cta",
                 "cnt", "tot_oper_mto", "lst_fec_informacion_hora_oper",
                 "is_rfc_curp_valid", "rfc_curp_ends_with_xxx",
-                "RFC_CURP_KIND_PRIORITY", "cnt_rfc_by_cta", "process_date",
+                "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY",
+                "cnt_rfc_by_cta", "process_date",
                 "mis_date", "fec_informacion")
                 .drop("tfrom")
         )

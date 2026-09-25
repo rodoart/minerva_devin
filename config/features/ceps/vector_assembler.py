@@ -19,6 +19,7 @@ import config.graph_making as c_gmc
 import config.graph_making.ceps.edges_and_nodes as ccen
 import config.features.ceps.graph_features as cfgf
 import config.features.ceps.target_propagation_features as cfcf
+import config.features.ceps.cluster_features as cclf
 import config.target_propagation.lovelace.special_treatment as ctp_l_st
 
 ##########################################################################################
@@ -51,6 +52,8 @@ FEATURE_AGGREGATION = {"default": "weighted_mean"}
 EXCLUDE_COLUMNS = [
     "mis_date", "process_date", "vintage", "cohort",  # metadatos de partición/cohorte
     "seed_score",                                     # auxiliar de la propagación (semilla)
+    # Columnas de grupo del step de clustering: identifican el grupo, no son features
+    "component_id", "scc",
     # Nombres de partición-param del merge_schema de contagion: no son features
     "weight_type", "target_column", "max_iter", "alpha", "keep_seed_floor",
 ]
@@ -114,6 +117,11 @@ FEATURE_SOURCES["contagion"] = {
 FEATURE_SOURCES["nodes_join_target_lovelace"] = {
     "mode": "partitioned",
     "key": "nodes_join_target_lovelace",
+}
+# Stats intra-grupo del step de clustering (una fila por `id`).
+FEATURE_SOURCES["cluster_stats"] = {
+    "mode": "simple",
+    "path": cclf.output["cluster_stats"]["table_or_hdfs"],
 }
 
 

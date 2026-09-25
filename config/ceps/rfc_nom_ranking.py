@@ -1,3 +1,5 @@
+import os
+
 from libs.data_engineering_toolbox.path import HivePath
 from ..job import sbx as job_config   # config del job (raíz HDFS de salidas, cohorte, lag, is_dynamic)
 from pyspark.sql import Window
@@ -8,6 +10,11 @@ from pyspark.sql.functions import col
 # "history" en los dicts input/output: el intervalo de particiones cubre los
 # últimos `history` meses terminando en (vintage - lag).
 CEPS_MAXIMUM_HISTORY_IN_MONTHS = 3
+
+# Meses de historia del catálogo Banxico `bxico_rfc_curp_cat`: ventana más
+# amplia que la de CEP porque el catálogo se sube con poca frecuencia y el
+# dedup por `cta` ya se queda con la `fecha_de_subida` más reciente.
+BXICO_HISTORY_IN_MONTHS = 12
 
 # ---------------------------------------------------------------------------
 # Patrones regex para clasificar el identificador de ordenante/beneficiario
@@ -44,6 +51,24 @@ RFC_CURP_KIND_PRIORITY = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Origen de la fila dentro del histórico aplanado (columna `source`):
+#   - "s264_ceps": transacciones CEP/SPEI observadas en la tabla s264.
+#   - "bxico_rfc_curp_cat": catálogo oficial de clientes que provee Banxico.
+# ---------------------------------------------------------------------------
+S264_SOURCE = "s264_ceps"
+BXICO_SOURCE = "bxico_rfc_curp_cat"
+
+# Prioridad del origen al escoger el RFC/CURP canónico (menor = mejor). El
+# catálogo Banxico es información oficial y gana a cualquier candidato de
+# s264_ceps; el resto de criterios de la ventana siguen gobernando entre
+# alternativas del mismo origen. Se materializa como columna SOURCE_PRIORITY.
+SOURCE_PRIORITY = {
+BXICO_SOURCE: 0,                 # información oficial de Banxico: máxima prioridad
+S264_SOURCE: 1                   # lo observado en transacciones CEP
+}
+
+
 # ranking for RFC and CURP by cta, prioritizing the following criteria:
 # Ventana que ordena los candidatos a RFC/CURP canónico dentro de cada cuenta
 # `cta`; con row_number()=1 se elige el "mejor" identificador observado para la
@@ -54,6 +79,7 @@ RFC_BY_CTA_PRIORITY_WINDOW = (Window.partitionBy("cta")  # un ranking independie
 .orderBy(
 col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final (isNull()=False ordena primero)
 col("nom").isNull().asc(), # bad: candidatos con nombre conocido primero
+col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
 col("rfc_curp_ends_with_xxx").isNull().asc(), # bad: flag "termina en XX" nulo al final
 col("RFC_CURP_KIND_PRIORITY").isNull().asc(), # bad: sin tipo de id clasificado (prioridad nula) al final
 col("rfc_curp_ends_with_xxx").asc(), # bad: prefiera RFC que NO termina en "XX" (0 antes que 1; sufijo XX = RFC genérico/enmascarado)
@@ -72,6 +98,7 @@ RFC_BY_NOM_PRIORITY_WINDOW = (Window.partitionBy("nom")  # un ranking independie
 .orderBy(
 col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final
 col("nom").isNull().asc(), # bad: nombre nulo al final
+col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
 col("rfc_curp_ends_with_xxx").asc(),  # bad: prefiera RFC que NO termina en "XX"
 col("RFC_CURP_KIND_PRIORITY").asc(),  # bad: mejor tipo de identificador primero
 col("cnt_rfc_by_cta").desc(), # candidato visto en más operaciones de su cuenta primero
@@ -105,6 +132,20 @@ input = {
 "history": CEPS_MAXIMUM_HISTORY_IN_MONTHS,               # meses de historia a leer (3: vintage y los 2 anteriores)
 "information_date_mode":"all",                           # leer TODOS los meses del intervalo ("first"/"last" leerían solo el primero/último)
 "minimum_required_history": round(CEPS_MAXIMUM_HISTORY_IN_MONTHS/2)  # mínimo de meses exigidos (2); con menos -> error "Not enough history"; con menos de `history` -> solo warning
+},
+# Catálogo oficial de clientes de Banxico (nombres, CURP, RFC, cta, banco).
+# INPUT OPCIONAL: si la tabla/path no existe, el pipeline sigue sin él
+# (ver `optional_input` en pipelines/ceps/rfc_nom_ranking.py).
+# TODO: actualizar con el nombre real cuando Banxico publique la tabla;
+# sobreescribible vía MINERVA_BXICO_RFC_CURP_CAT_TABLE.
+"bxico_rfc_curp_cat" : {
+"table_or_hdfs": os.environ.get("MINERVA_BXICO_RFC_CURP_CAT_TABLE",
+    "gcpdlkmvpsd_prd_db.bxico_rfc_curp_cat"),  # tabla Hive del catálogo Banxico
+"information_date_column": "fecha_de_subida",# columna-partición: fecha de carga del catálogo
+"lag": 0,                                    # meses de desfase sobre vintage_date
+"history": BXICO_HISTORY_IN_MONTHS,          # ventana amplia: el catálogo puede subir con poca frecuencia
+"information_date_mode":"each",              # toda la ventana; el dedup por cta elige la más reciente
+"minimum_required_history": False            # sin exigencia: cualquier partición disponible sirve
 }
 }
 
