@@ -14,8 +14,9 @@ from typing import List, Dict, Optional, Union
 # ----------------------------------------------------------------------
 from pyspark.sql import DataFrame, Column
 
-from pyspark.sql.functions import (col, to_date, lit, date_format,
-    max as spark_max)
+from pyspark.sql.functions import (col, to_date, lit, date_format, last_day,
+    datediff, collect_set, collect_list, flatten, array_distinct,
+    max as spark_max, sum as spark_sum)
 from pyspark.sql.types import StringType
 # ----------------------------------------------------------------------
 # Custom
@@ -24,6 +25,7 @@ from libs.data_engineering_toolbox.path import HivePath
 
 
 import libs.framework as ppf
+import libs.functions.aggregations as lfa
 import config.job as cj
 ########################################################################
 # Process
@@ -146,6 +148,96 @@ class StandardGroupBySubStep(SubStep):
             result = result.drop(*auxiliary_columns.keys())
         return result
         #
+    def standard_group_by_txn_monthly(self,
+        input_df:DataFrame,
+        value_columns:List[str],
+        txn_id_columns:Optional[Union[str, List[str]]]=["id_src", "id_dst"],
+        month_column:str = lfa.MONTHLY_PARTITION_COLUMN,
+        time_column:str = lfa.MONTHLY_TIME_COLUMN,
+        date_column:str = "information_date",
+        months:Optional[List[str]]=None,
+    ) -> DataFrame:
+        """Agrega las transacciones por arista Y MES con parciales combinables.
+
+        Calcula `month_column` (fin de mes de `date_column`, usado como
+        partición mensual) y `time_column` (días desde la transacción al fin
+        de su propio mes, antigüedad relativa que NO depende del vintage).
+        Las parciales se combinan después con `merge_monthly_group_by`.
+
+        Args:
+            input_df: Transacciones de entrada.
+            value_columns: variables de valor a agregar (p.ej. ["oper_mto"]).
+            txn_id_columns: columnas de agrupación de la arista.
+            month_column: nombre de la columna-partición de mes.
+            time_column: nombre de la columna de antigüedad relativa.
+            date_column: columna de fecha de información.
+            months: si se indica, filtra las transacciones a esos meses
+                "YYYY-MM" antes de agrupar (cómputo incremental).
+
+        Returns:
+            DataFrame con una fila por arista-mes y las parciales de
+            `lfa.monthly_partial_group_by_aggregations`.
+        """
+        if isinstance(txn_id_columns, str):
+            txn_id_columns = [txn_id_columns]
+        date_col = to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT)
+        input_df = (input_df
+            .withColumn(month_column, last_day(date_col))
+            .withColumn(time_column, datediff(col(month_column), date_col))
+        )
+        if months:
+            input_df = input_df.filter(
+                date_format(col(month_column), "yyyy-MM").isin(*months))
+        return (input_df
+            .groupBy(*txn_id_columns, month_column)
+            .agg(*lfa.monthly_partial_group_by_aggregations(
+                value_columns=value_columns,
+                time_column=time_column,
+                date_column=date_column))
+        )
+        #
+    def standard_merge_group_by_txn_monthly(self,
+        monthly_df:DataFrame,
+        aggregations:List[str],
+        feature_names:Union[List[str], Dict],
+        reference_date:str,
+        txn_id_columns:Optional[Union[str, List[str]]]=["id_src", "id_dst"],
+        time_variable:str = "tfrom_days",
+        month_column:str = lfa.MONTHLY_PARTITION_COLUMN,
+        time_column:str = lfa.MONTHLY_TIME_COLUMN,
+        date_column:str = "information_date",
+    ) -> DataFrame:
+        """Combina las parciales mensuales en la agregación de toda la ventana.
+
+        Produce el mismo resultado que `standard_group_by_txn` sobre las
+        transacciones crudas, pero leyendo las particiones mensuales
+        materializadas. Requiere `reference_date`, la fecha de referencia de
+        la antigüedad (la misma que usó `calculate_tfroms`).
+
+        Raises:
+            ValueError: si alguna agregación pedida no tiene combinador
+                mensual (el llamador puede hacer fallback al group-by completo).
+        """
+        if isinstance(txn_id_columns, str):
+            txn_id_columns = [txn_id_columns]
+        merged = lfa.merge_monthly_group_by(
+            monthly_df=monthly_df,
+            txn_id_columns=txn_id_columns,
+            aggregation_names=aggregations,
+            feature_names=feature_names,
+            reference_date=reference_date,
+            time_variable=time_variable,
+            time_column=time_column,
+            month_column=month_column,
+            date_column=date_column,
+        )
+        return (merged
+            .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
+            .withColumn("mis_date", date_format(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
+            .withColumn("cohort", lit(self.cohort).cast(StringType()))
+        )
+        #
     def standard_txn_split(self,
         input_df: DataFrame,
         id_columns: Union[str, List[str]],
@@ -244,6 +336,81 @@ class StandardGroupBySubStep(SubStep):
             .agg(*aggregations)
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
             .withColumn("mis_date", date_format(to_date(col("information_date"), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
+            .withColumn("cohort", lit(self.cohort).cast(StringType()))
+        )
+        #
+    def standard_group_by_id_monthly(self,
+        input_src_df: DataFrame,
+        input_dst_df: DataFrame,
+        set_columns: List[str],
+        sum_columns: List[str],
+        id_columns: Union[str, List[str]]="id",
+        month_column:str = lfa.MONTHLY_PARTITION_COLUMN,
+        date_column:str = "information_date",
+        months:Optional[List[str]]=None,
+    ) -> DataFrame:
+        """Agrega por nodo Y MES las proyecciones origen/destino (parciales).
+
+        Las parciales de conjuntos (`collect_set` por mes) se unen después con
+        `standard_merge_group_by_id_monthly` vía unión de arrays; las sumas se
+        recombinan por suma y la fecha por máximo.
+
+        Args:
+            input_src_df: Proyección del lado origen.
+            input_dst_df: Proyección del lado destino.
+            set_columns: columnas a acumular como conjuntos por nodo-mes.
+            sum_columns: columnas a sumar por nodo-mes.
+            id_columns: columnas de agrupación del nodo.
+            month_column: nombre de la columna-partición de mes.
+            date_column: columna de fecha de información (su máximo se guarda).
+            months: si se indica, filtra a esos meses "YYYY-MM".
+
+        Returns:
+            DataFrame con una fila por nodo-mes.
+        """
+        if isinstance(id_columns, str):
+            id_columns = [id_columns]
+        input_df = (input_src_df.unionByName(input_dst_df)
+            .withColumn(month_column, last_day(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT)))
+        )
+        if months:
+            input_df = input_df.filter(
+                date_format(col(month_column), "yyyy-MM").isin(*months))
+        return (input_df
+            .groupBy(*id_columns, month_column)
+            .agg(
+                *[collect_set(col(column)).alias(column) for column in set_columns],
+                *[spark_sum(col(column)).alias(column) for column in sum_columns],
+                spark_max(col(date_column)).alias(date_column),
+            )
+        )
+        #
+    def standard_merge_group_by_id_monthly(self,
+        monthly_df: DataFrame,
+        set_columns: List[str],
+        sum_columns: List[str],
+        id_columns: Union[str, List[str]]="id",
+        date_column:str = "information_date",
+    ) -> DataFrame:
+        """Combina las parciales mensuales de nodo en la agregación de la ventana.
+
+        Los conjuntos se unen con `array_distinct(flatten(collect_list))`, las
+        sumas se recombinan por suma y `date_column` por máximo (equivalente
+        determinista al `last` del group-by completo).
+        """
+        if isinstance(id_columns, str):
+            id_columns = [id_columns]
+        return (monthly_df
+            .groupBy(*id_columns)
+            .agg(
+                *[array_distinct(flatten(collect_list(col(column)))).alias(column)
+                    for column in set_columns],
+                *[spark_sum(col(column)).alias(column) for column in sum_columns],
+                spark_max(col(date_column)).alias(date_column),
+            )
+            .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
+            .withColumn("mis_date", date_format(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )

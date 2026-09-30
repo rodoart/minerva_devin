@@ -110,6 +110,13 @@ DST_COLUMNS = [column for column in INPUT_COLUMNS if column.endswith("_dst") and
 COMMON_COLUMNS = [column for column in INPUT_COLUMNS if not column.endswith("_src") and not column.endswith("_dst") and column not in GROUP_BY_TXN_GROUPING_VARS]
 
 
+# Columnas de las agregaciones del group-by por nodo expresadas de forma
+# combinable: se usan por el group-by mensual incremental (parciales por
+# nodo-mes que luego se fusionan). Deben mantenerse alineadas con
+# GROUP_ID_AGGREGATIONS.
+GROUP_ID_SET_COLUMNS = ["numcliente", "nom", "cta", "id_ban"]  # collect_set -> unión mensual
+GROUP_ID_SUM_COLUMNS = ["oper_mto"]                          # sum -> recombinable por suma
+
 # Agregaciones del group-by por nodo ("id"): consolidan los atributos del nodo a
 # partir de la unión de los lados origen y destino de las transacciones.
 GROUP_ID_AGGREGATIONS = [
@@ -157,6 +164,27 @@ output = {
         "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
         "lag": 0,                                         # sin desfase al releer
         "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
+        "information_date_mode":"each",                   # todos los meses del intervalo
+        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+    },
+    # Agregados parciales por arista-MES: base incremental de group_by_txn.
+    # Una partición por mes de información de la transacción; en corridas
+    # mensuales solo se computan los meses ausentes de la ventana
+    # (ver libs.framework.ensure_monthly_partitions).
+    "group_by_txn_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_txn_monthly"),
+        "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
+        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+        "lag": 0,                                         # sin desfase al releer
+        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
+        "information_date_mode":"each",                   # todos los meses del intervalo
+        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+    },
+    # Agregados parciales por nodo-MES: base incremental de group_by_id.
+    "group_by_id_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_id_monthly"),
+        "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
+        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+        "lag": 0,                                         # sin desfase al releer
+        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
         "information_date_mode":"each",                   # todos los meses del intervalo
         "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
     }

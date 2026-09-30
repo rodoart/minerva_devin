@@ -10,6 +10,7 @@ import logging
 
 from datetime import date
 from functools import wraps
+from dateutil.relativedelta import relativedelta
 
 from pyspark import HiveContext
 from pyspark.sql import DataFrame, SparkSession
@@ -20,6 +21,7 @@ from pyspark.sql.utils import AnalysisException
 
 from libs.data_engineering_toolbox.path import HivePath
 from libs.data_engineering_toolbox.pyspark.tools.parquet_treatment import SparkLoadPartitionedTableOrParquet, overwrite_partition, overwrite_two_partition
+from libs.data_engineering_toolbox.general.date_treatment import make_date_interval_with_lag_months
 from libs.framework.utils import sanitize_property_name
 
 import time
@@ -424,6 +426,126 @@ def dynamic_partitioned_table_or_parquet(path_key: str) -> Callable:
     return decorator
 
 
+
+
+def _window_months(vintage_date: date, history: int, lag: int) -> List[str]:
+    """Meses "YYYY-MM" de la ventana [inicio, fin) definida por `lag`/`history`.
+
+    Replica el intervalo que usa `SparkTwoPartitionMonthlyInterval` para
+    identificar qué meses deberían existir como particiones mensuales.
+    """
+    start, end = make_date_interval_with_lag_months(vintage_date, history, lag)
+    months = []
+    cursor = start
+    while cursor < end:
+        months.append(cursor.strftime("%Y-%m"))
+        cursor += relativedelta(months=1)
+    return months
+
+
+def ensure_monthly_partitions(
+    step: "Step",
+    path_key: str,
+    compute_missing_months: Callable[[List[str]], DataFrame],
+) -> DataFrame:
+    """Materialización incremental de una salida particionada por mes.
+
+    Carga las particiones mensuales ya existentes de
+    `step.output_hive[path_key]` dentro de la ventana (`lag`/`history` del
+    config), computa ÚNICAMENTE los meses ausentes llamando a
+    `compute_missing_months(missing_months)` —que debe devolver un DataFrame
+    con la columna `information_date_column` ya poblada con valores
+    parseables como fecha— y los añade como particiones nuevas (por fecha de
+    información y fecha de proceso). Finalmente devuelve la ventana completa
+    releída desde disco.
+
+    Si `step.is_dynamic` es False se recomputan todos los meses. Si un mes no
+    produce filas no se escribe partición (se recomputará en la próxima
+    corrida, que seguirá considerándolo faltante).
+
+    Args:
+        step: Step dueño de la configuración (usa `output_hive`,
+            `input_parameters`, `sqlContext` e `is_dynamic`).
+        path_key: clave dentro de `step.output_hive` con la config de la
+            tabla/parquet particionada mensualmente.
+        compute_missing_months: callable que recibe la lista ordenada de
+            meses "YYYY-MM" faltantes y devuelve el DataFrame de esas
+            particiones.
+
+    Returns:
+        DataFrame con todas las particiones mensuales de la ventana.
+
+    Raises:
+        FileNotFoundError: si no se pudo materializar ninguna partición.
+    """
+    config = step.output_hive[path_key]
+    load_kwargs = _partition_load_kwargs(config, step.input_parameters)
+    table_or_hdfs = load_kwargs["table_or_hdfs"]
+    information_date_column = load_kwargs["information_date_column"]
+    process_date_column = load_kwargs["process_date_column"]
+    expected_months = _window_months(
+        vintage_date=step.input_parameters["vintage_date"],
+        history=load_kwargs["history"],
+        lag=load_kwargs["lag"])
+    present_months = set()
+    load_object = None
+    if step.is_dynamic:
+        try:
+            logger.info("Attempting to load %s from %s", path_key, table_or_hdfs)
+            load_object = SparkLoadPartitionedTableOrParquet(
+                session=step.sqlContext, **load_kwargs)
+            load_object.df   # fuerza la resolución de las particiones existentes
+            present_months = {
+                information_date.strftime("%Y-%m")
+                for pairs in load_object.sorted_pairs
+                for (information_date, _) in pairs
+            }
+            logger.info("%s: monthly partitions found for %s",
+                path_key, sorted(present_months))
+        except Exception as e:
+            load_object = None
+            logger.info("%s: no reusable monthly partitions (%s)", path_key, e)
+    missing_months = [month for month in expected_months if month not in present_months]
+    new_df = None
+    if missing_months:
+        logger.info("%s: computing %d missing monthly partitions: %s",
+            path_key, len(missing_months), missing_months)
+        new_df = compute_missing_months(missing_months)
+        if process_date_column is not None:
+            new_df = new_df.withColumn(
+                process_date_column,
+                lit(str(step.input_parameters["process_date"])))
+        if not new_df.isEmpty():
+            if process_date_column is not None:
+                overwrite_two_partition(
+                    df=new_df,
+                    process_date_column=process_date_column,
+                    information_date_column=information_date_column,
+                    table_or_hdfs=table_or_hdfs,
+                    session=step.sqlContext
+                ).write()
+            else:
+                overwrite_partition(
+                    df=new_df,
+                    partition_by=[information_date_column],
+                    table_or_hdfs=table_or_hdfs,
+                    session=step.sqlContext
+                ).write()
+            load_object = None   # hubo escrituras: hay que releer
+            logger.info("%s monthly partitions written in %s",
+                path_key, table_or_hdfs)
+    if load_object is not None:
+        return load_object.df
+    try:
+        result = SparkLoadPartitionedTableOrParquet(
+            session=step.sqlContext, **load_kwargs).df
+    except Exception:
+        # Puede no existir nada en disco (p.ej. todos los meses estaban vacíos)
+        result = new_df
+    if result is None:
+        raise FileNotFoundError(
+            f"{path_key}: no monthly partitions could be materialized")
+    return result
 
 
 def standard_load_parquet_or_table(
