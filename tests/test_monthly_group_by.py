@@ -17,8 +17,7 @@ import pytest
 
 pytest.importorskip("pyspark")
 
-# config.job exige MINERVA_TODAY en import; los tests usan un vintage fijo.
-os.environ.setdefault("MINERVA_TODAY", "2025-08-31")
+# Los tests usan un vintage fijo (date_treatment construido a mano).
 
 from pyspark.sql.functions import (col, lit, to_date, datediff,
     collect_set, max as spark_max, sum as spark_sum)

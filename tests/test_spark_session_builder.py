@@ -2,7 +2,7 @@
 
 Solo se prueban las partes que no levantan sesión (`hdfs_uri`, `linux_uri`,
 inicialización): `build()` requiere el cluster YARN (o una sesión local
-funcional en modo MINERVA_TEST_MODE=local, que no usa este builder).
+funcional en modo APP_TEST_MODE=local, que no usa este builder).
 """
 from pathlib import Path
 
@@ -15,10 +15,15 @@ from libs.data_engineering_toolbox.context import SparkSessionBuilder
 
 
 class TestInit:
-    def test_defaults(self):
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("APP_NAME", raising=False)
         builder = SparkSessionBuilder()
-        assert builder.app_name == "minerva"
+        assert builder.app_name == "spark-app"
         assert builder.extra_conf == {}
+
+    def test_app_name_from_env(self, monkeypatch):
+        monkeypatch.setenv("APP_NAME", "env-app")
+        assert SparkSessionBuilder().app_name == "env-app"
 
     def test_custom_values(self):
         builder = SparkSessionBuilder(app_name="my_app", extra_conf={"k": "v"})

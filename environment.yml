@@ -1,4 +1,4 @@
-name: minerva_devin
+name: spark_etl_framework
 dependencies:
   - python=3.10.18
   - packaging=24.2

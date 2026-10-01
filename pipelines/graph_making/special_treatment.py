@@ -26,7 +26,8 @@ from libs.data_engineering_toolbox.path import HivePath
 from libs.functions.missing_treatment import apply_missing_treatment
 
 import libs.framework as ppf
-import config.job as cj
+from libs.data_engineering_toolbox.general.date_treatment import (
+    DATE_STANDARD_FORMAT, DATE_STANDARD_SPARK_FORMAT, DATE_MONTH_SPARK_FORMAT)
 ##########################################################################
 # FUNCTIONS
 ##########################################################################
@@ -34,11 +35,11 @@ def calculate_monthly_tfrom(
     df:DataFrame,
     current_date:str,
     date_column:str,
-    date_format: Optional[str] = cj.DATE_MONTH_SPARK_FORMAT
+    date_format: Optional[str] = DATE_MONTH_SPARK_FORMAT
 ) -> DataFrame:
     """Añade `tfrom_months`: meses completos entre `date_column` y `current_date`."""
     if date_format is None:
-        date_format = cj.DATE_MONTH_SPARK_FORMAT
+        date_format = DATE_MONTH_SPARK_FORMAT
     #
     return df.withColumn(
         "tfrom_months",
@@ -49,11 +50,11 @@ def calculate_daily_tfrom(
     df:DataFrame,
     current_date:str,
     date_column:str,
-    date_format: Optional[str] = cj.DATE_STANDARD_SPARK_FORMAT
+    date_format: Optional[str] = DATE_STANDARD_SPARK_FORMAT
 ) -> DataFrame:
     """Añade `tfrom_days`: días completos entre `date_column` y `current_date`."""
     if date_format is None:
-        date_format = cj.DATE_STANDARD_SPARK_FORMAT
+        date_format = DATE_STANDARD_SPARK_FORMAT
     #
     return df.withColumn(
         "tfrom_days",
@@ -162,14 +163,14 @@ class StandardExtractSubStep(SubStep):
         reference_date:str = str((
             datetime.strptime(
                 self.parent.date_treatment["last_day_of_current_month_date_str"],
-                cj.DATE_STANDARD_FORMAT,
+                DATE_STANDARD_FORMAT,
             ).date() - relativedelta(months=lag)
-        ).strftime(cj.DATE_STANDARD_FORMAT))
+        ).strftime(DATE_STANDARD_FORMAT))
         return (df
             .transform(lambda df_: calculate_monthly_tfrom(df=df_,  current_date=reference_date, date_column=information_date_column,
-                date_format=cj.DATE_STANDARD_SPARK_FORMAT))
+                date_format=DATE_STANDARD_SPARK_FORMAT))
             .transform(lambda df_: calculate_daily_tfrom(df=df_,  current_date=reference_date, date_column=information_date_column,
-                date_format=cj.DATE_STANDARD_SPARK_FORMAT))
+                date_format=DATE_STANDARD_SPARK_FORMAT))
         )
         #
     @staticmethod

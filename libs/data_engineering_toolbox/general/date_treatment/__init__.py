@@ -6,6 +6,12 @@ from typing import Union
 
 _YYYYMM_FORMAT = '%Y%m'
 
+# Formatos de fecha estándar del framework.
+DATE_STANDARD_FORMAT = "%Y-%m-%d"          # datetime de Python (strptime/strftime)
+DATE_MONTH_FORMAT = "%Y%m"                 # mes para datetime; formato del vintage (p.ej. "202507")
+DATE_STANDARD_SPARK_FORMAT = "yyyy-MM-dd"  # equivalente Spark (to_date/date_format)
+DATE_MONTH_SPARK_FORMAT = "yyyyMM"         # equivalente Spark del mes; formato de la columna-partición mis_date
+
 def vintage_yyyymm_to_date(yyyymm:str) -> datetime:
     return datetime.strptime(yyyymm, _YYYYMM_FORMAT).date()
 

@@ -1,11 +1,11 @@
 """Tests para StandardVectorAssemblerSubStep._partition_suffix y
 get_merge_schema_input (pipelines/features/vector_assembler.py).
 
-Mode-aware según MINERVA_TEST_MODE:
+Mode-aware según APP_TEST_MODE:
 - "local" (default): los parquets se escriben en `tmp_path` del filesystem
   local y `HivePath.listparquets` —que consulta HDFS— se parchea con
   monkeypatch para devolver los leaves escritos.
-- "cluster": los parquets se escriben en `MINERVA_TMP_TESTS_DIR_HDFS` y se
+- "cluster": los parquets se escriben en `APP_TMP_TESTS_DIR_HDFS` y se
   usa el `listparquets` real de HDFS (sin parche).
 """
 import os
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.spark
 from libs.data_engineering_toolbox.path import HivePath
 from pipelines.features.vector_assembler import StandardVectorAssemblerSubStep
 
-TEST_MODE = os.environ.get("MINERVA_TEST_MODE", "local")
+TEST_MODE = os.environ.get("APP_TEST_MODE", "local")
 
 
 @pytest.fixture()

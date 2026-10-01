@@ -4,64 +4,74 @@ if [ -z "$BASH_VERSION" ]; then
     exec bash "$0" "$@"
 fi
 
+# =============================================================================
+# environment_vars.sh — plantilla de variables de entorno del framework.
+#
+# Ajusta los valores a tu cluster. Convención de nombres:
+#   APP_*      parámetros/propios de la aplicación
+#   PYSPARK_*  configuración de la sesión Spark (los lee SparkSessionBuilder)
+#   VENV_*     virtualenv empaquetado con conda-pack
+# =============================================================================
+
 # Parameters
-export MINERVA_HIVE_DATABASE="gcprcmsbx_work"
+export APP_HIVE_DATABASE="your_hive_database"
 
 # Paths
 CURRENT_SCRIPT_DIR_LINUX=$(dirname "$(realpath "$0")")
 export TESTING_DIR_LINUX=$(realpath "$CURRENT_SCRIPT_DIR_LINUX/../..")
 export LOGS_DIR_LINUX="${TESTING_DIR_LINUX}/logs"
-export MINERVA_TMP_DIR_LINUX=$(realpath "$TESTING_DIR_LINUX/tmp/tests")
+export APP_TMP_DIR_LINUX=$(realpath "$TESTING_DIR_LINUX/tmp/tests")
 
-export MINERVA_WORKSPACE_DIR_LINUX=$(realpath "$CURRENT_SCRIPT_DIR_LINUX/..")
+export APP_WORKSPACE_DIR_LINUX=$(realpath "$CURRENT_SCRIPT_DIR_LINUX/..")
 
 # PYSPARK
 
 # Parameters
-export PYSPARK_PORT=12880
-export PYSPARK_QUEUE="datalabs2"
+export PYSPARK_PORT=4040
+export PYSPARK_QUEUE="default"
 
-# Paths
+# Paths (ajusta a las rutas de tu distribución Hadoop/Spark)
 export JAVA_HOME="/usr/java/default"
-export SPARK_HOME="/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.12-1-1.p0.70675659/lib/spark3"
-export PYLIB="/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.12-1-1.p0.70675659/lib/spark3/python/lib"
-export HADOOP_CONF_DIR="/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hadoop/etc/hadoop"
-export HIVE_CONF_DIR="/opt/cloudera/parcels/CDH-7.1.9-1.cdh7.1.9.p1069.74330271/lib/hive/conf"
-export PYSPARK_PYTHON="/opt/cloudera/parcels/clt/conda38-9.9.65/bin/python"
+export SPARK_HOME="/opt/cloudera/parcels/SPARK3/lib/spark3"
+export PYLIB="${SPARK_HOME}/python/lib"
+export HADOOP_CONF_DIR="/etc/hadoop/conf"
+export HIVE_CONF_DIR="/etc/hive/conf"
+export PYSPARK_PYTHON="python"
 export PYSPARK_DRIVER_PYTHON="${PYSPARK_PYTHON}"
 
-export PYSPARK_TMP_DIR_HDFS="/data/gcprcmsbx/work/hive/gcprcmsbx_work/rg49392/tmp"
+export PYSPARK_TMP_DIR_HDFS="/user/${USER}/spark_app/tmp"
 export PYSPARK_STAGING_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/spark_staging"
 export PYSPARK_LOGS_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/spark_logs"
 export PYSPARK_WAREHOUSE_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/warehouse"
 export PYSPARK_CHECKPOINTS_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/checkpoints"
 
-export MINERVA_WORKSPACE_DIR_HDFS="/data/gcprcmsbx/work/hive/gcprcmsbx_work/rg49392/minerva"
-export MINERVA_TMP_TESTS_DIR_HDFS="${MINERVA_WORKSPACE_DIR_HDFS}/tmp/tests"
-export MINERVA_CHECKPOINT_BASE_DIR_HDFS="${MINERVA_WORKSPACE_DIR_HDFS}/tmp/checkpoints"
-export MINERVA_STAGING_BASE_DIR_HDFS="${MINERVA_WORKSPACE_DIR_HDFS}/tmp/staging"
-export MINERVA_WAREHOUSE_DIR_HDFS="/data/gcprcmsbx/work/hive"
+export APP_WORKSPACE_DIR_HDFS="/user/${USER}/spark_app"
+export APP_TMP_TESTS_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/tests"
+export APP_CHECKPOINT_BASE_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/checkpoints"
+export APP_STAGING_BASE_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/staging"
+export APP_WAREHOUSE_DIR_HDFS="/user/${USER}/hive"
 
 # VIRTUAL ENVIRONMENT
 
 # Parameters
-export MINERVA_NAME="minerva"
-export VENV_NAME="minerva"
-export MINERVA_TODAY="2025-08-17"
+export APP_NAME="spark-app"
+export VENV_NAME="spark-app"
+export APP_TODAY="$(date '+%Y-%m-%d')"
 
 # Paths
-export MINIFORGE_DIR_LINUX="/data/1/gcgaacqmxpysp/rg49392/miniforge"
+export MINIFORGE_DIR_LINUX="${HOME}/miniforge"
 export CONDA_LINUX="${MINIFORGE_DIR_LINUX}/bin/conda"
 
-export MINERVA_VENV_TAR_GZ_PARENT_DIR_LINUX="${MINERVA_WORKSPACE_DIR_LINUX}/tmp"
-export MINERVA_VENV_TAR_GZ_PARENT_DIR_HDFS="/tmp/spark/env"
+export VENV_TAR_GZ_PARENT_DIR_LINUX="${APP_WORKSPACE_DIR_LINUX}/tmp"
+export VENV_TAR_GZ_PARENT_DIR_HDFS="/tmp/spark/env"
 
-export MINERVA_VENV_TAR_GZ_LINUX="${MINERVA_VENV_TAR_GZ_PARENT_DIR_LINUX}/${VENV_NAME}.tar.gz"
-export MINERVA_VENV_TAR_GZ_HDFS="${MINERVA_VENV_TAR_GZ_PARENT_DIR_HDFS}/${VENV_NAME}.tar.gz"
+export VENV_TAR_GZ_LINUX="${VENV_TAR_GZ_PARENT_DIR_LINUX}/${VENV_NAME}.tar.gz"
+export PYSPARK_VENV_TAR_GZ_HDFS="${VENV_TAR_GZ_PARENT_DIR_HDFS}/${VENV_NAME}.tar.gz"
 
-export MINERVA_GRAPHFRAMES_JAR_LINUX="${MINERVA_WORKSPACE_DIR_LINUX}/jars/graphframes-0.8.1-spark3.0-s_2.12.jar"
-export MINERVA_GRAPHFRAMES_JAR_PARENT_DIR_HDFS="/tmp/spark/jars"
-export MINERVA_GRAPHFRAMES_JAR_HDFS="${MINERVA_GRAPHFRAMES_JAR_PARENT_DIR_HDFS}/graphframes-0.8.1-spark3.0-s_2.12.jar"
+# Jars extra para la sesión (p.ej. graphframes). Lista separada por comas en HDFS.
+export EXTRA_JAR_LINUX="${APP_WORKSPACE_DIR_LINUX}/jars/graphframes-0.8.1-spark3.0-s_2.12.jar"
+export EXTRA_JAR_PARENT_DIR_HDFS="/tmp/spark/jars"
+export PYSPARK_JARS_HDFS="${EXTRA_JAR_PARENT_DIR_HDFS}/graphframes-0.8.1-spark3.0-s_2.12.jar"
 
 # Parameters
 
@@ -69,10 +79,10 @@ PATH_VARS=(
     CURRENT_SCRIPT_DIR_LINUX
     TESTING_DIR_LINUX
     LOGS_DIR_LINUX
-    MINERVA_TMP_DIR_LINUX
-    MINERVA_WORKSPACE_DIR_LINUX
+    APP_TMP_DIR_LINUX
+    APP_WORKSPACE_DIR_LINUX
     MINIFORGE_DIR_LINUX
-    MINERVA_VENV_TAR_GZ_PARENT_DIR_LINUX
+    VENV_TAR_GZ_PARENT_DIR_LINUX
 )
 
 for var in "${PATH_VARS[@]}"; do
@@ -81,12 +91,11 @@ for var in "${PATH_VARS[@]}"; do
 done
 
 INFO_VARS=(
-    MINERVA_TODAY
-    MINERVA_NAME
+    APP_TODAY
+    APP_NAME
     VENV_NAME
-    MINERVA_VENV_TAR_GZ_PARENT_DIR_HDFS
+    VENV_TAR_GZ_PARENT_DIR_HDFS
     CONDA_LINUX
-    MINERVA_NAME
 )
 
 for var in "${INFO_VARS[@]}"; do
@@ -99,11 +108,11 @@ HIVE_DIR_VARS=(
     PYSPARK_LOGS_DIR_HDFS
     PYSPARK_WAREHOUSE_DIR_HDFS
     PYSPARK_CHECKPOINTS_DIR_HDFS
-    MINERVA_WORKSPACE_DIR_HDFS
-    MINERVA_TMP_TESTS_DIR_HDFS
-    MINERVA_STAGING_BASE_DIR_HDFS
-    MINERVA_WAREHOUSE_DIR_HDFS
-    MINERVA_GRAPHFRAMES_JAR_PARENT_DIR_HDFS
+    APP_WORKSPACE_DIR_HDFS
+    APP_TMP_TESTS_DIR_HDFS
+    APP_STAGING_BASE_DIR_HDFS
+    APP_WAREHOUSE_DIR_HDFS
+    EXTRA_JAR_PARENT_DIR_HDFS
 )
 
 for var in "${HIVE_DIR_VARS[@]}"; do

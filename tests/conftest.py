@@ -1,10 +1,10 @@
-"""Fixtures compartidas de la suite de tests de Minerva.
+"""Fixtures compartidas de la suite de tests del framework.
 
-Modo de ejecución (variable `MINERVA_TEST_MODE`):
+Modo de ejecución (variable `APP_TEST_MODE`):
 - `"local"` (default): SparkSession local[2], rutas temporales en `tmp_path`
   del filesystem local y `PYLIB` dummy. Corre sin cluster.
 - `"cluster"`: `SparkSessionBuilder()` (sesión YARN real) y `tmp_hdfs` sobre
-  HDFS (`MINERVA_TMP_TESTS_DIR_HDFS`). Requiere `opt/environment_vars.sh`.
+  HDFS (`APP_TMP_TESTS_DIR_HDFS`). Requiere `opt/environment_vars.sh`.
 
 Fixtures:
 - `spark`: SparkSession (local[2] en modo local, YARN en modo cluster).
@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-TEST_MODE = os.environ.get("MINERVA_TEST_MODE", "local")
+TEST_MODE = os.environ.get("APP_TEST_MODE", "local")
 
 if TEST_MODE == "local":
     # libs.data_engineering_toolbox.__init__ inserta en sys.path los zips de
@@ -42,7 +42,7 @@ def spark():
         from pyspark.sql import SparkSession
         session = (SparkSession.builder
             .master("local[2]")
-            .appName("minerva-tests")
+            .appName("framework-tests")
             .config("spark.sql.shuffle.partitions", "4")
             .config("spark.ui.enabled", "false")
             .config("spark.driver.host", "localhost")
@@ -80,12 +80,12 @@ def tmp_hdfs(tmp_path):
     """Directorio temporal para tests que escriben parquets.
 
     - modo "local": `tmp_path` de pytest (filesystem local).
-    - modo "cluster": HivePath de `MINERVA_TMP_TESTS_DIR_HDFS`.
+    - modo "cluster": HivePath de `APP_TMP_TESTS_DIR_HDFS`.
     """
     if TEST_MODE == "local":
         return tmp_path
     from libs.data_engineering_toolbox.path import HivePath
-    return HivePath(os.environ.get("MINERVA_TMP_TESTS_DIR_HDFS"))
+    return HivePath(os.environ.get("APP_TMP_TESTS_DIR_HDFS"))
 
 
 @pytest.fixture()

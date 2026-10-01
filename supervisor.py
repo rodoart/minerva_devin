@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Supervisor autónomo de la sesión Minerva.
+"""Supervisor autónomo de sesiones de pipeline Spark.
 
-Lanza `python main.py` como subproceso y lo vigila:
+Lanza el comando configurado como subproceso y lo vigila:
 
 - **Muerte del proceso** (OOM-kill, SIGKILL, excepción no controlada): lo
   reinicia de forma autónoma. Como los outputs decorados se recargan desde
   parquet (`_reload_or_recompute_parquet`), el nuevo proceso "reanuda" de
   facto en el Step en el que iba.
-- **Step atascado**: si el pipeline lleva más de `MINERVA_STEP_TIMEOUT`
+- **Step atascado**: si el pipeline lleva más de `SUPERVISOR_STEP_TIMEOUT`
   segundos en el mismo Step, se consulta la Spark UI del driver:
     * si hay tareas activas o las completadas crecen -> sigue calculando:
       se espera;
-    * si no hay trabajo vivo durante `MINERVA_STALL_TIMEOUT` -> zombie:
+    * si no hay trabajo vivo durante `SUPERVISOR_STALL_TIMEOUT` -> zombie:
       se mata el grupo de procesos y se reinicia.
 
 Detección de zombie (mejor que solo contar): la Spark UI expone
@@ -23,11 +23,11 @@ El progreso por Step se infiere del stdout del hijo (los mensajes
 cambios en el pipeline.
 
 Env vars:
-    MINERVA_COMMAND           comando a vigilar          (default "python main.py")
-    MINERVA_STEP_TIMEOUT      seg. máx. en el mismo Step (default 7200)
-    MINERVA_STALL_TIMEOUT     seg. sin progreso de tareas para declarar zombie (600)
-    MINERVA_WATCHDOG_INTERVAL periodo del watchdog en seg. (30)
-    MINERVA_MAX_RESTARTS      reinicios antes de rendirse (10)
+    SUPERVISOR_COMMAND           comando a vigilar          (default "python main.py")
+    SUPERVISOR_STEP_TIMEOUT      seg. máx. en el mismo Step (default 7200)
+    SUPERVISOR_STALL_TIMEOUT     seg. sin progreso de tareas para declarar zombie (600)
+    SUPERVISOR_WATCHDOG_INTERVAL periodo del watchdog en seg. (30)
+    SUPERVISOR_MAX_RESTARTS      reinicios antes de rendirse (10)
     PYSPARK_PORT              puerto de la Spark UI      (4040)
 
 Uso:
@@ -57,11 +57,11 @@ def _env_seconds(name: str, default: float) -> float:
         return default
 
 
-COMMAND = os.environ.get("MINERVA_COMMAND", "python main.py")
-STEP_TIMEOUT = _env_seconds("MINERVA_STEP_TIMEOUT", 2 * 3600)
-STALL_TIMEOUT = _env_seconds("MINERVA_STALL_TIMEOUT", 600)
-WATCHDOG_INTERVAL = _env_seconds("MINERVA_WATCHDOG_INTERVAL", 30)
-MAX_RESTARTS = int(os.environ.get("MINERVA_MAX_RESTARTS", 10))
+COMMAND = os.environ.get("SUPERVISOR_COMMAND", "python main.py")
+STEP_TIMEOUT = _env_seconds("SUPERVISOR_STEP_TIMEOUT", 2 * 3600)
+STALL_TIMEOUT = _env_seconds("SUPERVISOR_STALL_TIMEOUT", 600)
+WATCHDOG_INTERVAL = _env_seconds("SUPERVISOR_WATCHDOG_INTERVAL", 30)
+MAX_RESTARTS = int(os.environ.get("SUPERVISOR_MAX_RESTARTS", 10))
 SPARK_UI_PORT = int(os.environ.get("PYSPARK_PORT", 4040))
 
 

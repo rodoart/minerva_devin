@@ -2,17 +2,17 @@
 # -----------------------------------------------------------------------------
 # run-supervised.sh
 #
-# Wrapper para lanzar la sesión Minerva bajo el supervisor autónomo
+# Wrapper para lanzar la sesión del pipeline bajo el supervisor autónomo
 # (supervisor.py): carga las variables de entorno del cluster y delega.
 #
-# El supervisor reinicia `python main.py` si muere o si un Step supera
-# MINERVA_STEP_TIMEOUT sin progreso en la Spark UI (zombie). La reanudación
-# en el Step actual la da el propio dinamismo (los parquets ya escritos se
-# recargan en vez de recomputarse).
+# El supervisor reinicia el comando supervisado si muere o si un Step supera
+# SUPERVISOR_STEP_TIMEOUT sin progreso en la Spark UI (zombie). La reanudación
+# en el Step actual la da el propio dinamismo del framework (los parquets ya
+# escritos se recargan en vez de recomputarse).
 #
 # Env vars del supervisor (ver docstring de supervisor.py):
-#   MINERVA_STEP_TIMEOUT, MINERVA_STALL_TIMEOUT, MINERVA_WATCHDOG_INTERVAL,
-#   MINERVA_MAX_RESTARTS, MINERVA_COMMAND
+#   SUPERVISOR_STEP_TIMEOUT, SUPERVISOR_STALL_TIMEOUT,
+#   SUPERVISOR_WATCHDOG_INTERVAL, SUPERVISOR_MAX_RESTARTS, SUPERVISOR_COMMAND
 #
 # Uso:
 #   ./opt/run-supervised.sh

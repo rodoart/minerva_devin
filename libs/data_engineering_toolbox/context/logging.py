@@ -25,7 +25,7 @@ def setup_logging(level: Optional[str]=None, log_file:Optional[str]=None, force_
         return
     _initialized = True_
     #
-    level = (level or os.getenv("MINERVA_LOG_LEVEL", "INFO")).upper()
+    level = (level or os.getenv("APP_LOG_LEVEL", "INFO")).upper()
     if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
         level = "DEBUG"
     #
@@ -47,11 +47,17 @@ def setup_logging(level: Optional[str]=None, log_file:Optional[str]=None, force_
             },
         },
         "loggers": {
-            "minerva": {
+            "app": {
                 "level": level,
                 "handlers": ["console"],
                 "propagate": False,
             },
+        },
+        # root con handler de consola: los loggers por módulo
+        # (libs.*, pipelines.*, examples.*) propagan aquí y emiten.
+        "root": {
+            "level": level,
+            "handlers": ["console"],
         },
     }
     if log_file is not None:
@@ -62,7 +68,8 @@ def setup_logging(level: Optional[str]=None, log_file:Optional[str]=None, force_
             "filename": log_file,
             "mode": "a",
         }
-        config["loggers"]["minerva"]["handlers"].append("file")
+        config["loggers"]["app"]["handlers"].append("file")
+        config["root"]["handlers"].append("file")
     #
     logging.config.dictConfig(config)
 

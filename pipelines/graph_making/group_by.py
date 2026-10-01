@@ -26,7 +26,8 @@ from libs.data_engineering_toolbox.path import HivePath
 
 import libs.framework as ppf
 import libs.functions.aggregations as lfa
-import config.job as cj
+from libs.data_engineering_toolbox.general.date_treatment import (
+    DATE_STANDARD_SPARK_FORMAT, DATE_MONTH_SPARK_FORMAT)
 ########################################################################
 # Process
 ########################################################################
@@ -140,7 +141,7 @@ class StandardGroupBySubStep(SubStep):
             .groupBy(*txn_id_columns)
             .agg(*aggregations)
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
-            .withColumn("mis_date", date_format(to_date(col("information_date"), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("mis_date", date_format(to_date(col("information_date"), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )
@@ -180,7 +181,7 @@ class StandardGroupBySubStep(SubStep):
         """
         if isinstance(txn_id_columns, str):
             txn_id_columns = [txn_id_columns]
-        date_col = to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT)
+        date_col = to_date(col(date_column), DATE_STANDARD_SPARK_FORMAT)
         input_df = (input_df
             .withColumn(month_column, last_day(date_col))
             .withColumn(time_column, datediff(col(month_column), date_col))
@@ -233,7 +234,7 @@ class StandardGroupBySubStep(SubStep):
         )
         return (merged
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
-            .withColumn("mis_date", date_format(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("mis_date", date_format(to_date(col(date_column), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )
@@ -335,7 +336,7 @@ class StandardGroupBySubStep(SubStep):
             .groupBy(*id_columns)
             .agg(*aggregations)
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
-            .withColumn("mis_date", date_format(to_date(col("information_date"), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("mis_date", date_format(to_date(col("information_date"), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )
@@ -372,7 +373,7 @@ class StandardGroupBySubStep(SubStep):
         if isinstance(id_columns, str):
             id_columns = [id_columns]
         input_df = (input_src_df.unionByName(input_dst_df)
-            .withColumn(month_column, last_day(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT)))
+            .withColumn(month_column, last_day(to_date(col(date_column), DATE_STANDARD_SPARK_FORMAT)))
         )
         if months:
             input_df = input_df.filter(
@@ -410,7 +411,7 @@ class StandardGroupBySubStep(SubStep):
                 spark_max(col(date_column)).alias(date_column),
             )
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
-            .withColumn("mis_date", date_format(to_date(col(date_column), cj.DATE_STANDARD_SPARK_FORMAT), cj.DATE_MONTH_SPARK_FORMAT))
+            .withColumn("mis_date", date_format(to_date(col(date_column), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )
