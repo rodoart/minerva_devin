@@ -60,9 +60,23 @@ CLUSTER_STATS = {
 AGGREGATE_EXCLUDE_COLUMNS = [
     "id", "numcliente", "component_id", "scc",
     "mis_date", "process_date", "information_date",
-    "weight", "weight_type", "target_column",
+    "weight_type", "target_column",
     "max_iter", "alpha", "keep_seed_floor", "reset_prob",
     "seed_score",
+]
+
+# Prefijos de columnas que DEBEN entrar en los estadísticos de grupo: la
+# etiqueta original (target_lovelace*), la propagada (contagion_*) y las
+# columnas de peso/monto (oper_mto, weight*, *_strength). Si ninguna columna
+# agregable coincide con un prefijo se registra un warning al construir
+# `cluster_stats` — sirve como guarda de que los targets propagados y los
+# pesos participan en las features de agrupación.
+REQUIRED_STATS_PREFIXES = [
+    "target_",      # etiqueta(s) semilla unidas a los nodos
+    "contagion_",   # target propagado por el grafo
+    "oper_mto",     # monto/peso base de los nodos
+    "weight",       # pesos de arista ya agregados por nodo (p.ej. *_weight)
+    "_strength",    # fuerzas ponderadas in/out/total de weighted_degrees
 ]
 
 # Features de grafo cuyos parquets se unen a los nodos para las stats intra-grupo.
@@ -70,7 +84,9 @@ AGGREGATE_EXCLUDE_COLUMNS = [
 # parámetros, p.ej. weight=count_txn) y se colapsa a una fila por `id`.
 GRAPH_FEATURE_KEYS = [
     "pagerank", "degrees",
+    "degree_balance", "reciprocity", "self_loops",
     "weighted_pagerank", "weighted_degrees", "weighted_edge_stats",
+    "weighted_degree_balance",
 ]
 GRAPH_FEATURE_SOURCES = {
     key: cfgf.output[key]["table_or_hdfs"] for key in GRAPH_FEATURE_KEYS

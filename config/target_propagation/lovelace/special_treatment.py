@@ -1,6 +1,6 @@
 from libs.data_engineering_toolbox.path import HivePath
 from ...job import sbx as job_config
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, max as spark_max, mean as spark_mean
 
 
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))  # raíz HDFS de las salidas del job
@@ -12,6 +12,19 @@ current_hdfs = _general_root_hdfs.joinpath("target_propagation/lovelace/special_
 # (la segunda cuenta los nulos como 0 al calcularla).
 STANDARD_MISSING_TREATMENT_VARS = {
     "oper_mto": ["value", 0]  # oper_mto: los nulos se imputan a 0
+}
+
+
+# Columnas del target a propagar y su función de agregación al pasar a nivel
+# `cta` / `numcliente`. La tabla Lovelace puede traer más columnas además de la
+# etiqueta (p.ej. scores de modelos); todas las listadas aquí viajan juntas en
+# `target_cta`/`target_numcliente` y se propagan por el grafo.
+# Ejemplo para añadir un score:
+#   1. proyectarlo en el "select" del input: col("score_modelo").alias("score")
+#   2. añadirlo aquí: "score": spark_mean
+TARGET_AGGREGATIONS = {
+    "target": spark_max,   # etiqueta de fraude: fraude si alguna txn lo es
+    # "score": spark_mean, # ejemplo: score de modelo (descomentar + select)
 }
 
 

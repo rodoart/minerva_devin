@@ -8,7 +8,7 @@ y propagación iterativa del target, más el registro `GRAPH_FEATURE_FUNCTIONS`.
 # ------------------------------------------------------------------------------
 # General
 # ------------------------------------------------------------------------------
-from typing import Callable, List, Dict, Optional
+from typing import Callable, List, Dict, Optional, Union
 
 
 # ------------------------------------------------------------------------------
@@ -65,6 +65,86 @@ def triangle_count(
 ) -> DataFrame:
     """Número de triángulos en los que participa cada nodo."""
     return graph.triangleCount().withColumnRenamed("count", "triangle_count")
+
+
+def degree_balance(
+    graph:GraphFrame
+) -> DataFrame:
+    """Balance direccional del grado por nodo.
+
+    Columnas: `net_degree` (out - in; >0 sumidero... origen neto de flujo) y
+    `in_out_degree_ratio` (out/in; null cuando el nodo no recibe nada).
+    """
+    edges = graph.edges
+    in_deg = edges.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
+    out_deg = edges.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
+    return (
+        in_deg.join(out_deg, on="id", how="outer")
+        .withColumn("_in", coalesce(col("_in"), lit(0)))
+        .withColumn("_out", coalesce(col("_out"), lit(0)))
+        .withColumn("net_degree", col("_out") - col("_in"))
+        .withColumn("in_out_degree_ratio",
+            when(col("_in") > 0, col("_out") / col("_in")).otherwise(lit(None).cast("double")))
+        .select("id", "net_degree", "in_out_degree_ratio")
+    )
+
+
+def reciprocity(
+    graph:GraphFrame
+) -> DataFrame:
+    """Reciprocidad por nodo sobre pares dirigidos únicos (sin self-loops).
+
+    Una arista src->dst es recíproca si existe dst->src. Columnas:
+    `reciprocal_out`/`reciprocal_in` (nº de vecinos que también enlazan de
+    vuelta en cada dirección), `reciprocity_out`/`reciprocity_in`
+    (fracción sobre el grado de cada dirección) y `reciprocity`
+    (fracción de las aristas incidentes que son recíprocas).
+    """
+    pairs = (graph.edges
+        .select("src", "dst")
+        .distinct()
+        .filter(col("src") != col("dst")))
+    reversed_pairs = pairs.select(col("dst").alias("src"), col("src").alias("dst"))
+    reciprocal = pairs.join(reversed_pairs, ["src", "dst"], "inner")
+    #
+    out_stats = pairs.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
+    in_stats = pairs.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
+    rec_out = reciprocal.groupBy(col("src").alias("id")).agg(spark_count("*").alias("reciprocal_out"))
+    rec_in = reciprocal.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("reciprocal_in"))
+    #
+    result = (
+        out_stats.join(in_stats, on="id", how="outer")
+        .join(rec_out, on="id", how="left")
+        .join(rec_in, on="id", how="left")
+        .withColumn("_out", coalesce(col("_out"), lit(0)))
+        .withColumn("_in", coalesce(col("_in"), lit(0)))
+        .withColumn("reciprocal_out", coalesce(col("reciprocal_out"), lit(0)))
+        .withColumn("reciprocal_in", coalesce(col("reciprocal_in"), lit(0)))
+        .withColumn("reciprocity_out",
+            when(col("_out") > 0, col("reciprocal_out") / col("_out")).otherwise(lit(None).cast("double")))
+        .withColumn("reciprocity_in",
+            when(col("_in") > 0, col("reciprocal_in") / col("_in")).otherwise(lit(None).cast("double")))
+        .withColumn("reciprocity",
+            when((col("_in") + col("_out")) > 0,
+                (col("reciprocal_in") + col("reciprocal_out")) / (col("_in") + col("_out")))
+            .otherwise(lit(None).cast("double")))
+        .select("id", "reciprocal_out", "reciprocal_in",
+            "reciprocity_out", "reciprocity_in", "reciprocity")
+    )
+    return result
+
+
+def self_loops(
+    graph:GraphFrame
+) -> DataFrame:
+    """Número de aristas src==dst por nodo (`self_loop_count`; 0 si no hay)."""
+    loops = (graph.edges
+        .filter(col("src") == col("dst"))
+        .groupBy(col("src").alias("id"))
+        .agg(spark_count("*").alias("self_loop_count")))
+    return (graph.vertices.select("id")
+        .join(loops, on="id", how="left")
+        .withColumn("self_loop_count", coalesce(col("self_loop_count"), lit(0))))
 
 
 ###############################################################################
@@ -147,6 +227,24 @@ def weighted_edge_stats(
         .agg(
             *aggregations
         )
+    )
+
+
+def weighted_degree_balance(
+    graph: GraphFrame
+) -> DataFrame:
+    """Balance direccional de la fuerza ponderada por nodo.
+
+    Columnas: `net_strength` (out_strength - in_strength) e
+    `in_out_strength_ratio` (out/in; null cuando no entra flujo).
+    """
+    strength = weighted_degrees(graph)
+    return (strength
+        .withColumn("net_strength", col("out_strength") - col("in_strength"))
+        .withColumn("in_out_strength_ratio",
+            when(col("in_strength") > 0, col("out_strength") / col("in_strength"))
+            .otherwise(lit(None).cast("double")))
+        .select("id", "net_strength", "in_out_strength_ratio")
     )
 
 
@@ -301,18 +399,32 @@ def target_group_by_id(
     group_by_id:DataFrame,
     target:DataFrame,
     column:str,
-    function:Callable[..., Column]=spark_max
+    function:Union[Callable[..., Column], Dict[str, Callable[..., Column]]]=spark_max
 ) -> DataFrame:
-    """Agrega el target por cada valor de `column` (array) asociado a cada id de nodo."""
+    """Agrega el target por cada valor de `column` (array) asociado a cada id de nodo.
+
+    `function` puede ser:
+      - un callable de agregación (back-compat): agrega la columna `target` y
+        produce `target_agg_{column}`.
+      - un dict {columna_target: callable}: agrega TODAS esas columnas de la
+        tabla `target` (p.ej. target y scores) produciendo una columna
+        `target_agg_{column}` para "target" y `target_agg_{column}_{nombre}`
+        para el resto.
+    """
+    if not isinstance(function, dict):
+        function = {"target": function}
     target_columns = (target
         .groupBy(column)
-        .agg(function(col("target")).alias("target"))
+        .agg(*[func(col(tcol)).alias(tcol) for tcol, func in function.items()])
     )
     return (group_by_id
         .withColumn(column, explode(column))
         .join(other=target_columns, on=column, how="left")
         .groupBy("id")
-        .agg(function("target").alias(f"target_agg_{column}"))
+        .agg(*[
+            func(col(tcol)).alias(
+                f"target_agg_{column}" if tcol == "target" else f"target_agg_{column}_{tcol}")
+            for tcol, func in function.items()])
     )
 
 
@@ -370,9 +482,13 @@ GRAPH_FEATURE_FUNCTIONS = {
     "degrees": degrees,
     "components": components,
     "triangle_count": triangle_count,
+    "degree_balance": degree_balance,
+    "reciprocity": reciprocity,
+    "self_loops": self_loops,
     "weighted_pagerank": weighted_pagerank,
     "weighted_degrees": weighted_degrees,
     "weighted_edge_stats": weighted_edge_stats,
+    "weighted_degree_balance": weighted_degree_balance,
     "weighted_components": weighted_components,
     "weighted_triangle_count": weighted_triangle_count,
     "target_propagation": propagate_target,

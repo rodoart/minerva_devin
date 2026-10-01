@@ -9,7 +9,18 @@ from pyspark.sql.functions import col
 # Máximo de meses de historia CEP (SPEI) que maneja este pipeline; se usa como
 # "history" en los dicts input/output: el intervalo de particiones cubre los
 # últimos `history` meses terminando en (vintage - lag).
+#
+# NOTA sobre las dos ventanas independientes (txn_replacement):
+#   - CEPS_RANKING_HISTORY_IN_MONTHS: meses de historia CEP leídos para
+#     CONSTRUIR los catálogos de reemplazo (flattened -> groupby -> ranks ->
+#     cases_replace). Una ventana profunda (24) produce mejores candidatos
+#     RFC/CURP por cta/nom.
+#   - CEPS_MAXIMUM_HISTORY_IN_MONTHS: meses de historia transaccional que
+#     termina llevando la tabla `rfc_curp_analysis_s264_ceps_replaced`
+#     (la que alimenta el grafo); los catálogos se aplican solo a esa
+#     ventana reciente (ver config/ceps/txn_replacement.py).
 CEPS_MAXIMUM_HISTORY_IN_MONTHS = 3
+CEPS_RANKING_HISTORY_IN_MONTHS = 24
 
 # Meses de historia del catálogo Banxico `bxico_rfc_curp_cat`: ventana más
 # amplia que la de CEP porque el catálogo se sube con poca frecuencia y el
@@ -129,9 +140,9 @@ input = {
 "table_or_hdfs": "gcpdlkmvpsd_prd_db.fz2s264_bxic0_t_d",   # tabla Hive origen (CEPs s264)
 "information_date_column": "fec_informacion",            # columna-partición de fecha de información (corte del dato)
 "lag": 0,                                                # meses de desfase sobre vintage_date; 0 = el intervalo termina en el mes vintage
-"history": CEPS_MAXIMUM_HISTORY_IN_MONTHS,               # meses de historia a leer (3: vintage y los 2 anteriores)
+"history": CEPS_RANKING_HISTORY_IN_MONTHS,               # meses de historia a leer para los catálogos (24); independiente de la ventana de la tabla replaced
 "information_date_mode":"all",                           # leer TODOS los meses del intervalo ("first"/"last" leerían solo el primero/último)
-"minimum_required_history": round(CEPS_MAXIMUM_HISTORY_IN_MONTHS/2)  # mínimo de meses exigidos (2); con menos -> error "Not enough history"; con menos de `history` -> solo warning
+"minimum_required_history": round(CEPS_RANKING_HISTORY_IN_MONTHS/2)  # mínimo de meses exigidos (12); con menos -> error "Not enough history"; con menos de `history` -> solo warning
 },
 # Catálogo oficial de clientes de Banxico (nombres, CURP, RFC, cta, banco).
 # INPUT OPCIONAL: si la tabla/path no existe, el pipeline sigue sin él

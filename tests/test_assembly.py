@@ -58,7 +58,7 @@ class TestDistinctCount:
 class TestAggregationRegistry:
     def test_expected_keys(self):
         assert set(ASSEMBLY_AGGREGATION_FUNCTIONS.keys()) == {
-            "mean", "min", "max", "sum", "first",
+            "mean", "median", "std", "min", "max", "sum", "first",
             "distinct_count", "weighted_mean"}
 
 
@@ -91,12 +91,49 @@ class TestBuildAggregationExpressions:
 
     def test_unknown_aggregation_raises(self):
         with pytest.raises(ValueError, match="Unsupported assembly aggregation"):
-            build_aggregation_expressions(["feat"], "median")
+            build_aggregation_expressions(["feat"], "moda")
 
     def test_unknown_in_dict_raises(self):
         with pytest.raises(ValueError, match="Unsupported assembly aggregation"):
             build_aggregation_expressions(
-                ["feat"], {"default": "sum", "feat": "median"})
+                ["feat"], {"default": "sum", "feat": "moda"})
+
+    def test_list_of_aggregations_prefixes_columns(self, exploded_df):
+        """Varias funciones por feature -> columnas `{func}_{feature}`."""
+        exprs = build_aggregation_expressions(
+            ["feat"], ["mean", "median", "std"])
+        result = exploded_df.groupBy("numcliente").agg(*exprs)
+        assert {"mean_feat", "median_feat", "std_feat"} <= set(result.columns)
+        row = [r for r in result.collect() if r["numcliente"] == "c1"][0]
+        assert row["mean_feat"] == pytest.approx(15.0)
+        assert row["median_feat"] == pytest.approx(15.0)
+        # stddev muestral de {10, 20} = sqrt(50)
+        assert row["std_feat"] == pytest.approx(7.0710678118654755)
+
+    def test_median_and_std_in_default_dict(self, exploded_df):
+        exprs = build_aggregation_expressions(
+            ["feat"], {"default": ["mean", "median"]})
+        result = exploded_df.groupBy("numcliente").agg(*exprs).collect()
+        row = [r for r in result if r["numcliente"] == "c2"][0]
+        # c2: solo 5.0 no nulo -> mean = median = 5
+        assert row["mean_feat"] == pytest.approx(5.0)
+        assert row["median_feat"] == pytest.approx(5.0)
+
+    def test_list_with_weighted_mean(self, exploded_df):
+        """`weighted_mean` dentro de una lista usa el peso y se prefija."""
+        exprs = build_aggregation_expressions(
+            ["feat"], ["weighted_mean", "max"], weight=col("w"))
+        result = exploded_df.groupBy("numcliente").agg(*exprs).collect()
+        row = [r for r in result if r["numcliente"] == "c1"][0]
+        assert row["weighted_mean_feat"] == pytest.approx(17.5)
+        assert row["max_feat"] == 20.0
+
+    def test_single_aggregation_keeps_column_name(self, exploded_df):
+        """Back-compat: una sola función agrega sobre el nombre original."""
+        exprs = build_aggregation_expressions(["feat"], "median")
+        result = exploded_df.groupBy("numcliente").agg(*exprs)
+        assert "feat" in result.columns
+        assert "median_feat" not in result.columns
 
 
 class TestExplodeArrayColumn:

@@ -56,6 +56,30 @@ cta, banco_cta (nombre del banco), banco_reporte, fecha_de_subida`.
 Tests: `tests/test_bxico_catalog.py` (merge de nombres, catálogo de bancos,
 dedup, elección de rfc_curp, optional_input, prioridad en ventanas).
 
+## Pipeline `txn_replacement` — historias independientes
+
+Step: `CepsTxnReplacementStep` (`pipelines/ceps/txn_replacement.py`), config
+en `config/ceps/txn_replacement.py`.
+
+Dos ventanas de historia **independientes**:
+
+| Constante | Valor | Controla |
+|---|---|---|
+| `CEPS_RANKING_HISTORY_IN_MONTHS` (rfc_nom_ranking) | 24 | meses de historia CEP leídos para construir los catálogos de reemplazo (`s264_ceps` input) |
+| `TXN_REPLACED_HISTORY_IN_MONTHS` (txn_replacement) | 3 | meses de transacciones que conserva `rfc_curp_analysis_s264_ceps_replaced` (la tabla que alimenta el grafo) |
+
+- El input `rfc_curp_analysis_s264_ceps` del step de reemplazo lee solo la
+  partición del vintage (`history=1`): cada partición ya contiene la ventana
+  completa del ranking.
+- `limit_txn_history_window` (en el pipeline) recorta las txns por
+  `fec_informacion` al intervalo `[vintage-lag-history+1m, vintage-lag+1m)`,
+  con la misma aritmética que `make_date_interval_with_lag_months`.
+- Como la partición de salida lleva solo 3 meses, el grafo sigue viendo la
+  ventana completa acumulando las particiones de los últimos vintages (como
+  hace `history` en los loaders de `edges_and_nodes`).
+
+Tests: `tests/test_txn_history_window.py`.
+
 ## Nota: `norm` corregido
 
 `norm` = `upper(regexp_replace(trim(col), "\s+[A-Z]$", ""))` solo elimina un

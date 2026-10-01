@@ -316,3 +316,105 @@ HivePath en cluster), marcadores `spark`/`graphframes`. Ejecución:
   patrón "históricos mes a mes" más arriba en la cadena.
 - El merge respeta nulos: una txn con `oper_mto` nulo no cuenta en
   `count_oper_mto` ni en las ponderadas (igual que en el group-by completo).
+
+---
+
+## 9. Mejoras de la segunda iteración
+
+### 9.1 Historia independiente: catálogos de reemplazo vs. tabla `txn_replaced`
+
+- `config/ceps/rfc_nom_ranking.py`: `CEPS_RANKING_HISTORY_IN_MONTHS = 24` —
+  meses de historia CEP leídos para construir los catálogos
+  (`s264_ceps` input). `CEPS_MAXIMUM_HISTORY_IN_MONTHS = 3` queda como la
+  ventana transaccional corta usada por los outputs.
+- `config/ceps/txn_replacement.py`: `TXN_REPLACED_HISTORY_IN_MONTHS = 3` y
+  el input `rfc_curp_analysis_s264_ceps` lee solo la partición del vintage
+  (`history=1`) — cada partición ya contiene la ventana completa del ranking.
+- `pipelines/ceps/txn_replacement.py`: `limit_txn_history_window` recorta las
+  transacciones por `fec_informacion` a la ventana
+  `[vintage-lag-history+1m, vintage-lag+1m)` con la misma aritmética de
+  `make_date_interval_with_lag_months`. Se aplica en
+  `rfc_curp_analysis_s264_ceps` antes del join de reemplazo.
+
+Resultado: los catálogos usan 24 meses; la tabla `replaced` que alimenta el
+grafo solo conserva 3 meses por partición (el grafo acumula las particiones
+de los últimos vintages, como siempre).
+
+### 9.2 Propagación multi-columna del target
+
+- `config/target_propagation/lovelace/special_treatment.py`:
+  `TARGET_AGGREGATIONS = {columna: funcion}` — todas las columnas listadas
+  (target, scores, ...) viajan juntas en `target_cta`/`target_numcliente`.
+- `pipelines/target_propagation/lovelace/special_treatment.py`: agrega cada
+  columna con su función en vez de solo `max(target)`.
+- `lff.target_group_by_id` acepta `function` como dict `{columna: callable}`:
+  `target` produce `target_agg_<columna>`, el resto `target_agg_<columna>_<tcol>`.
+- `TARGETS[*]["modes"][*]` admite `"columns"` multi-columna; la forma simple
+  (`aggregation_function` + `missing_treatment`) sigue funcionando.
+- `propagation_node_columns()` devuelve `target_lovelace` +
+  `target_lovelace_<col>` por cada columna extra; `PROPAGATION_FEATURES`
+  genera `contagion_<weight>` para `target` y `contagion_<col>_<weight>`
+  para el resto.
+
+### 9.3 Features globales de grafo
+
+Nuevas en `libs/functions/features.py` (+ registry + `_ft` + config):
+
+- `degree_balance` -> `net_degree`, `in_out_degree_ratio`
+- `reciprocity` -> `reciprocal_out/in`, `reciprocity_out/in`, `reciprocity`
+  (pares dirigidos únicos, sin self-loops)
+- `self_loops` -> `self_loop_count` (0 si no hay)
+- `weighted_degree_balance` -> `net_strength`, `in_out_strength_ratio`
+
+Inventario completo de preguntas/features: `notebook/preguntas_grafo.md`.
+
+### 9.4 Targets propagadas y pesos en features de agrupación
+
+- `config/features/ceps/cluster_features.py`: `REQUIRED_STATS_PREFIXES`
+  (`target_`, `contagion_`, `oper_mto`, `weight`, `_strength`) — si ninguna
+  columna agregable coincide con un prefijo, `cluster_stats` registra un
+  warning (guarda de que los stats de grupo incluyan target, contagio y pesos).
+- `CLUSTER_STATS` incluye `median` (percentile_approx 0.5) además de
+  count/sum/mean/std/min/max.
+
+### 9.5-9.7 Vector assembler: fuentes opcionales, sufijo, niveles
+
+`config/features/ceps/vector_assembler.py` + `pipelines/features/ceps/vector_assembler.py`:
+
+- **Fuentes opcionales**: cada entrada de `FEATURE_SOURCES` acepta
+  `"enabled": False` (se salta) y `"optional": True` (default; si la carga
+  falla se registra warning y se sigue sin esa fuente; `False` propaga el error).
+- **Sufijo de variables**: `VARIABLE_SUFFIX = "_ceps"` renombra TODAS las
+  columnas de `{nivel}_features` menos la llave.
+- **Niveles**: `AGGREGATION_LEVELS = ["numcliente", "cta"]` con
+  `NODE_ID_ARRAY_COLUMNS` (array de `nodes` explotado por nivel) y
+  `PIVOT_BY_LEVEL` (pivote externo por nivel: `pivot` -> numcliente,
+  `pivot_cta` -> cta). Misma lógica para ambos.
+- **Multi-agregación**: `FEATURE_AGGREGATION` acepta lista
+  (`{"default": ["weighted_mean", "median", "std", "mean"]}`) — con varias
+  funciones por feature las columnas se llaman `{funcion}_{feature}`;
+  `libs/functions/assembly.py` añade `median` (percentile_approx) y `std` al
+  registro `ASSEMBLY_AGGREGATION_FUNCTIONS`.
+- **Nulos**: `FILL_NULLS_VALUE = -99999` se aplica a las columnas del vector
+  antes del `VectorAssembler` (centinela de "no encontrado").
+- **Esquema final**: `{nivel}_features` = llave + todas las variables
+  agregadas (con sufijo); `{nivel}_features_vector` = SOLO llave + columna
+  `features` (el select final descarta las variables sueltas).
+
+### Tests añadidos
+
+- `tests/test_txn_history_window.py`: `limit_txn_history_window` (ventana,
+  lag, bordes inclusivo/exclusivo, passthrough) + constantes de config.
+- `tests/test_features.py`: registry ampliado + `degree_balance`,
+  `reciprocity` (incl. self-loops ignorados), `self_loops`,
+  `weighted_degree_balance`, `target_group_by_id` multi-columna.
+- `tests/test_assembly.py`: `median`/`std` en el registro, listas de
+  agregaciones (`{func}_{col}`), dict con default.
+- `tests/test_cluster_features.py`: warnings de `REQUIRED_STATS_PREFIXES`,
+  stats de target/contagion/pesos por grupo, helpers `_mode_columns` /
+  `propagation_node_columns` / naming de `PROPAGATION_FEATURES`.
+- `tests/test_vector_assembler_options.py`: sufijo, niveles, pivote por
+  nivel, multi-agregación con sufijo, fuentes opcionales/desactivadas,
+  dedup de columnas entre fuentes.
+- `tests/conftest.py`: el shim `local_hdfs` (HDFS -> fs local) se movió
+  desde `test_monthly_group_by.py` para reutilizarlo.

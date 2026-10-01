@@ -12,7 +12,7 @@ from typing import Dict, Any
 # ----------------------------------------------------------------------------
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import max as spark_max
+from pyspark.sql.functions import col, max as spark_max
 # ----------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------
@@ -20,6 +20,10 @@ import libs.framework as ppf
 
 import pipelines.target_propagation.special_treatment as p_tp_st
 
+import config.target_propagation.lovelace.special_treatment as ctp_st
+
+from libs.data_engineering_toolbox.context.logging import get_logger
+logger = get_logger(__name__)
 
 from libs.data_engineering_toolbox.path import HivePath
 ##########################################################################
@@ -79,25 +83,48 @@ class LovelaceExtractSubStep(p_tp_st.StandardTargetPropagationExtractSubStep):
     #
     #
     @ppf.cached_property
+    def target_aggregations(self) -> Dict[str, Any]:
+        """Columnas del target a propagar (config `TARGET_AGGREGATIONS`), acotadas
+        a las presentes en `lovelace_target`. `target` es obligatoria; el resto
+        ausentes solo avisan."""
+        lovelace_target: DataFrame = self.lovelace_target
+        aggregations = {
+            column: func
+            for column, func in ctp_st.TARGET_AGGREGATIONS.items()
+            if column in lovelace_target.columns
+        }
+        missing = [c for c in ctp_st.TARGET_AGGREGATIONS if c not in aggregations]
+        for column in missing:
+            logger.warning(
+                "Columna de target '%s' no existe en lovelace_target; se omite",
+                column)
+        if "target" not in aggregations:
+            raise ValueError(
+                "La columna obligatoria 'target' no está en lovelace_target")
+        return aggregations
+    #
+    @ppf.cached_property
     @ppf.dynamic_unpartitioned_parquet(path_key="target_numcliente")
     def target_numcliente(self) -> DataFrame:
-        """Target Lovelace agregado a nivel `numcliente` (max de `target`).
+        """Target Lovelace agregado a nivel `numcliente` (todas las columnas de `TARGET_AGGREGATIONS`).
         """
         lovelace_target: DataFrame = self.lovelace_target
         return (lovelace_target
             .groupBy("numcliente")
-            .agg(spark_max("target").alias("target"))
+            .agg(*[func(col(column)).alias(column)
+                   for column, func in self.target_aggregations.items()])
         )
     #
     @ppf.cached_property
     @ppf.dynamic_unpartitioned_parquet(path_key="target_cta")
     def target_cta(self) -> DataFrame:
-        """Target Lovelace agregado a nivel `cta` (max de `target`).
+        """Target Lovelace agregado a nivel `cta` (todas las columnas de `TARGET_AGGREGATIONS`).
         """
         _ = self.target_numcliente
         lovelace_target: DataFrame = self.lovelace_target
         return (lovelace_target
             .groupBy("cta")
-            .agg(spark_max("target").alias("target"))
+            .agg(*[func(col(column)).alias(column)
+                   for column, func in self.target_aggregations.items()])
         )
         #

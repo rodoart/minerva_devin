@@ -84,10 +84,14 @@ GRAPH_CENTRALITY_FEATURES = [
     {"pagerank": None},                                  # PageRank no ponderado por nodo (max_iter=10, reset_prob=0.15 por defecto)
     {"degrees": None},                                   # grado de entrada/salida/total por nodo
     {"components": None},                                # id de la componente conexa de cada nodo
+    {"degree_balance": None},                            # balance direccional del grado (net_degree, in_out_degree_ratio)
+    {"reciprocity": None},                               # fracción de vecinos que también enlazan de vuelta
+    {"self_loops": None},                                # nº de aristas src==dst por nodo
     # {"triangle_count": None},                          # nº de triángulos en los que participa cada nodo
     {"weighted_pagerank": {"weight": "count_txn"}},      # PageRank ponderado por el peso "composed" de las aristas
     {"weighted_degrees": {"weight": "count_txn"}},       # fuerza (strength) in/out/total con peso "composed"
     {"weighted_edge_stats": {"weight": "count_txn"}},    # estadísticas del peso de aristas incidentes (in+out)
+    {"weighted_degree_balance": {"weight": "count_txn"}},# balance direccional de la fuerza (net_strength, ratio)
     # {"weighted_triangle_count": {"weight": "composed"}}, # triángulos por nodo + fuerza ponderada
 ]
 
@@ -136,6 +140,18 @@ output = {
         "keep_or_delete": "keep"
     },
     "weighted_triangle_count": {"table_or_hdfs": current_hdfs.joinpath("weighted_triangle_count"),#simple
+        "keep_or_delete": "keep"
+    },
+    "degree_balance": {"table_or_hdfs": current_hdfs.joinpath("degree_balance"),#simple
+        "keep_or_delete": "keep"
+    },
+    "reciprocity": {"table_or_hdfs": current_hdfs.joinpath("reciprocity"),#simple
+        "keep_or_delete": "keep"
+    },
+    "self_loops": {"table_or_hdfs": current_hdfs.joinpath("self_loops"),#simple
+        "keep_or_delete": "keep"
+    },
+    "weighted_degree_balance": {"table_or_hdfs": current_hdfs.joinpath("weighted_degree_balance"),#simple
         "keep_or_delete": "keep"
     },
     "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple  # dir. de checkpoint de GraphFrames

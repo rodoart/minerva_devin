@@ -39,7 +39,7 @@ El vintage se deriva de `MINERVA_TODAY` en `config/job.py` (`vintage`, `vintage_
 ### Flujo completo (producción)
 
 ```bash
-python main.py                      # ejecuta los 9 steps encadenados
+python main.py                      # ejecuta los 10 steps encadenados
 python main.py --level DEBUG        # más logs
 python main.py --log-file run.log   # también a fichero
 python main.py --build-only         # solo construye la cadena (smoke test)
@@ -54,7 +54,7 @@ todo el flujo:
 ```
 rfc_nom_ranking → txn_replacement → special_treatment → group_by
   → edges_and_nodes → graph_features → target_propagation (lovelace)
-  → target_propagation_features → vector_assembler
+  → target_propagation_features → cluster_features → vector_assembler
 ```
 
 ### Desarrollo interactivo (`run_order.py`)
@@ -146,19 +146,21 @@ ver `config/target_propagation/lovelace/special_treatment.py`).
 
 | Step | Lee | Produce |
 |---|---|---|
-| `CepsRfcNomRankingStep` | CEPS crudo | CEPS con `id_src`/`id_dst` (ranking rfc/nom) |
-| `CepsTxnReplacementStep` | ranking + CEPS | CEPS con txns reemplazadas |
+| `CepsRfcNomRankingStep` | CEPS crudo (24m) + catálogo Banxico opcional | CEPS con `id_src`/`id_dst` (ranking rfc/nom) |
+| `CepsTxnReplacementStep` | ranking + CEPS | `rfc_curp_analysis_s264_ceps_replaced` (solo últimos 3 meses de txns) |
 | `CepsSpecialTreatment` | txn_replacement | `raw_flattened` (tfrom_days, hora, monto) |
-| `CepsGroupByStep` | flattened | `group_by_id` (métricas + arrays id por nodo), `group_by_txn` |
+| `CepsGroupByStep` | flattened | `group_by_id` (métricas + arrays id por nodo), `group_by_txn` + parciales `*_monthly` (incremental por `month_partition`) |
 | `CepsEdgesAndNodesStep` | group_by | `edges` (con mapa `weights`), `nodes` |
-| `CepsGraphFeaturesStep` | edges/nodes | parquets por feature (`pagerank`, `degrees`, `weighted_*`...) |
-| `LovelaceTargetPropagationSpecialTreatmentStep` | lovelace crudo | target limpio agregado |
-| `CepsTargetPropagationFeaturesStep` | nodes/edges + target | `edges_norm`, `target_propagation` (`contagion_*`), `nodes_join_target_lovelace` |
-| `CepsVectorAssemblerStep` | todas las features + pivote | `numcliente_features`, `numcliente_features_vector` |
+| `CepsGraphFeaturesStep` | edges/nodes | parquets por feature (`pagerank`, `degrees`, `degree_balance`, `reciprocity`, `self_loops`, `weighted_*`...) |
+| `LovelaceTargetPropagationSpecialTreatmentStep` | lovelace crudo | `target_cta`/`target_numcliente` con TODAS las columnas de `TARGET_AGGREGATIONS` (target + scores) |
+| `CepsTargetPropagationFeaturesStep` | nodes/edges + target | `edges_norm`, `target_propagation` (`contagion_<weight>` y `contagion_<col>_<weight>`), `nodes_join_target_lovelace` |
+| `CepsClusterFeaturesStep` | nodos enriquecidos + features | `cluster_stats` (stats intra-grupo por `component_id`/`scc`) |
+| `CepsVectorAssemblerStep` | todas las features + pivotes | `{numcliente,cta}_features` y `{numcliente,cta}_features_vector` |
 
-**Salida final**: `numcliente_features_vector` = pivote de numclientes +
-columnas de feature agregadas + columna vector `features` (lista para
-`pyspark.ml`), con `target_*` disponibles como etiquetas fuera del vector.
+**Salida final**: `{nivel}_features_vector` = SOLO llave + columna vector
+`features` (lista para `pyspark.ml`); `{nivel}_features` = llave + variables
+agregadas `{func}_{feat}_ceps` (con `target_*` como etiquetas fuera del
+vector).
 
 ## 6. Cómo extender
 
@@ -213,13 +215,18 @@ GRAPH_FEATURE_FUNCTIONS["mi_feature"] = mi_feature
 1. `config/target_propagation/<nuevo>/special_treatment.py` con su `input`
    (`select`/`filter`/`column`/`missing_treatment`) y un step
    `StandardTargetPropagationSpecialTreatmentStep` propio que produzca
-   `target_cta`/`target_numcliente` (o el nivel que aplique).
+   `target_cta`/`target_numcliente` (o el nivel que aplique). Usar
+   `TARGET_AGGREGATIONS = {columna: funcion}` para propagar varias columnas
+   a la vez (target + scores).
 2. En `config/features/ceps/target_propagation_features.py`: registrar el
    target en `TARGETS` con sus `modes` — cada modo define `input_key`
    (clave de `input`/`output` del step de tratamiento), `suffix` (nombre de
    la columna `target_<suffix>`), `aggregation_function` y
-   `missing_treatment`. `TARGET_SELECTION_FUNCTION` (defecto `greatest`)
-   decide el target final cuando hay varios modos.
+   `missing_treatment`. Para propagar varias columnas usar `"columns":
+   {columna: {"aggregation_function": f, "missing_treatment": [...]}}`;
+   `TARGET_SELECTION_FUNCTION` (defecto `greatest`) decide el target final
+   cuando hay varios modos. Las columnas extra producen
+   `contagion_<col>_<weight>` automáticamente.
 3. Crear los substeps de join/propagación en
    `pipelines/features/ceps/target_propagation_features.py` siguiendo el
    patrón `LovelaceCeps{JoinGraph,TargetPropagation}SubStep` y añadir las
@@ -236,11 +243,38 @@ Editar `config/features/ceps/target_propagation_features.py`:
 
 ### Parámetros del assembler
 
-`config/features/ceps/vector_assembler.py`: `PIVOT`/`PIVOT_COLUMN` (lista de
-numclientes), `AGGREGATION_WEIGHT` (Column, por defecto
-`oper_mto/(tfrom_days+1)`), `FEATURE_AGGREGATION` (default `weighted_mean`,
-overrides por columna), `FILL_NULLS_VALUE`, `HANDLE_INVALID`,
-`EXCLUDE_COLUMNS`/`EXCLUDE_PREFIXES` (`target_*` queda fuera del vector).
+`config/features/ceps/vector_assembler.py`:
+
+- `AGGREGATION_LEVELS` — niveles de agregación (`["numcliente", "cta"]`); cada
+  uno produce `{nivel}_features` + `{nivel}_features_vector`.
+- `NODE_ID_ARRAY_COLUMNS` — array de `nodes` explotado por nivel.
+- `PIVOT_BY_LEVEL` — pivote externo por nivel (`input_key` + `column`).
+- `AGGREGATION_WEIGHT` — Column de peso (defecto `oper_mto/(tfrom_days+1)`).
+- `FEATURE_AGGREGATION` — string, lista (`{func}_{feat}` por función) o dict
+  `{"default": ..., "<col>": ...}`; funciones: mean/median/std/min/max/sum/
+  first/distinct_count/weighted_mean.
+- `VARIABLE_SUFFIX` — sufijo de todas las variables (`"_ceps"`).
+- `FILL_NULLS_VALUE` — centinela de nulos del vector (`-99999`).
+- `HANDLE_INVALID`, `VECTOR_OUTPUT_COLUMN`, `EXCLUDE_COLUMNS`,
+  `EXCLUDE_PREFIXES` (`target_*` queda fuera del vector).
+- `FEATURE_SOURCES` — flags por fuente: `"enabled": False` desactiva;
+  `"optional": True` (default) convierte errores de carga en warning.
+
+### Desactivar una fuente de features
+
+```python
+FEATURE_SOURCES["cluster_stats"] = {
+    "mode": "simple", "path": ..., "enabled": False}   # no se lee
+# o dejarla opcional (default): si falta el parquet solo hay warning.
+```
+
+### Historia de txns vs. catálogos de reemplazo
+
+`CEPS_RANKING_HISTORY_IN_MONTHS` (24, en `config/ceps/rfc_nom_ranking.py`)
+controla cuánta historia CEP alimenta los catálogos;
+`TXN_REPLACED_HISTORY_IN_MONTHS` (3, en `config/ceps/txn_replacement.py`)
+cuánta historia transaccional conserva `rfc_curp_analysis_s264_ceps_replaced`.
+Son independientes.
 
 ## 7. Tests
 

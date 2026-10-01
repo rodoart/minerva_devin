@@ -13,16 +13,21 @@ write_lock = Lock()
 # ----------------------------------------------------------------------------------------------------------------------
 # Pyspark
 # ----------------------------------------------------------------------------------------------------------------------
+from datetime import date
+
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import (col, when, lit)
+from pyspark.sql.functions import (col, when, lit, to_date)
 from pyspark.sql.types import StringType
 # ----------------------------------------------------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------------------------------------------------
 from libs.data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.general.date_treatment import make_date_interval_with_lag_months
 
 import libs.framework as ppf
+import config.job as cj
+import config.ceps.txn_replacement as cctr
 
 from libs.data_engineering_toolbox.context.logging import get_logger
 logger = get_logger(__name__)
@@ -30,6 +35,29 @@ logger = get_logger(__name__)
 ########################################################################################################################
 # FUNCTIONS
 ########################################################################################################################
+
+def limit_txn_history_window(
+    df: DataFrame,
+    vintage_date: date,
+    history: int,
+    lag: int = 0,
+    date_column: str = "fec_informacion",
+    spark_date_format: str = cj.DATE_STANDARD_SPARK_FORMAT,
+) -> DataFrame:
+    """Recorta las transacciones a los últimos `history` meses (ventana [inicio, fin)).
+
+    La ventana usa la misma aritmética que el loader de particiones
+    (`make_date_interval_with_lag_months`): termina al inicio del mes
+    siguiente a (vintage - lag) y empieza `history` meses atrás. Permite que la
+    tabla `replaced` conserve una historia transaccional corta (p.ej. 3 meses)
+    aunque los catálogos de reemplazo se construyeran con una ventana más
+    profunda.
+    """
+    if not history or history <= 0:
+        return df
+    start, end = make_date_interval_with_lag_months(vintage_date, history, lag)
+    txn_date = to_date(col(date_column), spark_date_format)
+    return df.filter((txn_date >= lit(str(start))) & (txn_date < lit(str(end))))
 
 ########################################################################################################################
 # PROCESS
@@ -107,6 +135,12 @@ class CepsTxnReplacementStep(ppf.Step):
         y renombra `id_kind_*` a `rfc_curp_kind_*`.
         """
         return (self.standard_load_parquet_or_table("rfc_curp_analysis_s264_ceps", input_or_output="input")
+            .transform(lambda df_: limit_txn_history_window(
+                df_,
+                vintage_date=self.input_parameters["vintage_date"],
+                history=cctr.TXN_REPLACED_HISTORY_IN_MONTHS,
+                lag=self.input_hive["rfc_curp_analysis_s264_ceps"].get("lag", 0),
+            ))
             .drop("tfrom")
             .drop(*['is_curp_ord', 'is_rfc_fisica_ord', 'is_rfc_moral_ord',
                 'is_rfc_fisica_sin_homoclave_ord', 'is_tc_ord', 'is_clabe_ord',

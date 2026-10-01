@@ -276,6 +276,30 @@ class StandardGraphFeaturesUnWeightedStep(SubStep):
         """Número de triángulos en los que participa cada nodo."""
         return lff.triangle_count(graph)
     #
+    @staticmethod
+    def degree_balance_ft(
+        graph:GraphFrame,
+        **kwargs
+    ) -> DataFrame:
+        """Balance direccional del grado por nodo (net_degree, in_out_degree_ratio)."""
+        return lff.degree_balance(graph)
+    #
+    @staticmethod
+    def reciprocity_ft(
+        graph:GraphFrame,
+        **kwargs
+    ) -> DataFrame:
+        """Reciprocidad por nodo (vecinos que también enlazan de vuelta)."""
+        return lff.reciprocity(graph)
+    #
+    @staticmethod
+    def self_loops_ft(
+        graph:GraphFrame,
+        **kwargs
+    ) -> DataFrame:
+        """Número de aristas src==dst por nodo (self_loop_count)."""
+        return lff.self_loops(graph)
+    #
     # def k_core_ft(self, graph:GraphFrame, k:int) -> DataFrame:
     #     return graph.kCore(k).withColumnRenamed("core", f"k_core_{k}")
 
@@ -308,6 +332,14 @@ class StandardGraphFeaturesWeightedStep(SubStep):
     ) -> DataFrame:
         """Estadísticas de peso de aristas incidentes por nodo (in + out). ..."""
         return lff.weighted_edge_stats(graph, aggregations=aggregations)
+    #
+    @staticmethod
+    def weighted_degree_balance_ft(
+        graph: GraphFrame,
+        **kwargs
+    ) -> DataFrame:
+        """Balance direccional de la fuerza ponderada (net_strength, in_out_strength_ratio)."""
+        return lff.weighted_degree_balance(graph)
     #
     @staticmethod
     def weighted_components_ft(

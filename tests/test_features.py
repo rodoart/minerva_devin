@@ -48,7 +48,9 @@ class TestRegistry:
     def test_expected_feature_names(self):
         assert set(lff.GRAPH_FEATURE_FUNCTIONS.keys()) == {
             "pagerank", "degrees", "components", "triangle_count",
+            "degree_balance", "reciprocity", "self_loops",
             "weighted_pagerank", "weighted_degrees", "weighted_edge_stats",
+            "weighted_degree_balance",
             "weighted_components", "weighted_triangle_count",
             "target_propagation",
         }
@@ -100,6 +102,59 @@ class TestUnweightedFeatures:
         result = lff.pagerank(tiny_graph, max_iter=2)
         assert "pagerank" in result.columns
         assert result.count() == 4
+
+    def test_degree_balance(self, tiny_graph):
+        result = {r["id"]: r for r in lff.degree_balance(tiny_graph).collect()}
+        # a: out=2, in=0 -> net=2, ratio null (no recibe)
+        assert result["a"]["net_degree"] == 2
+        assert result["a"]["in_out_degree_ratio"] is None
+        # b: out=1, in=1 -> net=0, ratio=1
+        assert result["b"]["net_degree"] == 0
+        assert result["b"]["in_out_degree_ratio"] == pytest.approx(1.0)
+        # c: out=0, in=2 -> net=-2, ratio=0
+        assert result["c"]["net_degree"] == -2
+        assert result["c"]["in_out_degree_ratio"] == 0.0
+
+    def test_reciprocity(self, graphframes):
+        """a<->b recíproco; a->c y c->a existen? no: a->c solo ida."""
+        from graphframes import GraphFrame
+        vertices = graphframes.createDataFrame(
+            [("a",), ("b",), ("c",)], ["id"])
+        edges = graphframes.createDataFrame(
+            [("a", "b"), ("b", "a"), ("a", "c")], ["src", "dst"])
+        g = GraphFrame(vertices, edges)
+        result = {r["id"]: r for r in lff.reciprocity(g).collect()}
+        # a: out={b,c}, in={b}; recíproco out=1 (b), in=1 (b)
+        assert result["a"]["reciprocal_out"] == 1
+        assert result["a"]["reciprocal_in"] == 1
+        assert result["a"]["reciprocity_out"] == pytest.approx(0.5)
+        assert result["a"]["reciprocity_in"] == pytest.approx(1.0)
+        assert result["a"]["reciprocity"] == pytest.approx(2 / 3)
+        # b: out={a}, in={a}; ambos recíprocos -> ratios 1.0
+        assert result["b"]["reciprocity_out"] == pytest.approx(1.0)
+        assert result["b"]["reciprocity_in"] == pytest.approx(1.0)
+        # c: solo recibe -> reciprocity_in = 0 (a->c no recíproca)
+        assert result["c"]["reciprocity_in"] == 0.0
+
+    def test_reciprocity_ignores_self_loops(self, graphframes):
+        """Una arista src==dst no cuenta como reciprocidad."""
+        from graphframes import GraphFrame
+        vertices = graphframes.createDataFrame([("a",)], ["id"])
+        edges = graphframes.createDataFrame([("a", "a")], ["src", "dst"])
+        g = GraphFrame(vertices, edges)
+        rows = lff.reciprocity(g).collect()
+        assert rows == []  # el self-loop se excluye de los pares dirigidos
+
+    def test_self_loops(self, graphframes):
+        from graphframes import GraphFrame
+        vertices = graphframes.createDataFrame([("a",), ("b",)], ["id"])
+        edges = graphframes.createDataFrame(
+            [("a", "a"), ("a", "a"), ("a", "b")], ["src", "dst"])
+        g = GraphFrame(vertices, edges)
+        result = {r["id"]: r["self_loop_count"]
+            for r in lff.self_loops(g).collect()}
+        assert result["a"] == 2
+        assert result["b"] == 0  # sin self-loop -> 0, no null
 
 
 # ----------------------------------------------------------------------------
@@ -155,6 +210,19 @@ class TestWeightedFeatures:
         rows = {r["id"]: r for r in result.collect()}
         # componente {a,b,c}: peso total aristas = 2+4+6 = 12
         assert rows["a"]["component_weight"] == 12.0
+
+    def test_weighted_degree_balance(self, tiny_graph):
+        result = {r["id"]: r for r in
+            lff.weighted_degree_balance(tiny_graph).collect()}
+        # a: out=8, in=0 -> net=8, ratio null
+        assert result["a"]["net_strength"] == 8.0
+        assert result["a"]["in_out_strength_ratio"] is None
+        # b: out=4, in=2 -> net=2, ratio=2
+        assert result["b"]["net_strength"] == 2.0
+        assert result["b"]["in_out_strength_ratio"] == pytest.approx(2.0)
+        # c: out=0, in=10 -> net=-10, ratio=0
+        assert result["c"]["net_strength"] == -10.0
+        assert result["c"]["in_out_strength_ratio"] == 0.0
 
 
 # ----------------------------------------------------------------------------
@@ -258,6 +326,46 @@ class TestTargetGroupById:
         target = spark.createDataFrame([("c1", 0.8)], ["numcliente", "target"])
         result = lff.target_group_by_id(group_by_id, target, "numcliente")
         assert result.columns == ["id", "target_agg_numcliente"]
+
+    def test_multi_column_dict(self, spark):
+        """Dict {columna: función}: propaga target y scores en una sola pasada."""
+        group_by_id = spark.createDataFrame(
+            [("n1", ["c1", "c2"]), ("n2", ["c3"])], ["id", "numcliente"])
+        target = spark.createDataFrame(
+            [("c1", 1.0, 0.9), ("c2", 0.0, 0.1), ("c3", 0.0, 0.5)],
+            ["numcliente", "target", "score"])
+        result = {r["id"]: r for r in lff.target_group_by_id(
+            group_by_id, target, "numcliente",
+            function={"target": spark_max, "score": spark_mean}).collect()}
+        # n1: max(target)=1, mean(score)=(0.9+0.1)/2=0.5
+        assert result["n1"]["target_agg_numcliente"] == pytest.approx(1.0)
+        assert result["n1"]["target_agg_numcliente_score"] == pytest.approx(0.5)
+        assert result["n2"]["target_agg_numcliente"] == 0.0
+        assert result["n2"]["target_agg_numcliente_score"] == pytest.approx(0.5)
+
+    def test_multi_column_names(self, spark):
+        """'target' mantiene `target_agg_<col>`; el resto lleva su nombre."""
+        group_by_id = spark.createDataFrame(
+            [("n1", ["c1"])], ["id", "numcliente"])
+        target = spark.createDataFrame(
+            [(1, 0.9, 0.3)], ["numcliente", "target", "score"])
+        result = lff.target_group_by_id(
+            group_by_id, target, "numcliente",
+            function={"target": spark_max, "score": spark_mean})
+        assert set(result.columns) == {
+            "id", "target_agg_numcliente", "target_agg_numcliente_score"}
+
+    def test_multi_column_missing_target_gives_null(self, spark):
+        group_by_id = spark.createDataFrame(
+            [("n1", ["c9"])], ["id", "numcliente"])
+        target = spark.createDataFrame(
+            [("c1", 1.0, 0.9)], ["numcliente", "target", "score"])
+        result = lff.target_group_by_id(
+            group_by_id, target, "numcliente",
+            function={"target": spark_max, "score": spark_mean})
+        row = result.first()
+        assert row["target_agg_numcliente"] is None
+        assert row["target_agg_numcliente_score"] is None
 
 
 class TestJoinTarget:

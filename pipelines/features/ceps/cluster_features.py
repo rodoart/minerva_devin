@@ -254,6 +254,16 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             and field.name not in cclf.AGGREGATE_EXCLUDE_COLUMNS
         ]
         logger.info("Columnas agregadas por grupo: %s", aggregate_columns)
+        # Guarda: la target y la target propagada (y los pesos) deben entrar
+        # en los estadísticos de grupo; si ningún prefijo obligatorio tiene
+        # columnas agregables se avisa en lugar de fallar.
+        for prefix in getattr(cclf, "REQUIRED_STATS_PREFIXES", []):
+            if not any(c.startswith(prefix) or c.endswith(prefix)
+                    for c in aggregate_columns):
+                logger.warning(
+                    "Ninguna columna agregable coincide con el prefijo "
+                    "obligatorio %r; el grupo no tendrá stats de esa variable",
+                    prefix)
         result = df.select("id")
         for group_column in cclf.GROUP_COLUMNS:
             result = result.join(

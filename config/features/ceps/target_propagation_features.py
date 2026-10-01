@@ -33,29 +33,69 @@ from ...job import sbx as job_config
 # Fuentes de target a propagar: {nombre_target: {"modes": {modo: config}}}.
 # Cada modo agrega el target sobre `group_by_id` y lo une a los nodos como
 # columna `target_lovelace_<suffix>`.
+#
+# Cada modo admite dos formas de declarar las columnas a propagar:
+#   - simple (back-compat): "aggregation_function" + "missing_treatment"
+#     aplicados a la columna "target".
+#   - multi-columna: "columns" = {columna: {"aggregation_function": f,
+#     "missing_treatment": [...]}} — agrega y propaga TODAS esas columnas de
+#     la tabla de entrada (target, scores, etc.), produciendo
+#     `target_lovelace_<suffix>_<columna>` por nodo.
 TARGETS = {
     "lovelace":{
         "modes": {
             "cta":{  # agregación del target por cuenta beneficiaria
                 "input_key":"target_cta",               # clave de `input` con el target ya agregado por cta
                 "suffix":"cta",                         # columna (array) de group_by_id por la que se agrega; sufijo de la columna resultante
-                "aggregation_function": spark_max,      # función de agregación del target (máximo = fraude si alguna txn lo es)
-                "missing_treatment": ["mean_with_nulls"]# imputación de nulos del agregado: media contando nulos como 0
+                "aggregation_function": spark_max,      # función de agregación por defecto de las columnas
+                "missing_treatment": ["mean_with_nulls"]# imputación de nulos por defecto: media contando nulos como 0
+                # ,"columns": {                         # forma multi-columna (opcional):
+                #     "target": {"aggregation_function": spark_max, "missing_treatment": ["mean_with_nulls"]},
+                #     "score":  {"aggregation_function": spark_mean, "missing_treatment": ["mean_with_nulls"]},
+                # }
             },
             "numcliente":{  # agregación del target por cliente
                 "input_key":"target_numcliente",        # clave de `input` con el target ya agregado por numcliente
                 "suffix":"numcliente",                  # columna (array) de group_by_id por la que se agrega; sufijo de la columna resultante
-                "aggregation_function": spark_max,      # función de agregación del target (máximo)
-                "missing_treatment": ["mean_with_nulls"]# imputación de nulos del agregado: media contando nulos como 0
+                "aggregation_function": spark_max,      # función de agregación por defecto
+                "missing_treatment": ["mean_with_nulls"]# imputación de nulos por defecto: media contando nulos como 0
             }
         }
     }
 }
 
 
-# Combina las columnas `target_lovelace_*` de todos los modos en `target_lovelace`
-# (greatest = se queda con el máximo entre cta y numcliente).
+# Combina las columnas `target_lovelace_*` de todos los modos en
+# `target_lovelace[_<columna>]` (greatest = se queda con el máximo entre cta y
+# numcliente). Se aplica por separado a cada columna propagada.
 TARGET_SELECTION_FUNCTION = greatest
+
+
+def _mode_columns(mode: dict) -> dict:
+    """Columnas a propagar de un modo: normaliza la forma simple a la de dict."""
+    if "columns" in mode:
+        return mode["columns"]
+    return {"target": {
+        "aggregation_function": mode["aggregation_function"],
+        "missing_treatment": mode.get("missing_treatment"),
+    }}
+
+
+def propagation_node_columns(targets: dict = None) -> list:
+    """Columnas `target_lovelace*` combinadas que quedan en los nodos.
+
+    "target" -> "target_lovelace"; cualquier otra columna (scores, etc.) ->
+    "target_lovelace_<columna>". Útil para `node_final_columns` del grafo.
+    """
+    if targets is None:
+        targets = TARGETS
+    columns = set()
+    for target in targets.values():
+        for mode in target["modes"].values():
+            columns.update(_mode_columns(mode).keys())
+    return sorted(
+        "target_lovelace" if column == "target" else f"target_lovelace_{column}"
+        for column in columns)
 
 
 # --------------------------------------------------------------------------------------
@@ -72,16 +112,25 @@ PROPAGATION_MAX_ITER = 3              # iteraciones de paso de mensajes por el g
 PROPAGATION_ALPHA = 0.15              # amortiguación: peso del score entrante frente al propio (1-alpha)
 PROPAGATION_KEEP_SEED_FLOOR = True    # el score de un nodo nunca cae por debajo de su semilla original
 
-# Features de contagio generadas: una por weight_type. Cada kwargs va a
-# `propagate_target` y, al ser escalares, parametriza el subdirectorio de salida
+# Features de contagio generadas: una por (columna de target propagada x
+# weight_type). La columna semilla `target_lovelace` produce `contagion_<weight>`;
+# el resto (`target_lovelace_<col>`: scores, etc.) produce
+# `contagion_<col>_<weight>`. Cada kwargs va a `propagate_target` y, al ser
+# escalares, parametriza el subdirectorio de salida
 # (weight_type=.../target_column=.../max_iter=.../alpha=.../keep_seed_floor=...).
 PROPAGATION_FEATURES = [
-    {f"contagion_{weight_type}": {   # nombre de la feature y de su columna de salida
+    {(
+        f"contagion_{weight_type}"
+        if node_column == "target_lovelace"
+        else f"contagion_{node_column.replace('target_lovelace_', '')}_{weight_type}"
+    ): {
         "weight_type": weight_type,                       # clave del mapa `weights` usada como peso de arista
+        "target_column": node_column,                     # columna semilla en los nodos a propagar
         "max_iter": PROPAGATION_MAX_ITER,                 # iteraciones de difusión
         "alpha": PROPAGATION_ALPHA,                       # factor de amortiguación de la difusión
         "keep_seed_floor": PROPAGATION_KEEP_SEED_FLOOR,   # floor en la semilla del target
     }}
+    for node_column in propagation_node_columns()
     for weight_type in WEIGHT_TYPES
 ]
 

@@ -6,7 +6,7 @@
 # ------------------------------------------------------------------------------
 # General
 # ------------------------------------------------------------------------------
-from typing import Callable, List, Dict, Any
+from typing import Callable, List, Dict, Any, Optional, Union
 
 
 # ------------------------------------------------------------------------------
@@ -135,9 +135,13 @@ class StandardJoinGraphSubStep(SubStep):
         group_by_id:DataFrame,
         target:DataFrame,
         column:str,
-        function:Callable[..., Column]=spark_max
+        function:Union[Callable[..., Column], Dict[str, Callable[..., Column]]]=spark_max
     ) -> DataFrame:
-        """Agrega el target por cada valor de `column` (array) asociado a cada id de nodo."""
+        """Agrega el/los target(s) por cada valor de `column` (array) asociado a cada id de nodo.
+
+        `function` puede ser un callable (columna `target`) o un dict
+        {columna: callable} para propagar varias columnas a la vez.
+        """
         return lff.target_group_by_id(group_by_id, target, column, function)
     #
     @staticmethod
@@ -280,6 +284,7 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
         max_iter:int = 3,
         alpha:float = 0.15,
         keep_seed_floor:bool = True,
+        output_column_name:Optional[str] = None,
         **kwargs
     ) -> DataFrame:
         """Propaga el target por el grafo y cachea el score de contagio.
@@ -315,7 +320,8 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
                 graph=graph,
                 edges_norm=edges_norm,
                 target_column=target_column,
-                final_output_column_name=f"contagion_{weight_type}",
+                final_output_column_name=(output_column_name
+                    or f"contagion_{weight_type}"),
                 keep_seed_floor=keep_seed_floor,
                 max_iter=max_iter,
                 alpha=alpha,
@@ -392,40 +398,50 @@ class LovelaceCepsJoinGraphSubStep(StandardJoinGraphSubStep):
     @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="nodes_join_target_lovelace")
     def nodes_join_target(self) -> DataFrame:
-        """Nodos del grafo enriquecidos con el target Lovelace agregado por modo.
+        """Nodos del grafo enriquecidos con el/los target(s) Lovelace agregados por modo.
 
         Para cada modo de `TARGETS["lovelace"]["modes"]` (cta, numcliente) se
-        agrega el target sobre `group_by_id` y se une a `nodes`; después se
-        combinan las columnas `target_lovelace_*` en `target_lovelace` con
-        `TARGET_SELECTION_FUNCTION`.
+        agregan TODAS las columnas configuradas (`columns` o la forma simple
+        sobre `target`) sobre `group_by_id` y se unen a `nodes` como
+        `target_lovelace_{suffix}` / `target_lovelace_{suffix}_{columna}`;
+        después se combinan en `target_lovelace` / `target_lovelace_{columna}`
+        con `TARGET_SELECTION_FUNCTION`.
         """
         nodes = self.nodes
+        combined: Dict[str, List[str]] = {}
         #
         for mode_name, mode in cfcf.TARGETS["lovelace"]["modes"].items():
             target = self.get_input(mode["input_key"])
+            mode_columns = cfcf._mode_columns(mode)
+            #
             target_group_by_id = self.standard_target_group_by_id(
-                self.group_by_id, target, mode["suffix"], mode["aggregation_function"]
+                self.group_by_id, target, mode["suffix"],
+                {tcol: spec["aggregation_function"]
+                 for tcol, spec in mode_columns.items()}
             )
             #
-            agg_column = f"target_agg_{mode['suffix']}"
-            if mode.get("missing_treatment"):
-                target_group_by_id = apply_missing_treatment(
-                    target_group_by_id, {agg_column: mode["missing_treatment"]}
+            for tcol, spec in mode_columns.items():
+                agg_column = (f"target_agg_{mode['suffix']}" if tcol == "target"
+                    else f"target_agg_{mode['suffix']}_{tcol}")
+                if spec.get("missing_treatment"):
+                    target_group_by_id = apply_missing_treatment(
+                        target_group_by_id, {agg_column: spec["missing_treatment"]}
+                    )
+                node_column_suffix = (f"lovelace_{mode['suffix']}" if tcol == "target"
+                    else f"lovelace_{mode['suffix']}_{tcol}")
+                nodes = self.standard_join_target(
+                    nodes,
+                    target_group_by_id.select("id", agg_column),
+                    node_column_suffix,
+                    target_column=agg_column
                 )
-            #
-            nodes = self.standard_join_target(
-                nodes, target_group_by_id, f"lovelace_{mode['suffix']}",
-                target_column=agg_column
-            )
+                combined.setdefault(tcol, []).append(f"target_{node_column_suffix}")
         #
-        target_columns = [
-            f"target_lovelace_{mode['suffix']}"
-            for mode in cfcf.TARGETS["lovelace"]["modes"].values()
-        ]
-        nodes = nodes.withColumn(
-            "target_lovelace",
-            cfcf.TARGET_SELECTION_FUNCTION(*[col(c) for c in target_columns])
-        )
+        for tcol, columns in combined.items():
+            nodes = nodes.withColumn(
+                "target_lovelace" if tcol == "target" else f"target_lovelace_{tcol}",
+                cfcf.TARGET_SELECTION_FUNCTION(*[col(c) for c in columns])
+            )
         return nodes
 
 
@@ -455,17 +471,19 @@ class LovelaceCepsTargetPropagationSubStep(StandardTargetPropagationSubStep):
         for feature_config in cfcf.PROPAGATION_FEATURES:
             feature_name = list(feature_config.keys())[0]
             feature_kwargs = feature_config[feature_name]
+            target_column = feature_kwargs.get("target_column", "target_lovelace")
             #
             df = self.propagate_target(
                 parent_hdfs=parent_hdfs,
-                target_column="target_lovelace",
+                target_column=target_column,
+                output_column_name=feature_name,
                 edges_df=self.edges,
                 nodes_df=self.nodes_join_target,
                 checkpoint_hdfs=checkpoint_hdfs,
                 column_renames=cfgf.GRAPH_RENAMES,
                 edge_final_columns=["src", "dst", "weight"],
-                node_final_columns=["id", "target_lovelace"],
-                **feature_kwargs
+                node_final_columns=["id"] + cfcf.propagation_node_columns(),
+                **{k: v for k, v in feature_kwargs.items() if k != "target_column"}
             )
             results.append({feature_name: {**feature_kwargs, "df": df}})
         #

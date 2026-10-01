@@ -101,3 +101,55 @@ def df_factory(spark):
     def _make(rows, schema=None):
         return spark.createDataFrame(rows, schema=schema)
     return _make
+
+
+@pytest.fixture()
+def local_hdfs(monkeypatch):
+    """Redirige `libs.data_engineering_toolbox.path` al filesystem local.
+
+    Parchea las primitivas HDFS (`_ls`, `exists`, `is_dir`, ...) para que los
+    decoradores de particionado del framework funcionen sobre `tmp_path` en
+    modo "local". En modo "cluster" no parchea nada.
+    """
+    if TEST_MODE != "local":
+        return None
+    import shutil
+    from datetime import datetime
+    from pathlib import Path
+    import libs.data_engineering_toolbox.path as pm
+
+    def _local_ls(path, *args):
+        base = Path(path)
+        if not base.exists():
+            return []
+        it = base.rglob("*") if "-R" in args else base.glob("*")
+        entries = []
+        for p in sorted(it):
+            if not p.exists():
+                continue
+            st = p.stat()
+            entries.append({
+                "file_type": "d" if p.is_dir() else "-",
+                "permissions": "drwxrwxrwx" if p.is_dir() else "-rw-r--r--",
+                "copies": "1", "user": "u", "group": "g",
+                "size": str(st.st_size),
+                "date_and_time": datetime.fromtimestamp(st.st_mtime),
+                "path": p.as_posix(),
+            })
+        return entries
+
+    monkeypatch.setattr(pm, "_ls", _local_ls)
+    monkeypatch.setattr(pm, "exists", lambda p: Path(p).exists())
+    monkeypatch.setattr(pm, "is_dir", lambda p: Path(p).is_dir())
+    monkeypatch.setattr(pm, "is_file", lambda p: Path(p).is_file())
+    monkeypatch.setattr(
+        pm, "mkdir", lambda p, *a: Path(p).mkdir(parents=True, exist_ok=True))
+
+    def _touch(p):
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        Path(p).touch()
+    monkeypatch.setattr(pm, "touch", _touch)
+    monkeypatch.setattr(pm, "rmdir",
+        lambda p, *a: shutil.rmtree(p, ignore_errors=True))
+    monkeypatch.setattr(pm, "mv", lambda s, d: shutil.move(str(s), str(d)))
+    return pm

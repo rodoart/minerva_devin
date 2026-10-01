@@ -173,3 +173,129 @@ class TestConfig:
         assert cvas.FEATURE_SOURCES["cluster_stats"]["mode"] == "simple"
         for group_column in ("component_id", "scc"):
             assert group_column in cvas.EXCLUDE_COLUMNS
+
+
+# ----------------------------------------------------------------------------
+# REQUIRED_STATS_PREFIXES: targets propagadas y pesos deben entrar en los stats
+# ----------------------------------------------------------------------------
+
+def _cluster_substep(nodes_enriched):
+    """Substep mínimo con `nodes_enriched` precargado en caché."""
+    from pipelines.features.ceps.cluster_features import CepsClusterFeaturesSubStep
+    step = object.__new__(CepsClusterFeaturesSubStep)
+    step.__dict__["_nodes_enriched_cache"] = nodes_enriched
+    return step
+
+
+class TestRequiredStatsPrefixes:
+    """Guarda de `cluster_stats`: si ningún prefijo obligatorio (target_*,
+    contagion_*, oper_mto, weight*, *_strength) produce columnas agregables,
+    se registra un warning en lugar de construir stats sin señal de target."""
+
+    @pytest.fixture(autouse=True)
+    def _minimal_config(self, monkeypatch):
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "GROUP_COLUMNS", ["component_id"])
+        monkeypatch.setattr(cclf, "CLUSTER_STATS", {"mean": spark_mean})
+        monkeypatch.setattr(cclf, "AGGREGATE_EXCLUDE_COLUMNS",
+            ["id", "component_id", "scc"])
+        monkeypatch.setattr(cclf, "REQUIRED_STATS_PREFIXES",
+            ["target_", "contagion_", "oper_mto", "weight", "_strength"])
+
+    def test_warns_when_no_required_column_present(self, spark, caplog):
+        df = spark.createDataFrame(
+            [("a", 1, 10.0)], ["id", "component_id", "feat"])
+        step = _cluster_substep(df)
+        step.cluster_stats
+        warnings = [r.message for r in caplog.records
+            if "prefijo obligatorio" in r.message]
+        assert len(warnings) == 5   # un warning por prefijo sin match
+
+    def test_no_warning_with_target_contagion_and_weights(self, spark, caplog):
+        df = spark.createDataFrame(
+            [("a", 1, 1.0, 0.4, 100.0, 2.0, 5.0),
+             ("b", 1, 0.0, 0.1, 200.0, 3.0, 6.0)],
+            ["id", "component_id", "target_lovelace", "contagion_composed",
+             "oper_mto", "weight_x", "total_strength"])
+        step = _cluster_substep(df)
+        result = step.cluster_stats
+        assert not any("prefijo obligatorio" in r.message
+            for r in caplog.records)
+        # la target y la propagada se agregan por grupo
+        rows = {r["id"]: r for r in result.collect()}
+        assert rows["a"]["cluster_component_id_mean_target_lovelace"] == 0.5
+        assert rows["a"]["cluster_component_id_mean_contagion_composed"] == \
+            pytest.approx(0.25)
+        assert rows["a"]["cluster_component_id_mean_total_strength"] == \
+            pytest.approx(5.5)
+
+    def test_endswith_prefixes_count_too(self, spark, caplog):
+        """`_strength` se busca también como sufijo (in_strength, ...)."""
+        df = spark.createDataFrame(
+            [("a", 1, 1.0, 0.4, 100.0, 5.0)],
+            ["id", "component_id", "target_lovelace", "contagion_x",
+             "oper_mto", "in_strength"])
+        step = _cluster_substep(df)
+        step.cluster_stats
+        remaining = [r.message for r in caplog.records
+            if "prefijo obligatorio" in r.message]
+        # solo falta el prefijo literal "weight"
+        assert len(remaining) == 1
+        assert "'weight'" in remaining[0]
+
+
+# ----------------------------------------------------------------------------
+# Config de propagación multi-columna
+# ----------------------------------------------------------------------------
+
+class TestPropagationConfig:
+    def test_mode_columns_simple_form(self):
+        import config.features.ceps.target_propagation_features as cfcf
+        mode = {"aggregation_function": spark_max,
+                "missing_treatment": ["mean_with_nulls"]}
+        assert cfcf._mode_columns(mode) == {"target": {
+            "aggregation_function": spark_max,
+            "missing_treatment": ["mean_with_nulls"]}}
+
+    def test_mode_columns_dict_form(self):
+        import config.features.ceps.target_propagation_features as cfcf
+        columns = {
+            "target": {"aggregation_function": spark_max},
+            "score": {"aggregation_function": spark_mean},
+        }
+        assert cfcf._mode_columns({"columns": columns}) == columns
+
+    def test_propagation_node_columns_multi(self):
+        import config.features.ceps.target_propagation_features as cfcf
+        targets = {"lovelace": {"modes": {"cta": {"columns": {
+            "target": {"aggregation_function": spark_max},
+            "score": {"aggregation_function": spark_mean},
+        }}}}}
+        assert cfcf.propagation_node_columns(targets) == [
+            "target_lovelace", "target_lovelace_score"]
+
+    def test_propagation_features_naming(self):
+        """contagion_<weight> para 'target' y contagion_<col>_<weight> para
+        el resto de columnas propagadas."""
+        import config.features.ceps.target_propagation_features as cfcf
+        targets = {"lovelace": {"modes": {"cta": {"columns": {
+            "target": {"aggregation_function": spark_max},
+            "score": {"aggregation_function": spark_mean},
+        }}}}}
+        columns = cfcf.propagation_node_columns(targets)
+        for node_column in columns:
+            expected = ("contagion_" if node_column == "target_lovelace"
+                else f"contagion_{node_column.replace('target_lovelace_', '')}_")
+            # replica la regla de PROPAGATION_FEATURES
+            name = ("contagion_w"
+                if node_column == "target_lovelace"
+                else f"contagion_score_w")
+            assert name.startswith(expected)
+
+    def test_propagation_features_targets_valid_columns(self):
+        import config.features.ceps.target_propagation_features as cfcf
+        valid = set(cfcf.propagation_node_columns())
+        for feature in cfcf.PROPAGATION_FEATURES:
+            kwargs = list(feature.values())[0]
+            assert kwargs["target_column"] in valid
+            assert list(feature)[0].startswith("contagion_")

@@ -35,6 +35,26 @@ job_config = c_j.sbx  # config del job (raíz HDFS, fechas, cohortes)
 # Columna del pivote externo con la lista de numclientes (se renombra a "numcliente").
 PIVOT_COLUMN = "numcliente"
 
+# Niveles de agregación del ensamblado: cada entrada produce las tablas
+# `{nivel}_features` (llave + features agregadas) y `{nivel}_features_vector`
+# (llave + columna vector). Misma lógica; solo cambia la columna array de los
+# nodos que se explota y el pivote externo.
+AGGREGATION_LEVELS = ["numcliente", "cta"]
+
+# Columna array de `nodes` que se explota para agregar a cada nivel
+# (group_by_id conserva los collect_set de numcliente/cta/nom/id_ban por id).
+NODE_ID_ARRAY_COLUMNS = {
+    "numcliente": "numcliente",
+    "cta": "cta",
+}
+
+# Pivote externo por nivel: clave de `input` con la lista de llaves para las
+# que generar vectores (la columna se renombra al nombre del nivel).
+PIVOT_BY_LEVEL = {
+    "numcliente": {"input_key": "pivot", "column": PIVOT_COLUMN},
+    "cta": {"input_key": "pivot_cta", "column": "cta"},
+}
+
 # Columna array de los nodos que contiene los numclientes asociados a cada id.
 NODE_ID_ARRAY_COLUMN = "numcliente"
 
@@ -45,8 +65,14 @@ NODE_WEIGHT_COLUMNS = ["oper_mto"]
 # Parametrizable: cualquier expresión Column evaluable sobre los nodos explotados.
 AGGREGATION_WEIGHT = col("oper_mto").cast("double") / (col("tfrom_days") + lit(1.0))
 
-# Estadística de agregación por feature: string global o {"default","<col>"} overrides.
-FEATURE_AGGREGATION = {"default": "weighted_mean"}
+# Estadísticas de agregación por feature: string, lista de strings (se genera
+# una columna `{funcion}_{feature}` por cada una) o dict {"default","<col>"}
+# con overrides por feature.
+FEATURE_AGGREGATION = {"default": ["weighted_mean", "median", "std", "mean"]}
+
+# Sufijo añadido a TODAS las variables de las tablas `{nivel}_features` (no a
+# la llave). "" lo desactiva.
+VARIABLE_SUFFIX = "_ceps"
 
 # Columnas de metadatos que no se agregan ni se ensamblan.
 EXCLUDE_COLUMNS = [
@@ -64,7 +90,9 @@ EXCLUDE_COLUMNS = [
 EXCLUDE_PREFIXES = ["target_"]
 
 # Relleno de nulos antes del VectorAssembler (None para no rellenar).
-FILL_NULLS_VALUE = 0.0
+# Centinela de "no encontrado": -99999 hace visible en el vector al nodo sin
+# dato en lugar de mezclarlo con valores reales en 0.
+FILL_NULLS_VALUE = -99999.0
 
 # VectorAssembler: política ante valores inválidos y nombre de la columna vector.
 HANDLE_INVALID = "keep"
@@ -85,8 +113,12 @@ input = {
     # lista de numclientes (cast a string + distinct) para los que se genera vector.
     "pivot": {"table_or_hdfs": ctp_l_st.output["target_numcliente"]["table_or_hdfs"],
         "pivot_column": PIVOT_COLUMN},     # columna que se renombra a "numcliente"
-    "nodes": ccen.output["nodes"],          # nodos del grafo: aportan el array `numcliente` y oper_mto (peso)
-    "nodes_join_target_lovelace": cfcf.output["nodes_join_target_lovelace"],  # nodos + etiqueta target_lovelace
+    # Pivote a nivel cuenta: el target agregado por cta del special_treatment
+    # Lovelace (lleva todas las columnas de TARGET_AGGREGATIONS).
+    "pivot_cta": {"table_or_hdfs": ctp_l_st.output["target_cta"]["table_or_hdfs"],
+        "pivot_column": "cta"},            # columna que se renombra a "cta"
+    "nodes": ccen.output["nodes"],          # nodos del grafo: aportan los arrays `numcliente`/`cta` y oper_mto (peso)
+    "nodes_join_target_lovelace": cfcf.output["nodes_join_target_lovelace"],  # nodos + etiquetas target_lovelace*
 }
 
 
@@ -96,10 +128,16 @@ input = {
 #   "merge_schema"  -> parquet padre con subdirs por parámetros (p.ej. contagion_*)
 #                      leído con mergeSchema; las variantes se colapsan a una fila
 #                      por `id` (max de cada columna contagion_*).
+# Flags por fuente:
+#   "enabled":  False desactiva la fuente sin borrarla del config.
+#   "optional": True (default) -> si la carga falla solo se registra un
+#               warning y se sigue sin esa fuente; False -> el error se propaga.
 _GRAPH_FEATURE_KEYS = [  # claves de `output` de graph_features leídas como fuentes "simple"
     "pagerank", "degrees", "components",
+    "degree_balance", "reciprocity", "self_loops",
     # "triangle_count",
     "weighted_pagerank", "weighted_degrees", "weighted_edge_stats",
+    "weighted_degree_balance",
     # "weighted_triangle_count",
 ]
 FEATURE_SOURCES = {
@@ -125,19 +163,11 @@ FEATURE_SOURCES["cluster_stats"] = {
 }
 
 
-# Ambas salidas son tablas/parquets particionados por mis_date/process_date.
-output = {
-    # Features agregadas a nivel numcliente (una fila por numcliente y mes).
-    "numcliente_features": {"table_or_hdfs": current_hdfs.joinpath("numcliente_features"),
-        "information_date_column": "mis_date",     # columna de fecha de información (partición mensual)
-        "process_date_column": "process_date",     # columna de fecha de proceso/ejecución (segunda partición)
-        "lag": 0,                                  # ventana sin desplazamiento respecto a vintage_date
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,  # meses de historia (12)
-        "information_date_mode":"each",            # se usan todos los meses del intervalo
-        "process_date_mode":"last"                 # por cada mes se toma la process_date más reciente
-    },
-    # Lo anterior sobre el pivote + columna `features` (vector ensamblado).
-    "numcliente_features_vector": {"table_or_hdfs": current_hdfs.joinpath("numcliente_features_vector"),
+def _level_output(level:str) -> dict:
+    """Outputs particionados de un nivel de agregación: `{level}_features`
+    (llave + todas las variables con VARIABLE_SUFFIX) y `{level}_features_vector`
+    (solo llave + columna `features` del VectorAssembler)."""
+    base = {
         "information_date_column": "mis_date",     # columna de fecha de información (partición mensual)
         "process_date_column": "process_date",     # columna de fecha de proceso/ejecución (segunda partición)
         "lag": 0,                                  # ventana sin desplazamiento respecto a vintage_date
@@ -145,4 +175,15 @@ output = {
         "information_date_mode":"each",            # se usan todos los meses del intervalo
         "process_date_mode":"last"                 # por cada mes se toma la process_date más reciente
     }
-}
+    return {
+        f"{level}_features": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features"), **base},
+        f"{level}_features_vector": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features_vector"), **base},
+    }
+
+
+# Salidas por nivel de agregación: tablas/parquets particionados por
+# mis_date/process_date. `{nivel}_features` = llave + features; la tabla final
+# `{nivel}_features_vector` = SOLO llave + columna vector.
+output = {}
+for _level in AGGREGATION_LEVELS:
+    output.update(_level_output(_level))
