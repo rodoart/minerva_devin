@@ -211,8 +211,14 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             self.input_hive["components"]["table_or_hdfs"])
         #
     @ppf.cached_property
+    @ppf.dynamic_unpartitioned_parquet(path_key="subcluster_df")
     def subcluster_df(self) -> DataFrame:
-        """Sub-partición dirigida por nodo (columna `scc`)."""
+        """Sub-partición dirigida por nodo (columna `scc`), persistida.
+
+        El SCC de GraphFrames usa checkpoints internos no reanudables: este
+        parquet es el punto de reanudación real. Si ya existe se recarga y el
+        algoritmo de grafo no vuelve a ejecutarse.
+        """
         self.define_checkpoint(
             checkpoint_hdfs=self.output_hive["checkpoint"]["table_or_hdfs"])
         edges = self.edges
@@ -227,8 +233,14 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
         )
         #
     @ppf.cached_property
+    @ppf.dynamic_unpartitioned_parquet(path_key="nodes_enriched")
     def nodes_enriched(self) -> DataFrame:
-        """Nodos + targets + antigüedad + features de grafo + columnas de grupo."""
+        """Nodos + targets + antigüedad + features de grafo + columnas de grupo.
+
+        Materializado como parquet intermedio: el join de todas las fuentes es
+        pesado y su linaje incluye el SCC; al persistirlo, los stats por grupo
+        leen de disco en vez de recomputar el grafo.
+        """
         df = self.nodes_join_target
         if "information_date" in df.columns:
             df = p_gm_sp.calculate_daily_tfrom(
@@ -273,17 +285,8 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
         return result
         #
     @ppf.cached_property
+    @ppf.dynamic_unpartitioned_parquet(path_key="cluster_stats")
     def cluster_stats_output(self) -> DataFrame:
         """Salida `cluster_stats` (parquet plano, una fila por `id`)."""
-        property_path = HivePath(str(self.output_hive["cluster_stats"]["table_or_hdfs"]))
-        #
-        def make_stats(*args, **kwargs) -> DataFrame:
-            return self.cluster_stats
-        #
-        return self.get_cached_decorated_table_or_parquet_property(
-            path=property_path,
-            input_or_output="output",
-            method=make_stats,
-            property_name="cluster_stats",
-        )
+        return self.cluster_stats
         #

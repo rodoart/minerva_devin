@@ -115,6 +115,20 @@ Réplica de `group_by_id` + columnas de fecha: `id`, `numcliente` (array),
 Una columna por cada (`weight_type` × columna propagada) — subdirs
 `weight_type=<w>/target_column=<tc>/alpha=<a>/...` leídos con `mergeSchema`.
 
+**Guardados intermedios del step**:
+
+- `edges_norm/weight_type=<w>` — aristas normalizadas por grado del receptor,
+  compartidas por todas las columnas propagadas con ese peso (dir hermano de
+  `target_propagation`; `keep_or_delete="delete"` lo limpia al final).
+- `target_propagation/<params>` — un parquet por combinación
+  (weight_type × target_column × alpha × max_iter × keep_seed_floor); cada
+  feature de contagio es su propio punto de reanudación: si el proceso muere,
+  solo recomputan las combinaciones cuyo subdir falta.
+- Dentro de cada difusión, `propagate_target` trunca el linaje con un
+  `checkpoint()` eager por iteración al dir `checkpoint/` (los `.cache()` que
+  hace GraphFrames con `AM.getCachedDataFrame` son volátiles y no truncan el
+  plan — el checkpoint sí, y es durable en HDFS).
+
 ## 4. Features de agrupación (nivel `id`, tabla `cluster_stats`)
 
 | Columna | Definición |
@@ -124,6 +138,17 @@ Una columna por cada (`weight_type` × columna propagada) — subdirs
 
 `scc` = componente fuertemente conexa (determinista) o `label_propagation`
 (no determinista) según `SUBCLUSTER_METHOD`.
+
+**Reanudación del step**: los intermedios pesados se materializan como
+parquets propios (`dynamic_unpartitioned_parquet`), porque los checkpoints
+orgánicos de GraphFrames no son reanudables:
+
+- `subcluster_df` — resultado del SCC/label-propagation (id, scc).
+- `nodes_enriched` — join de nodos + targets + todas las features de grafo.
+- `cluster_stats` — salida final.
+
+Si el proceso muere, la siguiente ejecución recarga los parquets ya escritos
+y no vuelve a correr el algoritmo de grafo ni el join multi-fuente.
 
 ## 5. Nivel `numcliente` y `cta` (VectorAssembler multi-nivel)
 

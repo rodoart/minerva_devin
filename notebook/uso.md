@@ -77,6 +77,10 @@ Todo está diseñado para reanudarse tras interrupciones del cluster:
 - Los outputs **simples** (`{"keep_or_delete": "keep"}`) se reescriben enteros
   solo si no existen. `"delete"` los marca como temporales (`tmp_paths`) para
   limpieza al final.
+- Los **intermedios pesados** también se materializan con los mismos
+  decoradores (p.ej. `subcluster_df`/`nodes_enriched` en cluster_features):
+  los checkpoints que GraphFrames genera internamente NO son reanudables, así
+  que el punto de reanudación real es el parquet persistido.
 - Los outputs parametrizados por kwargs (features, propagación) se guardan en
   subdirs por parámetro: `target_propagation/weight_type=composed/alpha=0_15/...`.
   Cambiar un parámetro genera un subdir nuevo sin pisar los anteriores.

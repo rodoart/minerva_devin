@@ -387,6 +387,19 @@ def propagate_target(
                 greatest(col(final_output_column_name), col("seed_score")),
             )
         #
+        # Truncar el linaje entre iteraciones: AM.getCachedDataFrame solo hace
+        # cache() — volátil y no trunca el plan, que crecería un
+        # aggregateMessages+join por iteración. checkpoint() es eager y durable
+        # (dir de checkpoint ya fijado por define_checkpoint en el pipeline);
+        # localCheckpoint() trunca igual pero es local, para usos sin dir (tests).
+        session = getattr(new_nodes, "sparkSession", None)
+        if session is None:
+            session = new_nodes.sql_ctx.sparkSession
+        if session.sparkContext._jsc.sc().getCheckpointDir().isDefined():
+            new_nodes = new_nodes.checkpoint()
+        else:
+            new_nodes = new_nodes.localCheckpoint()
+        #
         g = GraphFrame(AM.getCachedDataFrame(new_nodes), g.edges)
     #
     return (g.vertices.drop("seed_score") if keep_seed_floor else g.vertices

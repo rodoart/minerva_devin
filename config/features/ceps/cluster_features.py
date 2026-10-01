@@ -120,6 +120,16 @@ output = {
     "cluster_stats": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats"),
         "keep_or_delete": "keep"
     },
+    # Intermedios materializados (reload-or-recompute). El SCC de GraphFrames
+    # NO es reanudable (sus checkpoints orgánicos quedan huérfanos al morir el
+    # proceso): si el job cae, sin parquet propio habría que recomputar el
+    # subgrafo entero. Lo mismo aplica al join pesado `nodes_enriched`.
+    "subcluster_df": {"table_or_hdfs": current_hdfs.joinpath("subcluster_df"),
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+    },
+    "nodes_enriched": {"table_or_hdfs": current_hdfs.joinpath("nodes_enriched"),
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+    },
     # Directorio de checkpoint de GraphFrames para stronglyConnectedComponents.
     "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),
         "keep_or_delete": "delete"

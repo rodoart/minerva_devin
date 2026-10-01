@@ -284,6 +284,26 @@ class TestPropagationHelpers:
         assert "mi_contagion" in result.columns
         assert "seed_score" not in result.columns
 
+    def test_propagate_target_checkpoints_each_iteration(
+            self, tiny_graph, edges_norm_fixture, tmp_path):
+        """Con checkpoint dir fijado, cada iteración trunca el linaje con un
+        checkpoint eager durable (dir con archivos) — no solo cache()."""
+        import os
+        spark_session = getattr(tiny_graph.vertices, "sparkSession", None)
+        if spark_session is None:
+            spark_session = tiny_graph.vertices.sql_ctx.sparkSession
+        checkpoint_dir = str(tmp_path / "ckpt")
+        spark_session.sparkContext.setCheckpointDir(checkpoint_dir)
+        result = {r["id"]: r["contagion_score"] for r in
+            lff.propagate_target(
+                tiny_graph, edges_norm_fixture,
+                target_column="target_lovelace",
+                max_iter=2, alpha=0.5).collect()}
+        assert result["a"] == pytest.approx(0.9)
+        # el checkpoint eager materializó archivos en el dir por iteración
+        assert os.path.isdir(checkpoint_dir)
+        assert any(os.scandir(checkpoint_dir))
+
 
 # ----------------------------------------------------------------------------
 # Agregación de target a id de nodo (DataFrame-level)

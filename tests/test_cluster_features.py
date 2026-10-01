@@ -168,6 +168,13 @@ class TestConfig:
         assert "nodes_join_target_lovelace" in cclf.input
         assert "cluster_stats" in cclf.output
 
+    def test_intermediate_parquets_declared(self):
+        """Los intermedios pesados (SCC + join enriquecido) se materializan."""
+        import config.features.ceps.cluster_features as cclf
+        for key in ("subcluster_df", "nodes_enriched", "checkpoint"):
+            assert key in cclf.output
+            assert "table_or_hdfs" in cclf.output[key]
+
     def test_vector_assembler_source_registered(self):
         import config.features.ceps.vector_assembler as cvas
         assert cvas.FEATURE_SOURCES["cluster_stats"]["mode"] == "simple"
@@ -242,6 +249,77 @@ class TestRequiredStatsPrefixes:
         # solo falta el prefijo literal "weight"
         assert len(remaining) == 1
         assert "'weight'" in remaining[0]
+
+
+# ----------------------------------------------------------------------------
+# Persistencia de intermedios (reload-or-recompute)
+# ----------------------------------------------------------------------------
+
+def _bare_substep(spark, tmp_dir):
+    """Substep mínimo con output_hive apuntando a rutas temporales locales."""
+    from pipelines.features.ceps.cluster_features import (
+        CepsClusterFeaturesSubStep)
+    step = object.__new__(CepsClusterFeaturesSubStep)
+    step.sqlContext = spark
+    step.is_dynamic = True
+    step.tmp_paths = []
+    step._decorated_cache = {}
+    step.output_hive = {
+        key: {"table_or_hdfs": str(tmp_dir / key), "keep_or_delete": "delete"}
+        for key in ("subcluster_df", "nodes_enriched", "cluster_stats")
+    }
+    return step
+
+
+class TestIntermediatePersistence:
+    """Los parquets intermedios hacen reanudable el step: en una segunda
+    instancia (p.ej. tras morir el proceso) se recargan sin recomputar."""
+
+    def test_subcluster_df_reloaded_without_recomputing(
+            self, spark, tmp_path, monkeypatch):
+        """El SCC de GraphFrames solo corre una vez; el segundo acceso lee el
+        parquet (los checkpoints orgánicos del algoritmo no son reanudables)."""
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "SUBCLUSTER_METHOD", "scc")
+        monkeypatch.setattr(cclf, "SUBCLUSTER_MAX_ITER", 3)
+
+        calls = []
+        def fake_subcluster(nodes_df, edges_df, **kwargs):
+            calls.append(1)
+            return spark.createDataFrame([("a", 7)], ["id", "scc"])
+
+        step = _bare_substep(spark, tmp_path)
+        step.__dict__["_nodes_join_target_cache"] = (
+            spark.createDataFrame([("a",)], ["id"]))
+        step.__dict__["_edges_cache"] = (
+            spark.createDataFrame([("a", "a")], ["src", "dst"]))
+        monkeypatch.setattr(step, "define_checkpoint",
+            lambda checkpoint_hdfs: None)
+        monkeypatch.setattr(step, "subcluster", fake_subcluster)
+
+        first = step.subcluster_df
+        assert calls == [1]
+        assert first.collect()[0]["scc"] == 7
+
+        # Segunda instancia (simula reinicio del proceso): recarga, no recomputa.
+        step2 = _bare_substep(spark, tmp_path)
+        monkeypatch.setattr(step2, "subcluster", fake_subcluster)
+        second = step2.subcluster_df
+        assert calls == [1]          # no se volvió a llamar al algoritmo
+        assert second.collect()[0]["scc"] == 7
+
+    def test_cluster_stats_output_reloaded(self, spark, tmp_path):
+        """La salida final también se recarga del parquet ya escrito."""
+        stats = spark.createDataFrame(
+            [("a", 1.0)], ["id", "cluster_component_id_mean_target_lovelace"])
+        step = _bare_substep(spark, tmp_path)
+        step.__dict__["_cluster_stats_cache"] = stats
+        assert step.cluster_stats_output.count() == 1
+
+        step2 = _bare_substep(spark, tmp_path)
+        reloaded = step2.cluster_stats_output
+        assert reloaded.columns == stats.columns
+        assert reloaded.collect()[0]["id"] == "a"
 
 
 # ----------------------------------------------------------------------------
