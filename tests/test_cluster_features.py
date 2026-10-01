@@ -323,6 +323,88 @@ class TestIntermediatePersistence:
 
 
 # ----------------------------------------------------------------------------
+# Subcluster desactivable
+# ----------------------------------------------------------------------------
+
+class TestSubclusterToggle:
+    """Con SUBCLUSTER_ENABLED=False el step solo agrupa por component_id:
+    no corre el algoritmo de grafo ni une la columna `scc`."""
+
+    def _step(self, spark, tmp_path, monkeypatch, enabled):
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "SUBCLUSTER_ENABLED", enabled)
+        monkeypatch.setattr(cclf, "GRAPH_FEATURE_SOURCES", {})
+        step = _bare_substep(spark, tmp_path)
+        step.__dict__["_nodes_join_target_cache"] = (
+            spark.createDataFrame([("a", 0.5)], ["id", "target_lovelace"]))
+        step.__dict__["_components_df_cache"] = (
+            spark.createDataFrame([("a", 1)], ["id", "component_id"]))
+        return step
+
+    def test_nodes_enriched_without_scc_when_disabled(
+            self, spark, tmp_path, monkeypatch):
+        step = self._step(spark, tmp_path, monkeypatch, enabled=False)
+        df = step.nodes_enriched
+        assert "component_id" in df.columns
+        assert "scc" not in df.columns
+
+    def test_nodes_enriched_joins_scc_when_enabled(
+            self, spark, tmp_path, monkeypatch):
+        step = self._step(spark, tmp_path, monkeypatch, enabled=True)
+        step.__dict__["_subcluster_df_cache"] = (
+            spark.createDataFrame([("a", 9)], ["id", "scc"]))
+        df = step.nodes_enriched
+        assert df.collect()[0]["scc"] == 9
+
+    def test_cluster_stats_ignores_missing_group_columns(
+            self, spark, tmp_path, monkeypatch):
+        """GROUP_COLUMNS puede seguir listando "scc": si la columna no existe
+        se omite con warning en lugar de fallar."""
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "SUBCLUSTER_ENABLED", False)
+        monkeypatch.setattr(cclf, "GROUP_COLUMNS", ["component_id", "scc"])
+        monkeypatch.setattr(cclf, "REQUIRED_STATS_PREFIXES", [])
+        monkeypatch.setattr(cclf, "AGGREGATE_EXCLUDE_COLUMNS",
+            ["id", "component_id", "scc"])
+        step = _bare_substep(spark, tmp_path)
+        step.__dict__["_nodes_enriched_cache"] = spark.createDataFrame(
+            [("a", 1, 0.5)], ["id", "component_id", "target_lovelace"])
+        stats = step.cluster_stats
+        assert not any("scc" in c for c in stats.columns)
+        assert any(c.startswith("cluster_component_id_")
+            for c in stats.columns)
+
+    def _runnable_step(self, spark, tmp_path, monkeypatch, enabled):
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "SUBCLUSTER_ENABLED", enabled)
+        step = _bare_substep(spark, tmp_path)
+        step.step_name = "test_substep"
+        step.output_parameters = {"test_substep": {}}
+        step.__dict__["_cluster_stats_output_cache"] = (
+            spark.createDataFrame([("a", 1.0)], ["id", "x"]))
+        return step
+
+    def test_warns_when_subcluster_enabled(
+            self, spark, tmp_path, monkeypatch, caplog):
+        """Al llegar al step con la opción activa se avisa de que es pesada."""
+        import logging
+        step = self._runnable_step(spark, tmp_path, monkeypatch, enabled=True)
+        with caplog.at_level(logging.WARNING):
+            step.step_action()
+        assert any("SUBCLUSTER_ENABLED" in r.message
+            for r in caplog.records)
+
+    def test_no_warning_when_subcluster_disabled(
+            self, spark, tmp_path, monkeypatch, caplog):
+        import logging
+        step = self._runnable_step(spark, tmp_path, monkeypatch, enabled=False)
+        with caplog.at_level(logging.WARNING):
+            step.step_action()
+        assert not any("SUBCLUSTER_ENABLED" in r.message
+            for r in caplog.records)
+
+
+# ----------------------------------------------------------------------------
 # Config de propagación multi-columna
 # ----------------------------------------------------------------------------
 

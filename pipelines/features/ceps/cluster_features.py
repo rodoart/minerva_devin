@@ -190,6 +190,12 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
     """
     def step_action(self) -> Dict[str, Any]:
         """Materializa `cluster_stats` y recoge su salida."""
+        if cclf.SUBCLUSTER_ENABLED:
+            logger.warning(
+                "SUBCLUSTER_ENABLED=True: este step ejecutará la sub-partición "
+                "dirigida '%s' (GraphFrames), la parte más pesada de "
+                "cluster_features. Pon SUBCLUSTER_ENABLED=False en la config "
+                "para agrupar solo por component_id.", cclf.SUBCLUSTER_METHOD)
         return ppf.collect_step_output(
             self, self.cluster_stats_output, "cluster_stats_output")
         #
@@ -252,9 +258,10 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             df = df.join(
                 self.feature_dataframe(self.sqlContext, path),
                 on="id", how="left")
-        return (df
-            .join(self.components_df, on="id", how="left")
-            .join(self.subcluster_df, on="id", how="left"))
+        df = df.join(self.components_df, on="id", how="left")
+        if cclf.SUBCLUSTER_ENABLED:
+            df = df.join(self.subcluster_df, on="id", how="left")
+        return df
         #
     @ppf.cached_property
     def cluster_stats(self) -> DataFrame:
@@ -276,8 +283,18 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
                     "Ninguna columna agregable coincide con el prefijo "
                     "obligatorio %r; el grupo no tendrá stats de esa variable",
                     prefix)
+        # Solo se agrupa por columnas realmente presentes: con
+        # SUBCLUSTER_ENABLED=False no existe "scc" y el step sigue solo con
+        # "component_id".
+        group_columns = [c for c in cclf.GROUP_COLUMNS if c in df.columns]
+        missing_groups = [c for c in cclf.GROUP_COLUMNS if c not in df.columns]
+        if missing_groups:
+            logger.warning(
+                "Columnas de grupo ausentes en nodes_enriched: %s "
+                "(SUBCLUSTER_ENABLED=%s); se omiten en los stats",
+                missing_groups, cclf.SUBCLUSTER_ENABLED)
         result = df.select("id")
-        for group_column in cclf.GROUP_COLUMNS:
+        for group_column in group_columns:
             result = result.join(
                 self.standard_cluster_group_stats(
                     df, group_column, aggregate_columns, cclf.CLUSTER_STATS),

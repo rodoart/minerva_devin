@@ -34,7 +34,14 @@ job_config = c_j.sbx  # config del job (raíz HDFS, fechas, cohortes)
 # Columnas de agrupación de cada nodo:
 #   - "component_id": componente conexa (determinista; parquet `components` ya existente)
 #   - "scc":          componente fuertemente conexa (determinista; sub-partición dirigida)
+#                   SOLO disponible si SUBCLUSTER_ENABLED=True; si está
+#                   desactivado, cluster_stats la ignora con un warning.
 GROUP_COLUMNS = ["component_id", "scc"]
+
+# Si es False no se ejecuta ningún algoritmo de sub-partición: el step solo
+# agrupa por "component_id" (parquet `components` ya existente) y sigue.
+# Desactivarlo salta la parte más pesada del step (SCC de GraphFrames).
+SUBCLUSTER_ENABLED = True
 
 # Algoritmo de sub-partición dentro de cada componente conexa.
 #   "scc"               -> stronglyConnectedComponents (determinista)

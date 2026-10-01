@@ -137,7 +137,9 @@ Una columna por cada (`weight_type` × columna propagada) — subdirs
 | `cluster_<grupo>_<stat>_<col>` | Estadística `{stat}` (`CLUSTER_STATS`: count/sum/mean/median/std/min/max) de la columna `<col>` dentro del grupo del nodo — incluye targets (`target_*`), contagio (`contagion_*`) y pesos (`oper_mto`, `*_weight`, `*_strength`); guardado por `REQUIRED_STATS_PREFIXES` |
 
 `scc` = componente fuertemente conexa (determinista) o `label_propagation`
-(no determinista) según `SUBCLUSTER_METHOD`.
+(no determinista) según `SUBCLUSTER_METHOD`. Con `SUBCLUSTER_ENABLED = False`
+no se corre el algoritmo de grafo: el step solo agrupa por `component_id` y
+omite `scc` con un warning (aunque siga en `GROUP_COLUMNS`).
 
 **Reanudación del step**: los intermedios pesados se materializan como
 parquets propios (`dynamic_unpartitioned_parquet`), porque los checkpoints
