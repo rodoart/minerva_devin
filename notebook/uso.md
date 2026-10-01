@@ -91,21 +91,27 @@ ejecutar.
 
 ### Limpieza de parquets intermedios
 
-Los outputs simples marcados `"keep_or_delete": "delete"` se consideran
-**intermedios** y se pueden borrar al final del flujo:
+Los outputs marcados `"keep_or_delete": "delete"` se consideran **intermedios**
+y se borran automáticamente al final de un run exitoso:
 
 - `Step.collect_tmp_paths()` reúne recursivamente los `tmp_paths` + outputs
   marcados de toda la cadena (substeps + `previous_step`, con deduplicación).
-- `Step.delete_tmp_paths()` los borra (`HivePath.rmdir(recursive=True,
-  skip_trash=True)`; `skip_missing` por defecto).
-- Flags: `python main.py --cleanup` (ejecuta y luego limpia) o
-  `--cleanup-only` (solo limpia).
-- Marcados actualmente: `edges_norm` y `checkpoint` (features y propagación).
-- **Solo outputs simples** (sin `information_date_column`): las tablas
-  particionadas nunca se borran, para no perder historia.
+- `Step.delete_tmp_paths()` los borra en **HDFS** (`HivePath.rmdir`/`rm`) **o
+  en el filesystem local** (fallback `shutil.rmtree`/`os.remove` cuando el
+  path no existe en HDFS — temporales linux como dirs de log/scratch).
+- `main.py` la ejecuta por defecto tras `execute()` exitoso; `--no-cleanup`
+  la desactiva y `--cleanup-only` limpia sin ejecutar (`--cleanup` sigue
+  aceptándose por compatibilidad).
+- Marcados actualmente: `tmp_replaced_joined_hdfs` (txn_replacement),
+  `edges_norm` y `checkpoint` (features y propagación), `subcluster_df` y
+  `nodes_enriched` (cluster_features).
 
-Para marcar un nuevo intermedio: `"keep_or_delete": "delete"` en su dict de
-`output`.
+**Salidas particionadas** (`information_date_column` presente): marcadas
+`"delete"` se borra **solo la partición del vintage en curso**
+(`<tabla>/<info_col>=<vintage>` con sus `process_date` dentro) — el resto de
+vintages pertenece a otras corridas y nunca se toca. Sin `vintage_date` en
+`input_parameters` se omite con warning. Sin la marca, las tablas
+particionadas nunca se borran (conservan historia).
 
 ## 4. Estructura de configuración (`config/`)
 

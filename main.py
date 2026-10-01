@@ -46,8 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build-only", action="store_true",
         help="Construye la cadena de steps sin ejecutar el flujo")
     parser.add_argument("--cleanup", action="store_true",
-        help="Tras ejecutar, borra los parquets intermedios "
-            "(outputs keep_or_delete='delete')")
+        help="(compat) Equivalente al comportamiento por defecto: tras un run "
+            "exitoso se borran los temporales (outputs keep_or_delete='delete')")
+    parser.add_argument("--no-cleanup", action="store_true",
+        help="No borra los parquets/ficheros intermedios al final del flujo")
     parser.add_argument("--cleanup-only", action="store_true",
         help="Borra los parquets intermedios sin ejecutar el flujo")
     return parser.parse_args()
@@ -222,9 +224,9 @@ def main() -> int:
         logger.info("Ejecutando flujo completo (último step: %s)",
             last_step.step_name)
         last_step.execute()
-        if args.cleanup:
+        if not args.no_cleanup:
             deleted = last_step.delete_tmp_paths()
-            logger.info("Limpieza post-flujo: %d parquets intermedios borrados",
+            logger.info("Limpieza post-flujo: %d paths intermedios borrados",
                 len(deleted))
     except Exception:
         logger.exception("El pipeline falló tras %.1fs", time.time() - start)

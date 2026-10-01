@@ -243,10 +243,36 @@ class TestTmpPathCleanup:
         s = make_step(output_hive={
             "tmp": {"table_or_hdfs": "/tmp/out", "keep_or_delete": "delete"},
             "keep": {"table_or_hdfs": "/keep/out", "keep_or_delete": "keep"},
-            "part": {"table_or_hdfs": "/p/out", "keep_or_delete": "delete",
-                "information_date_column": "mis_date"},   # particionada: NO se borra
         })
         assert s.collect_tmp_paths() == ["/tmp/out"]
+
+    def test_partitioned_delete_collects_only_vintage_partition(self):
+        """keep_or_delete='delete' en una salida particionada borra solo la
+        partición del vintage en curso (info_col=vintage), no la tabla entera."""
+        s = make_step(output_hive={
+            "part": {"table_or_hdfs": "/p/out", "keep_or_delete": "delete",
+                "information_date_column": "mis_date",
+                "process_date_column": "process_date"},
+            "part_keep": {"table_or_hdfs": "/p/keep", "keep_or_delete": "keep",
+                "information_date_column": "mis_date"},
+        })
+        paths = s.collect_tmp_paths()
+        assert paths == ["/p/out/mis_date=2023-07-31"]  # vintage del make_step
+        assert "/p/out" not in paths                    # nunca la tabla entera
+
+    def test_partitioned_delete_without_vintage_is_skipped(self, caplog):
+        """Sin vintage_date en input_parameters no se puede acotar la partición:
+        se omite con warning en lugar de borrar la tabla entera."""
+        import logging
+        s = make_step(output_hive={
+            "part": {"table_or_hdfs": "/p/out", "keep_or_delete": "delete",
+                "information_date_column": "mis_date"},
+        })
+        s.input_parameters = {}
+        with caplog.at_level(logging.WARNING):
+            paths = s.collect_tmp_paths()
+        assert paths == []
+        assert any("vintage_date" in r.message for r in caplog.records)
 
     def test_collects_from_previous_chain(self):
         parent = make_step()
@@ -282,6 +308,8 @@ class TestTmpPathCleanup:
     def test_delete_calls_rmdir(self, monkeypatch):
         calls = []
         monkeypatch.setattr(
+            "libs.framework.HivePath.is_dir", lambda self: True)
+        monkeypatch.setattr(
             "libs.framework.HivePath.rmdir",
             lambda self, **kw: calls.append(str(self)))
         s = make_step()
@@ -290,20 +318,68 @@ class TestTmpPathCleanup:
         assert calls == ["/tmp/a"]
         assert deleted == ["/tmp/a"]
 
+    def test_delete_removes_local_dirs_and_files(self, monkeypatch, tmp_path):
+        """Fallback a filesystem local: paths que no existen en HDFS se borran
+        con shutil/os (cubre temporales 'linux')."""
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_dir", lambda self: False)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_file", lambda self: False)
+        local_dir = tmp_path / "tmp_dir"
+        local_dir.mkdir()
+        (local_dir / "f.parquet").write_text("x")
+        local_file = tmp_path / "tmp_file"
+        local_file.write_text("x")
+        s = make_step()
+        s.tmp_paths = [str(local_dir), str(local_file)]
+        deleted = s.delete_tmp_paths()
+        assert not local_dir.exists()
+        assert not local_file.exists()
+        assert str(local_dir) in deleted and str(local_file) in deleted
+
+    def test_delete_removes_vintage_partition_dir(self, monkeypatch, tmp_path):
+        """End-to-end local: tabla particionada 'delete' solo pierde el dir
+        mis_date=<vintage>; otra partición de otro vintage queda intacta."""
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_dir", lambda self: False)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_file", lambda self: False)
+        table = tmp_path / "tmp_partitioned"
+        vintage_part = table / "mis_date=2023-07-31" / "process_date=2023-08-05"
+        other_part = table / "mis_date=2023-06-30" / "process_date=2023-07-05"
+        vintage_part.mkdir(parents=True)
+        other_part.mkdir(parents=True)
+        s = make_step(output_hive={
+            "tmp_part": {"table_or_hdfs": str(table),
+                "information_date_column": "mis_date",
+                "keep_or_delete": "delete"},
+        })
+        deleted = s.delete_tmp_paths()
+        assert not vintage_part.parent.exists()   # mis_date=2023-07-31 borrada
+        assert other_part.exists()                # otro vintage intacto
+        assert any(p.replace("\\", "/").endswith("mis_date=2023-07-31")
+            for p in deleted)
+
     def test_delete_skips_missing(self, monkeypatch):
         def _fail(self, **kw):
             raise FileNotFoundError("no existe")
-        monkeypatch.setattr("libs.framework.HivePath.rmdir", _fail)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_dir", lambda self: False)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_file", lambda self: False)
         s = make_step()
-        s.tmp_paths = ["/tmp/a", "/tmp/b"]
+        s.tmp_paths = ["/no/existe/a", "/no/existe/b"]
         assert s.delete_tmp_paths(skip_missing=True) == []
 
     def test_delete_raises_when_not_skip_missing(self, monkeypatch):
         def _fail(self, **kw):
             raise FileNotFoundError("no existe")
-        monkeypatch.setattr("libs.framework.HivePath.rmdir", _fail)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_dir", lambda self: False)
+        monkeypatch.setattr(
+            "libs.framework.HivePath.is_file", lambda self: False)
         s = make_step()
-        s.tmp_paths = ["/tmp/a"]
+        s.tmp_paths = ["/no/existe/a"]
         with pytest.raises(FileNotFoundError):
             s.delete_tmp_paths(skip_missing=False)
 

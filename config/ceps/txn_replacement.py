@@ -53,11 +53,12 @@ logger.debug("input: %s", input)
 output = {
     # checkpoints intermedios del join de reemplazo (un parquet por fuente y
     # lado, p.ej. fc_by_cta_ben.parquet): cortan el linaje de Spark cada 3
-    # joins. Dict simple (2 claves) -> parquet no particionado; "keep" =
-    # conservar ("delete" lo registraría en tmp_paths para borrado al final).
+    # joins. Dict simple (2 claves) -> parquet no particionado; "delete" =
+    # temporal, se borra al final del flujo (la salida particionada es el
+    # punto de reanudación real).
     "tmp_replaced_joined_hdfs": { #simple
         "table_or_hdfs": tmp_current_hdfs.joinpath("tmp_replaced_joined_hdfs"),
-        "keep_or_delete": "keep"
+        "keep_or_delete": "delete"
     },
     # salida final: historial CEP con rfc_curp / rfc_curp_kind rellenados a
     # partir de los casos rankeados, particionada por mis_date + process_date.

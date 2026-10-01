@@ -57,8 +57,10 @@ Unidad ETL. Cada `Step`:
   `inherit_parent_step_attributes` (cohorte, rutas, `sqlContext`,
   `is_dynamic`, `standard_load_parquet_or_table`, `parent`).
 - `@cached_property` (implementación propia) cachea propiedades por instancia.
-- `tmp_paths` + `delete_tmp_paths()` permiten borrar parquets intermedios
-  (outputs con `keep_or_delete="delete"`).
+- `tmp_paths` + `delete_tmp_paths()` borran los intermedios marcados
+  `keep_or_delete="delete"` al final de un run exitoso — en HDFS y en el
+  filesystem local. En salidas particionadas solo se borra la partición del
+  vintage en curso (`info_col=<vintage>`), nunca la tabla entera.
 
 ### 2.2 Particionado de salidas
 
@@ -301,8 +303,9 @@ HivePath en cluster), marcadores `spark`/`graphframes`. Ejecución:
 ## 7. Ejecución
 
 - `python main.py` — flujo completo (requiere env vars del cluster);
-  `--build-only` construye sin ejecutar; `--cleanup[-only]` borra parquets
-  intermedios (`keep_or_delete="delete"`).
+  `--build-only` construye sin ejecutar; la limpieza de intermedios
+  (`keep_or_delete="delete"`) corre por defecto tras un run exitoso;
+  `--no-cleanup` la desactiva y `--cleanup-only` solo limpia.
 - `run_order.py` — driver interactivo para desarrollo.
 - `local_flow_check.py` — smoke test local con shim HDFS -> filesystem local.
 - `opt/run-tests.sh` — suite en el entorno conda del cluster.

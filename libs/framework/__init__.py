@@ -24,6 +24,8 @@ from libs.data_engineering_toolbox.pyspark.tools.parquet_treatment import SparkL
 from libs.data_engineering_toolbox.general.date_treatment import make_date_interval_with_lag_months
 from libs.framework.utils import sanitize_property_name
 
+import os
+import shutil
 import time
 
 from libs.data_engineering_toolbox.context.logging import get_logger
@@ -223,12 +225,27 @@ class Step:
         _visited.add(id(self))
         #
         paths = [str(p) for p in self.tmp_paths]
-        paths += [
-            str(cfg["table_or_hdfs"]) for cfg in self.output_hive.values()
-            if isinstance(cfg, dict)
-            and cfg.get("keep_or_delete") == "delete"
-            and "information_date_column" not in cfg   # nunca borra tablas particionadas
-        ]
+        for cfg in self.output_hive.values():
+            if not isinstance(cfg, dict):
+                continue
+            if cfg.get("keep_or_delete") != "delete":
+                continue
+            if "information_date_column" not in cfg:
+                paths.append(str(cfg["table_or_hdfs"]))
+                continue
+            # Salida PARTICIONADA marcada como temporal: solo se borra la
+            # partición del vintage en curso (info_col=vintage, con sus
+            # process_date dentro). El resto de particiones pertenece a otras
+            # corridas/vintages y nunca se toca.
+            vintage = self.input_parameters.get("vintage_date")
+            if vintage is None:
+                logger.warning(
+                    "keep_or_delete='delete' sin vintage_date en "
+                    "input_parameters: %s no se borra",
+                    cfg["table_or_hdfs"])
+                continue
+            paths.append(str(HivePath(str(cfg["table_or_hdfs"]))
+                .joinpath(f"{cfg['information_date_column']}={vintage}")))
         for value in self.__dict__.values():
             nested:List["Step"] = []
             if isinstance(value, Step):
@@ -253,14 +270,33 @@ class Step:
         deleted:List[str] = []
         for path_str in self.collect_tmp_paths():
             try:
-                HivePath(path_str).rmdir(recursive=True, skip_trash=skip_trash)
+                self._delete_tmp_path(path_str, skip_trash=skip_trash)
                 deleted.append(path_str)
-                logger.info("Deleted intermediate parquet: %s", path_str)
+                logger.info("Deleted intermediate path: %s", path_str)
             except Exception as e:
                 if not skip_missing:
                     raise
                 logger.warning("Could not delete %s: %s", path_str, e)
         return deleted
+    #
+    @staticmethod
+    def _delete_tmp_path(path_str:str, skip_trash:bool = True) -> None:
+        """Borra un path temporal en HDFS (HivePath) o en el filesystem local.
+
+        Orden de resolución: dir HDFS -> fichero HDFS -> dir local -> fichero
+        local. Si el path no existe en ninguno, lanza FileNotFoundError.
+        """
+        hive = HivePath(path_str)
+        if hive.is_dir():
+            hive.rmdir(recursive=True, skip_trash=skip_trash)
+        elif hive.is_file():
+            hive.rm()
+        elif os.path.isdir(path_str):
+            shutil.rmtree(path_str)
+        elif os.path.isfile(path_str):
+            os.remove(path_str)
+        else:
+            raise FileNotFoundError(path_str)
     #
     def execute(self) -> Any:
         """Ejecuta el paso: resuelve `previous_step`, actualiza `input_parameters` y corre `step_action`."""
@@ -400,6 +436,11 @@ def dynamic_partitioned_table_or_parquet(path_key: str) -> Callable:
     Recarga la partición (information_date=vintage [, process_date]) si existe; si no,
     ejecuta la función, añade las columnas de partición y sobreescribe solo esas
     particiones. Devuelve `(DataFrame, load_object_kwargs)`.
+
+    Si la config marca `keep_or_delete == "delete"`, `collect_tmp_paths` registra
+    la partición del vintage en curso (`<tabla>/<info_col>=<vintage>`) para
+    borrado al final del flujo — el resto de particiones (otros vintages) se
+    conserva siempre.
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
