@@ -112,6 +112,11 @@ PROPAGATION_MAX_ITER = 3              # iteraciones de paso de mensajes por el g
 PROPAGATION_ALPHA = 0.15              # amortiguación: peso del score entrante frente al propio (1-alpha)
 PROPAGATION_KEEP_SEED_FLOOR = True    # el score de un nodo nunca cae por debajo de su semilla original
 
+# Buckets de sal para el groupBy de grado (suma de pesos por nodo): con skew
+# de grado (supernodos) reparte el cálculo entre N reducers en dos etapas.
+# 0/None desactiva la sal.
+DEGREE_SALT_BUCKETS = 64
+
 # Features de contagio generadas: una por (columna de target propagada x
 # weight_type). La columna semilla `target_lovelace` produce `contagion_<weight>`;
 # el resto (`target_lovelace_<col>`: scores, etc.) produce

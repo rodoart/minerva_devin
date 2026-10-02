@@ -286,6 +286,39 @@ controla cuánta historia CEP alimenta los catálogos;
 cuánta historia transaccional conserva `rfc_curp_analysis_s264_ceps_replaced`.
 Son independientes.
 
+### Aligerar `cluster_features` (config/features/ceps/cluster_features.py)
+
+El step escala por perilla, de más barato a más completo:
+
+| Perilla | Efecto |
+|---|---|
+| `SUBCLUSTER_ENABLED = False` | No corre SCC/label_propagation: solo `component_id` |
+| `CLUSTER_LIGHT_MODE = True` | Stats solo `LIGHT_STATS` sobre prefijos `LIGHT_AGGREGATE_PREFIXES` y solo une `LIGHT_FEATURE_SOURCES` (salta los joins pesados de features de grafo) |
+| `AGGREGATE_INCLUDE_PREFIXES` | Lista propia de prefijos/sufijos de columnas a agregar (afinado manual) |
+| `SALT_BUCKETS` | Buckets de sal del groupBy en dos etapas (64 default; `<=1` = groupBy directo) |
+| `STATS_COLUMN_CHUNK` | Columnas por chunk persistido en `cluster_stats_parts/` (más chunks = más puntos de reanudación) |
+| `STATS_BROADCAST_MAX_GROUPS` | Umbral de grupos para broadcast del join final |
+
+Los parquets intermedios (`subcluster_df`, `nodes_enriched`,
+`cluster_stats_parts`) llevan subdirs de variante (`method=...`,
+`mode=<full|light>_...`, `chunk=<hash>`): cambiar la config invalida el
+caché en vez de recargar datos obsoletos.
+
+### Otros groupBy anti-skew
+
+La misma maquinaria (sal en dos etapas) protege el resto de agregaciones
+pesadas, siempre con `<=1` = desactivado:
+
+| Perilla | Dónde |
+|---|---|
+| `lff.EDGE_GROUPBY_SALT_BUCKETS` (64) | Todas las features por nodo sobre aristas: `degrees`, `degree_balance`, `reciprocity`, `self_loops`, `weighted_*`; ajustable por feature vía `params.salt_buckets` en `GRAPH_CENTRALITY_FEATURES`/`WEIGHTED_FEATURES` |
+| `DEGREE_SALT_BUCKETS` (64) | `get_degree` en `edges_norm` (propagación) |
+| `ASSEMBLY_SALT_BUCKETS` (32) | groupBy por `numcliente`/`cta` del assembler |
+
+Los ratios de momentos `curt`/`skew`/`so` (`Σxᵏ/(Σx²)^(k/2)`) son
+combinables exactos (momentos 3-4 en los parciales); `countDistinct`,
+`median` y customs van por la vía directa unida por llave.
+
 ## 7. Tests
 
 ```bash

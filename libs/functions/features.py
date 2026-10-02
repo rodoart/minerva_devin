@@ -23,7 +23,57 @@ from pyspark.sql.functions import (coalesce, col,
     lit, mean as spark_mean,
     min as spark_min, max as spark_max, sum as spark_sum, count as spark_count,
     countDistinct, stddev as spark_std,
-    explode, when, greatest)
+    explode, when, greatest, concat_ws, pmod, hash as spark_hash)
+
+import libs.functions.aggregations as lfa
+
+# Buckets de sal por defecto para los groupBy por nodo sobre aristas: los
+# supernodos (hubs con millones de aristas) sesgan cualquier agregación por
+# `id`. Las funciones aceptan `salt_buckets` por parámetro: None -> este
+# valor; <= 1 -> groupBy directo de una etapa.
+EDGE_GROUPBY_SALT_BUCKETS = 64
+
+_EDGE_KEY_COLUMN = "__ekey"
+
+
+def _resolve_salt(salt_buckets:Optional[int]) -> int:
+    """Resuelve el nº de buckets de sal: None -> default del módulo."""
+    return EDGE_GROUPBY_SALT_BUCKETS if salt_buckets is None else salt_buckets
+
+
+def _salted_count_by_node(
+    df:DataFrame,
+    node_column:str,
+    salt_source:str,
+    salt_buckets:int,
+    out_column:str,
+) -> DataFrame:
+    """`groupBy(node).count()` en dos etapas con sal -> (id, out_column)."""
+    return (lfa.merge_salted_stats(
+        lfa.salted_partial_stats(
+            df, node_column, [], salt_buckets=salt_buckets,
+            id_column=salt_source),
+        node_column, [], [], size_column=out_column)
+        .withColumnRenamed(node_column, "id"))
+
+
+def _salted_sum_by_node(
+    df:DataFrame,
+    node_column:str,
+    value_column:str,
+    salt_source:str,
+    salt_buckets:int,
+    out_column:str,
+) -> DataFrame:
+    """`groupBy(node).sum(value)` en dos etapas con sal -> (id, out_column)."""
+    return (lfa.merge_salted_stats(
+        lfa.salted_partial_stats(
+            df, node_column, [value_column], salt_buckets=salt_buckets,
+            id_column=salt_source),
+        node_column, [value_column], ["sum"])
+        .withColumnRenamed(node_column, "id")
+        .withColumnRenamed(f"sum_{value_column}", out_column))
+
 
 ###############################################################################
 # UNWEIGHTED FEATURES
@@ -39,11 +89,26 @@ def pagerank(
 
 
 def degrees(
-    graph:GraphFrame
+    graph:GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
-    """Grado de entrada, salida y total por nodo."""
-    in_degrees_df = graph.inDegrees.withColumnRenamed("inDegree", "in_degree")
-    out_degrees_df = graph.outDegrees.withColumnRenamed("outDegree", "out_degree")
+    """Grado de entrada, salida y total por nodo.
+
+    Con `salt_buckets`>1 los conteos van en dos etapas con sal (equivale a
+    `inDegrees`/`outDegrees` pero sin que un supernodo concentre el shuffle);
+    None -> `EDGE_GROUPBY_SALT_BUCKETS`.
+    """
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        keyed = graph.edges.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        in_degrees_df = _salted_count_by_node(
+            keyed, "dst", _EDGE_KEY_COLUMN, buckets, "in_degree")
+        out_degrees_df = _salted_count_by_node(
+            keyed, "src", _EDGE_KEY_COLUMN, buckets, "out_degree")
+    else:
+        in_degrees_df = graph.inDegrees.withColumnRenamed("inDegree", "in_degree")
+        out_degrees_df = graph.outDegrees.withColumnRenamed("outDegree", "out_degree")
     degrees_df = (
         in_degrees_df.join(out_degrees_df, on="id", how="outer")
         .withColumn("in_degree", coalesce(col("in_degree"), lit(0)))
@@ -68,16 +133,28 @@ def triangle_count(
 
 
 def degree_balance(
-    graph:GraphFrame
+    graph:GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Balance direccional del grado por nodo.
 
     Columnas: `net_degree` (out - in; >0 sumidero... origen neto de flujo) y
     `in_out_degree_ratio` (out/in; null cuando el nodo no recibe nada).
+    Con `salt_buckets`>1 los conteos por nodo van en dos etapas con sal
+    (anti-supernodos); None -> `EDGE_GROUPBY_SALT_BUCKETS`.
     """
     edges = graph.edges
-    in_deg = edges.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
-    out_deg = edges.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        keyed = edges.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        in_deg = _salted_count_by_node(
+            keyed, "dst", _EDGE_KEY_COLUMN, buckets, "_in")
+        out_deg = _salted_count_by_node(
+            keyed, "src", _EDGE_KEY_COLUMN, buckets, "_out")
+    else:
+        in_deg = edges.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
+        out_deg = edges.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
     return (
         in_deg.join(out_deg, on="id", how="outer")
         .withColumn("_in", coalesce(col("_in"), lit(0)))
@@ -90,7 +167,8 @@ def degree_balance(
 
 
 def reciprocity(
-    graph:GraphFrame
+    graph:GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Reciprocidad por nodo sobre pares dirigidos únicos (sin self-loops).
 
@@ -107,10 +185,25 @@ def reciprocity(
     reversed_pairs = pairs.select(col("dst").alias("src"), col("src").alias("dst"))
     reciprocal = pairs.join(reversed_pairs, ["src", "dst"], "inner")
     #
-    out_stats = pairs.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
-    in_stats = pairs.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
-    rec_out = reciprocal.groupBy(col("src").alias("id")).agg(spark_count("*").alias("reciprocal_out"))
-    rec_in = reciprocal.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("reciprocal_in"))
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        keyed_pairs = pairs.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        keyed_rec = reciprocal.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        out_stats = _salted_count_by_node(
+            keyed_pairs, "src", _EDGE_KEY_COLUMN, buckets, "_out")
+        in_stats = _salted_count_by_node(
+            keyed_pairs, "dst", _EDGE_KEY_COLUMN, buckets, "_in")
+        rec_out = _salted_count_by_node(
+            keyed_rec, "src", _EDGE_KEY_COLUMN, buckets, "reciprocal_out")
+        rec_in = _salted_count_by_node(
+            keyed_rec, "dst", _EDGE_KEY_COLUMN, buckets, "reciprocal_in")
+    else:
+        out_stats = pairs.groupBy(col("src").alias("id")).agg(spark_count("*").alias("_out"))
+        in_stats = pairs.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("_in"))
+        rec_out = reciprocal.groupBy(col("src").alias("id")).agg(spark_count("*").alias("reciprocal_out"))
+        rec_in = reciprocal.groupBy(col("dst").alias("id")).agg(spark_count("*").alias("reciprocal_in"))
     #
     result = (
         out_stats.join(in_stats, on="id", how="outer")
@@ -135,13 +228,19 @@ def reciprocity(
 
 
 def self_loops(
-    graph:GraphFrame
+    graph:GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Número de aristas src==dst por nodo (`self_loop_count`; 0 si no hay)."""
-    loops = (graph.edges
-        .filter(col("src") == col("dst"))
-        .groupBy(col("src").alias("id"))
-        .agg(spark_count("*").alias("self_loop_count")))
+    loops_df = graph.edges.filter(col("src") == col("dst"))
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        loops = _salted_count_by_node(
+            loops_df, "src", "dst", buckets, "self_loop_count")
+    else:
+        loops = (loops_df
+            .groupBy(col("src").alias("id"))
+            .agg(spark_count("*").alias("self_loop_count")))
     return (graph.vertices.select("id")
         .join(loops, on="id", how="left")
         .withColumn("self_loop_count", coalesce(col("self_loop_count"), lit(0))))
@@ -166,19 +265,32 @@ def weighted_pagerank(
 
 
 def weighted_degrees(
-    graph: GraphFrame
+    graph: GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
-    """Fuerza (strength) ponderada: suma de pesos entrantes/salientes por nodo."""
+    """Fuerza (strength) ponderada: suma de pesos entrantes/salientes por nodo.
+
+    Con `salt_buckets`>1 las sumas por nodo van en dos etapas con sal
+    (anti-supernodos); None -> `EDGE_GROUPBY_SALT_BUCKETS`.
+    """
     edges = graph.edges
-    #
-    in_strength = (
-        edges.groupBy(col("dst").alias("id"))
-        .agg(spark_sum("weight").alias("in_strength"))
-    )
-    out_strength = (
-        edges.groupBy(col("src").alias("id"))
-        .agg(spark_sum("weight").alias("out_strength"))
-    )
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        keyed = edges.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        in_strength = _salted_sum_by_node(
+            keyed, "dst", "weight", _EDGE_KEY_COLUMN, buckets, "in_strength")
+        out_strength = _salted_sum_by_node(
+            keyed, "src", "weight", _EDGE_KEY_COLUMN, buckets, "out_strength")
+    else:
+        in_strength = (
+            edges.groupBy(col("dst").alias("id"))
+            .agg(spark_sum("weight").alias("in_strength"))
+        )
+        out_strength = (
+            edges.groupBy(col("src").alias("id"))
+            .agg(spark_sum("weight").alias("out_strength"))
+        )
     return (
         in_strength.join(out_strength, on="id", how="outer")
         .withColumn("in_strength", coalesce(col("in_strength"), lit(0.0)))
@@ -206,9 +318,19 @@ def weighted_edge_stats(
     graph: GraphFrame,
     aggregations:Optional[List[Column]] = None,
     stats:Optional[Dict[str, Callable[..., Column]]] = None,
-    weight_column:str = "weight"
+    weight_column:str = "weight",
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
-    """Estadísticas de peso de aristas incidentes por nodo (in + out)."""
+    """Estadísticas de peso de aristas incidentes por nodo (in + out).
+
+    Con `salt_buckets`>1 y un catálogo `stats` con nombre, los stats
+    combinables (count/sum/min/max/mean/std y los ratios de momentos
+    curt/skew/so) van en dos etapas con sal — los supernodos no concentran
+    el shuffle — y el resto (countDistinct, customs) por la vía directa
+    sobre el mismo frame, unidos por `id`. Con `aggregations` crudas
+    (expresiones `Column` sin nombre) se usa siempre el groupBy directo:
+    no hay forma de saber si son combinables.
+    """
     if aggregations is None:
         if stats is None:
             stats = STANDARD_WEIGHT_STATS
@@ -218,6 +340,34 @@ def weighted_edge_stats(
         ]
     #
     edges = graph.edges
+    buckets = _resolve_salt(salt_buckets)
+    if stats is not None and buckets > 1:
+        keyed_edges = edges.withColumn(
+            _EDGE_KEY_COLUMN, concat_ws("||", col("src"), col("dst")))
+        incident_keyed = (
+            keyed_edges.select(
+                col("src").alias("id"), col(weight_column), _EDGE_KEY_COLUMN)
+            .union(keyed_edges.select(
+                col("dst").alias("id"), col(weight_column), _EDGE_KEY_COLUMN))
+        )
+        combinable, other = lfa.split_stats_by_combinable(stats)
+        frames:List[DataFrame] = []
+        if combinable:
+            frames.append(lfa.merge_salted_stats(
+                lfa.salted_partial_stats(
+                    incident_keyed, "id", [weight_column],
+                    salt_buckets=buckets, id_column=_EDGE_KEY_COLUMN,
+                    max_moment=lfa.stats_required_moment(combinable)),
+                "id", [weight_column], combinable))
+        if other:
+            frames.append(lfa.plain_group_stats(
+                incident_keyed.drop(_EDGE_KEY_COLUMN),
+                "id", [weight_column], other))
+        result = frames[0]
+        for frame in frames[1:]:
+            result = result.join(frame, on="id", how="outer")
+        return result
+    #
     incident = (
         edges.select(col("src").alias("id"), col(weight_column))
         .union(edges.select(col("dst").alias("id"), col(weight_column)))
@@ -231,14 +381,15 @@ def weighted_edge_stats(
 
 
 def weighted_degree_balance(
-    graph: GraphFrame
+    graph: GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Balance direccional de la fuerza ponderada por nodo.
 
     Columnas: `net_strength` (out_strength - in_strength) e
     `in_out_strength_ratio` (out/in; null cuando no entra flujo).
     """
-    strength = weighted_degrees(graph)
+    strength = weighted_degrees(graph, salt_buckets=salt_buckets)
     return (strength
         .withColumn("net_strength", col("out_strength") - col("in_strength"))
         .withColumn("in_out_strength_ratio",
@@ -249,7 +400,8 @@ def weighted_degree_balance(
 
 
 def weighted_components(
-    graph: GraphFrame
+    graph: GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Componentes conexas enriquecidas con el peso total de cada componente."""
     components = (
@@ -261,23 +413,40 @@ def weighted_components(
         col("id").alias("src"),
         col("component"),
     )
-    comp_weight = (
-        graph.edges.join(src_comp, on="src", how="inner")
-        .groupBy("component")
-        .agg(spark_sum("weight").alias("component_weight"))
-    )
+    comp_edges = graph.edges.join(src_comp, on="src", how="inner")
+    buckets = _resolve_salt(salt_buckets)
+    if buckets > 1:
+        # La componente gigante concentraría casi todo el peso en un reducer:
+        # suma en dos etapas con sal por arista.
+        comp_weight = (lfa.merge_salted_stats(
+            lfa.salted_partial_stats(
+                comp_edges.withColumn(
+                    _EDGE_KEY_COLUMN,
+                    concat_ws("||", col("src"), col("dst"))),
+                "component", ["weight"], salt_buckets=buckets,
+                id_column=_EDGE_KEY_COLUMN),
+            "component", ["weight"], ["sum"])
+            .withColumnRenamed("sum_weight", "component_weight"))
+    else:
+        comp_weight = (
+            comp_edges
+            .groupBy("component")
+            .agg(spark_sum("weight").alias("component_weight"))
+        )
     return components.join(comp_weight, on="component", how="left")
 
 
 def weighted_triangle_count(
-    graph: GraphFrame
+    graph: GraphFrame,
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Conteo de triángulos por nodo (estructural, no ponderado) + fuerza."""
     triangles = (
         graph.triangleCount()
         .withColumnRenamed("count", "triangle_count")
     )
-    strength = weighted_degrees(graph).select("id", "total_strength")
+    strength = weighted_degrees(
+        graph, salt_buckets=salt_buckets).select("id", "total_strength")
     return triangles.join(strength, on="id", how="left")
 
 
@@ -287,18 +456,38 @@ def weighted_triangle_count(
 
 def get_degree(
     graph:GraphFrame, # with  weight
-
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
-    """Grado ponderado por nodo: suma de `weight` de aristas incidentes (in+out)."""
+    """Grado ponderado por nodo: suma de `weight` de aristas incidentes (in+out).
+
+    Con `salt_buckets` activa la agregación en dos etapas con sal
+    (parciales por (nodo, sal de arista) -> merge por nodo): robusta a
+    supernodos con millones de aristas que colgarían un único reducer.
+    """
     raw_edges:DataFrame = graph.edges
     #
-    deg = (
-        raw_edges.select(col("src").alias("node"), "weight")
-        .union(raw_edges.select(col("dst").alias("node"), "weight"))
-        .groupBy("node")
-        .agg(spark_sum("weight").alias("deg_sum"))
+    if not salt_buckets:
+        return (
+            raw_edges.select(col("src").alias("node"), "weight")
+            .union(raw_edges.select(col("dst").alias("node"), "weight"))
+            .groupBy("node")
+            .agg(spark_sum("weight").alias("deg_sum"))
+        )
+    #
+    # sal por arista (src||dst): las aristas de un supernodo se reparten entre
+    # buckets y el merge final solo combina `salt_buckets` parciales por nodo.
+    salted_edges = raw_edges.withColumn(
+        "__esalt",
+        pmod(spark_hash(concat_ws("||", col("src"), col("dst"))),
+            lit(salt_buckets)))
+    partials = (
+        salted_edges.select(col("src").alias("node"), "weight", "__esalt")
+        .union(salted_edges.select(col("dst").alias("node"), "weight", "__esalt"))
+        .groupBy("node", "__esalt")
+        .agg(spark_sum("weight").alias("__p"))
     )
-    return deg
+    return (partials.groupBy("node")
+        .agg(spark_sum("__p").alias("deg_sum")))
 
 
 def weight_normalization(
@@ -463,7 +652,8 @@ def cluster_group_stats(
     group_column:str,
     aggregate_columns:List[str],
     stats:Optional[Dict[str, Callable[..., Column]]] = None,
-    prefix:str = "cluster"
+    prefix:str = "cluster",
+    salt_buckets:Optional[int] = None,
 ) -> DataFrame:
     """Estadísticos intra-grupo por nodo.
 
@@ -472,14 +662,42 @@ def cluster_group_stats(
 
     Columnas resultantes: `{prefix}_{group_column}_size` (nº de miembros) +
     `{prefix}_{group_column}_{stat}_{column}` por cada stat y columna agregada.
+
+    Con `salt_buckets`>1 la agregación por grupo va en dos etapas con sal
+    (`lfa.salted_partial_stats`/`merge_salted_stats` para los combinables —
+    incluidos los ratios de momentos curt/skew/so — y `plain_group_stats`
+    para el resto): un grupo gigante no concentra todo el shuffle.
     """
     if stats is None:
         stats = STANDARD_WEIGHT_STATS
-    grouped = nodes.groupBy(group_column).agg(
-        spark_count("*").alias(f"{prefix}_{group_column}_size"),
-        *[func(c).alias(f"{prefix}_{group_column}_{func_name}_{c}")
-          for c in aggregate_columns for func_name, func in stats.items()],
-    )
+    buckets = _resolve_salt(salt_buckets)
+    size_column = f"{prefix}_{group_column}_size"
+    column_prefix = f"{prefix}_{group_column}_"
+    if buckets > 1:
+        combinable, plain_stats = lfa.split_stats_by_combinable(stats)
+        frames:List[DataFrame] = []
+        if combinable:
+            frames.append(lfa.merge_salted_stats(
+                lfa.salted_partial_stats(
+                    nodes, group_column, aggregate_columns,
+                    salt_buckets=buckets, id_column="id",
+                    max_moment=lfa.stats_required_moment(combinable)),
+                group_column, aggregate_columns, combinable,
+                size_column=size_column, column_prefix=column_prefix))
+        if plain_stats:
+            frames.append(lfa.plain_group_stats(
+                nodes, group_column, aggregate_columns, plain_stats,
+                size_column=None if combinable else size_column,
+                column_prefix=column_prefix))
+        grouped = frames[0]
+        for frame in frames[1:]:
+            grouped = grouped.join(frame, on=group_column)
+    else:
+        grouped = nodes.groupBy(group_column).agg(
+            spark_count("*").alias(size_column),
+            *[func(c).alias(f"{column_prefix}{func_name}_{c}")
+              for c in aggregate_columns for func_name, func in stats.items()],
+        )
     return (
         nodes.select("id", group_column)
         .join(grouped, on=group_column, how="left")

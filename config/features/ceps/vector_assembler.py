@@ -70,6 +70,13 @@ AGGREGATION_WEIGHT = col("oper_mto").cast("double") / (col("tfrom_days") + lit(1
 # con overrides por feature.
 FEATURE_AGGREGATION = {"default": ["weighted_mean", "median", "std", "mean"]}
 
+# Buckets de sal del groupBy por nivel (numcliente/cta): una llave gigante
+# (cliente con miles de nodos) concentraría todo el shuffle en un reducer.
+# Con >1 los stats combinables (weighted_mean/mean/std/min/max/sum) se
+# agregan en dos etapas (llave, sal) -> (llave); median/first/distinct van
+# por la vía directa. <= 1 -> groupBy directo de una etapa.
+ASSEMBLY_SALT_BUCKETS = 32
+
 # Sufijo añadido a TODAS las variables de las tablas `{nivel}_features` (no a
 # la llave). "" lo desactiva.
 VARIABLE_SUFFIX = "_ceps"

@@ -19,7 +19,8 @@ from pyspark.sql.functions import col, countDistinct, max as spark_max
 # Custom
 # ------------------------------------------------------------------------------
 from libs.functions.assembly import (build_aggregation_expressions,
-    explode_array_column, get_feature_columns, assemble_vector
+    explode_array_column, get_feature_columns, assemble_vector,
+    salted_assembly_groupby
 )
 from libs.functions.missing_treatment import apply_missing_treatment
 
@@ -204,14 +205,28 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
             column=array_column,
         ).withColumn(level, col(array_column).cast("string"))
         #
-        aggregations = build_aggregation_expressions(
-            self.feature_columns,
-            aggregation=cvas.FEATURE_AGGREGATION,
-            weight=cvas.AGGREGATION_WEIGHT,
-        )
-        aggregated = (exploded
-            .groupBy(level)
-            .agg(*(aggregations + [countDistinct("id").alias("node_count")])))
+        salt_buckets = getattr(cvas, "ASSEMBLY_SALT_BUCKETS", 0)
+        if salt_buckets and salt_buckets > 1:
+            # Dos etapas con sal: una llave gigante (cliente/cuenta con miles
+            # de nodos) no concentra todo el shuffle en un reducer.
+            aggregated = salted_assembly_groupby(
+                exploded,
+                group_column=level,
+                feature_columns=self.feature_columns,
+                aggregation=cvas.FEATURE_AGGREGATION,
+                weight=cvas.AGGREGATION_WEIGHT,
+                salt_buckets=salt_buckets,
+                id_column="id",
+            )
+        else:
+            aggregations = build_aggregation_expressions(
+                self.feature_columns,
+                aggregation=cvas.FEATURE_AGGREGATION,
+                weight=cvas.AGGREGATION_WEIGHT,
+            )
+            aggregated = (exploded
+                .groupBy(level)
+                .agg(*(aggregations + [countDistinct("id").alias("node_count")])))
         return self._suffixed(aggregated, level)
         #
     def level_features_property(self, level:str):

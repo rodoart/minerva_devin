@@ -13,7 +13,7 @@ nombre, de modo que el conjunto aplicado queda configurable por job.
 # ------------------------------------------------------------------------------
 # General
 # ------------------------------------------------------------------------------
-from typing import Callable, Dict, List, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 
 # ------------------------------------------------------------------------------
@@ -23,7 +23,7 @@ from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql.functions import (col, min as spark_min,
     max as spark_max, mean as spark_mean, stddev as spark_std,
     sum as spark_sum, count, countDistinct, last, first, coalesce, lit,
-    when, datediff, to_date, sqrt
+    when, datediff, to_date, sqrt, pmod, hash as spark_hash
 )
 
 
@@ -420,3 +420,242 @@ def merge_monthly_group_by(
             .alias(agg_name))
     finals.append(col(date_column))
     return grouped.select(*finals)
+
+
+###############################################################################
+# SALTED TWO-STAGE GROUP-BY (robusto a skew fuerte en la clave de grupo)
+###############################################################################
+
+# Stats con combinador exacto a partir de parciales por (grupo, sal): count/
+# sum/min/max/mean/std se descomponen; "curt"/"skew"/"so" son ratios de
+# momentos (Σx³/(Σx²)^1.5, Σx⁴/(Σx²)²) — también exactos si los parciales
+# guardan momentos 3 y 4. "median" (percentile_approx), customs u otros NO
+# son combinables — se calculan en una etapa aparte sin sal.
+COMBINABLE_GROUP_STATS = {
+    "count", "sum", "min", "max", "mean", "std", "curt", "skew", "so"}
+
+# Momento máximo que necesita cada stat (los parciales solo guardan Σx^k
+# hasta el momento requerido).
+_STAT_REQUIRED_MOMENT = {
+    "count": 1, "sum": 1, "min": 0, "max": 0, "mean": 1, "std": 2,
+    "curt": 3, "skew": 3, "so": 4,
+}
+
+
+def stats_required_moment(stat_names:List[str]) -> int:
+    """Momento máximo necesario para recombinar `stat_names` (2 por defecto)."""
+    return max([_STAT_REQUIRED_MOMENT.get(stat, 2) for stat in stat_names]
+        + [1])
+
+SALT_COLUMN = "__salt"
+_SALT_PARTIAL_PREFIX = "__p_"
+
+
+def split_stats_by_combinable(
+    stats:Dict[str, Callable[[str], Column]],
+) -> Tuple[List[str], Dict[str, Callable[[str], Column]]]:
+    """Separa los stats combinables por salting del resto.
+
+    Args:
+        stats: catálogo {nombre: callable(columna) -> Column} (p.ej.
+            CLUSTER_STATS).
+
+    Returns:
+        (nombres combinables, dict con los NO combinables).
+    """
+    combinable = [name for name in stats if name in COMBINABLE_GROUP_STATS]
+    other = {name: func for name, func in stats.items()
+             if name not in COMBINABLE_GROUP_STATS}
+    return combinable, other
+
+
+def salted_partial_stats(
+    df:DataFrame,
+    group_column:str,
+    value_columns:List[str],
+    salt_column:str = SALT_COLUMN,
+    salt_buckets:int = 64,
+    id_column:str = "id",
+    max_moment:int = 2,
+) -> DataFrame:
+    """Etapa 1 de la agregación robusta a skew: parciales por (grupo, sal).
+
+    Añade una sal determinista ``pmod(hash(id_column), salt_buckets)`` de modo
+    que un grupo gigante se reparte entre `salt_buckets` reducers en vez de
+    caer entero en uno. Por cada columna guarda sum/count/min/max/Σx² —
+    suficiente para recombinar count/sum/min/max/mean/std sin error. Con
+    `max_moment` 3/4 guarda además Σx³/Σx⁴ — necesario para recombinar los
+    ratios de momentos "curt"/"skew"/"so".
+
+    Args:
+        df: datos de entrada.
+        group_column: columna de agrupación (la que sufre la asimetría).
+        value_columns: columnas numéricas a agregar.
+        salt_column: nombre de la columna de sal.
+        salt_buckets: nº de buckets de sal (más -> más reparto, más reducers).
+        id_column: columna identificadora usada para la sal determinista.
+        max_moment: momento máximo guardado en los parciales (2-4).
+
+    Returns:
+        DataFrame con (group_column, salt_column, __size, __p_* por columna).
+    """
+    salted = df.withColumn(
+        salt_column, pmod(spark_hash(col(id_column)), lit(salt_buckets)))
+    aggregations:List[Column] = [count(lit(1)).alias("__size")]
+    for value_column in value_columns:
+        value = col(value_column)
+        aggregations += [
+            spark_sum(value).alias(f"{_SALT_PARTIAL_PREFIX}sum_{value_column}"),
+            count(value).alias(f"{_SALT_PARTIAL_PREFIX}count_{value_column}"),
+            spark_min(value).alias(f"{_SALT_PARTIAL_PREFIX}min_{value_column}"),
+            spark_max(value).alias(f"{_SALT_PARTIAL_PREFIX}max_{value_column}"),
+        ]
+        for moment in range(2, min(max(max_moment, 2), 4) + 1):
+            aggregations.append(
+                spark_sum(value**moment).alias(
+                    f"{_SALT_PARTIAL_PREFIX}sum{moment}_{value_column}"))
+    return salted.groupBy(group_column, salt_column).agg(*aggregations)
+
+
+def _salted_final_expression(stat:str, variable:str) -> Column:
+    """Expresión final de un stat combinable a partir de los parciales."""
+    prefix = _SALT_PARTIAL_PREFIX
+    if stat == "count":
+        return col(f"{prefix}count_{variable}")
+    if stat in ("sum", "min", "max"):
+        return col(f"{prefix}{stat}_{variable}")
+    if stat == "mean":
+        return col(f"{prefix}sum_{variable}") / col(f"{prefix}count_{variable}")
+    if stat == "std":
+        # desviación estándar muestral desde los momentos: (Σx²-(Σx)²/N)/(N-1)
+        variance = ((col(f"{prefix}sum2_{variable}")
+            - col(f"{prefix}sum_{variable}")**2
+                / col(f"{prefix}count_{variable}"))
+            / (col(f"{prefix}count_{variable}") - 1))
+        return coalesce(sqrt(variance), lit(0.0))
+    if stat in ("curt", "skew"):
+        # ratio de momentos: Σx³ / (Σx²)^(3/2)
+        return (col(f"{prefix}sum3_{variable}")
+            / col(f"{prefix}sum2_{variable}")**lit(1.5))
+    if stat == "so":
+        # ratio de momentos: Σx⁴ / (Σx²)²
+        return (col(f"{prefix}sum4_{variable}")
+            / col(f"{prefix}sum2_{variable}")**lit(2.0))
+    raise ValueError(f"Aggregation '{stat}' has no salted combiner")
+
+
+def merge_salted_stats(
+    partials:DataFrame,
+    group_column:str,
+    value_columns:List[str],
+    stat_names:List[str],
+    size_column:Optional[str] = None,
+    salt_column:str = SALT_COLUMN,
+    column_prefix:str = "",
+) -> DataFrame:
+    """Etapa 2: combina los parciales (grupo, sal) en stats finales por grupo.
+
+    Args:
+        partials: salida de `salted_partial_stats`.
+        group_column: columna de agrupación.
+        value_columns: columnas agregadas.
+        stat_names: stats finales (solo combinables: count/sum/min/max/mean/
+            std y los ratios de momentos curt/skew/so).
+        size_column: si se da, emite `size_column` = nº de filas del grupo.
+        salt_column: columna de sal usada en la etapa 1.
+        column_prefix: prefijo de las columnas de salida
+            (`{column_prefix}{stat}_{variable}`, p.ej. "cluster_scc_").
+
+    Returns:
+        Una fila por grupo con {column_prefix}{stat}_{variable}
+        (y `size_column` si se pidió).
+    """
+    required_moment = stats_required_moment(stat_names)
+    for value_column in value_columns:
+        for moment in range(3, required_moment + 1):
+            partial_name = f"{_SALT_PARTIAL_PREFIX}sum{moment}_{value_column}"
+            if partial_name not in partials.columns:
+                raise ValueError(
+                    f"Los parciales no tienen {partial_name}: los stats "
+                    f"{stat_names} requieren momento {moment}; vuelve a "
+                    f"llamar a salted_partial_stats con max_moment>="
+                    f"{required_moment}")
+    merges:List[Column] = []
+    if size_column is not None:
+        merges.append(spark_sum("__size").alias(size_column))
+    for value_column in value_columns:
+        merges += [
+            spark_sum(f"{_SALT_PARTIAL_PREFIX}sum_{value_column}"
+                ).alias(f"{_SALT_PARTIAL_PREFIX}sum_{value_column}"),
+            spark_sum(f"{_SALT_PARTIAL_PREFIX}count_{value_column}"
+                ).alias(f"{_SALT_PARTIAL_PREFIX}count_{value_column}"),
+            spark_min(f"{_SALT_PARTIAL_PREFIX}min_{value_column}"
+                ).alias(f"{_SALT_PARTIAL_PREFIX}min_{value_column}"),
+            spark_max(f"{_SALT_PARTIAL_PREFIX}max_{value_column}"
+                ).alias(f"{_SALT_PARTIAL_PREFIX}max_{value_column}"),
+        ]
+        for moment in range(2, min(max(required_moment, 2), 4) + 1):
+            merges.append(
+                spark_sum(f"{_SALT_PARTIAL_PREFIX}sum{moment}_{value_column}"
+                    ).alias(
+                        f"{_SALT_PARTIAL_PREFIX}sum{moment}_{value_column}"))
+    grouped = partials.groupBy(group_column).agg(*merges)
+    finals:List[Column] = [col(group_column)]
+    if size_column is not None:
+        finals.append(col(size_column))
+    for value_column in value_columns:
+        for stat in stat_names:
+            finals.append(
+                _salted_final_expression(stat, value_column)
+                .alias(f"{column_prefix}{stat}_{value_column}"))
+    return grouped.select(*finals)
+
+
+def plain_group_stats(
+    df:DataFrame,
+    group_column:str,
+    value_columns:List[str],
+    stats:Dict[str, Callable[[str], Column]],
+    size_column:Optional[str] = None,
+    column_prefix:str = "",
+) -> DataFrame:
+    """Etapa sin sal para stats NO combinables (median/percentile, customs).
+
+    Args:
+        df: datos de entrada.
+        group_column: columna de agrupación.
+        value_columns: columnas a agregar.
+        stats: {nombre: callable(columna) -> Column}.
+        size_column: si se da, emite `size_column` = nº de filas del grupo.
+        column_prefix: prefijo de las columnas de salida
+            (`{column_prefix}{stat}_{variable}`, p.ej. "cluster_scc_").
+
+    Returns:
+        Una fila por grupo con {column_prefix}{stat}_{variable}
+        (y `size_column` si se pidió).
+    """
+    aggregations:List[Column] = []
+    if size_column is not None:
+        aggregations.append(count(lit(1)).alias(size_column))
+    aggregations += [
+        func(col(value_column)).alias(f"{column_prefix}{stat}_{value_column}")
+        for value_column in value_columns
+        for stat, func in stats.items()
+    ]
+    return df.groupBy(group_column).agg(*aggregations)
+
+
+def stats_chunk_key(
+    group_column:str,
+    value_columns:List[str],
+    stat_names:List[str],
+) -> str:
+    """Huella estable del contenido de un chunk (nombres de columnas y stats).
+
+    Identifica el parquet intermedio de la etapa: si la config cambia las
+    columnas o stats del chunk, la huella cambia y el parquet se recomputa
+    en vez de recargarse con contenido obsoleto.
+    """
+    import hashlib
+    payload = "|".join([group_column] + list(value_columns) + list(stat_names))
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:10]

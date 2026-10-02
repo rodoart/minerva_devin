@@ -266,7 +266,8 @@ def _bare_substep(spark, tmp_dir):
     step._decorated_cache = {}
     step.output_hive = {
         key: {"table_or_hdfs": str(tmp_dir / key), "keep_or_delete": "delete"}
-        for key in ("subcluster_df", "nodes_enriched", "cluster_stats")
+        for key in ("subcluster_df", "nodes_enriched", "cluster_stats",
+                    "cluster_stats_parts")
     }
     return step
 
@@ -402,6 +403,107 @@ class TestSubclusterToggle:
             step.step_action()
         assert not any("SUBCLUSTER_ENABLED" in r.message
             for r in caplog.records)
+
+
+# ----------------------------------------------------------------------------
+# Stats etapados con sal (skew) y aligeramiento
+# ----------------------------------------------------------------------------
+
+class TestStagedClusterStats:
+    """Los stats por grupo se calculan en etapas salteadas persistidas."""
+
+    def _enriched(self, spark):
+        # skew fuerte: grupo 7 con 200 filas, grupos 1 y 2 con una fila
+        rows = ([(f"n{i}", 7, float(i), 1.0) for i in range(200)]
+            + [("big_only", 1, 5.0, 0.5), ("solo", 2, 3.0, 0.9)])
+        return spark.createDataFrame(
+            rows, ["id", "component_id", "x", "target_lovelace"])
+
+    def _step(self, spark, tmp_path, monkeypatch, **overrides):
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "GROUP_COLUMNS", ["component_id"])
+        monkeypatch.setattr(cclf, "REQUIRED_STATS_PREFIXES", [])
+        monkeypatch.setattr(cclf, "AGGREGATE_EXCLUDE_COLUMNS",
+            ["id", "component_id"])
+        monkeypatch.setattr(cclf, "SUBCLUSTER_ENABLED", False)
+        monkeypatch.setattr(cclf, "CLUSTER_LIGHT_MODE", False)
+        monkeypatch.setattr(cclf, "AGGREGATE_INCLUDE_PREFIXES", None)
+        for key, value in overrides.items():
+            monkeypatch.setattr(cclf, key, value)
+        step = _bare_substep(spark, tmp_path)
+        step.__dict__["_nodes_enriched_cache"] = self._enriched(spark)
+        return step
+
+    def test_salted_stats_match_plain_groupby(
+            self, spark, tmp_path, monkeypatch):
+        """La agregación en 2 etapas con sal replica el groupBy directo."""
+        import config.features.ceps.cluster_features as cclf
+        monkeypatch.setattr(cclf, "SALT_BUCKETS", 8)
+        monkeypatch.setattr(cclf, "STATS_COLUMN_CHUNK", 2)
+        step = self._step(spark, tmp_path, monkeypatch)
+        stats = step.cluster_stats
+        row = {r["id"]: r for r in stats.collect()}["n0"]
+        # grupo 7: x = 0..199 -> mean=99.5, sum=19900, count=200, size=200
+        assert row["cluster_component_id_size"] == 200
+        assert row["cluster_component_id_mean_x"] == pytest.approx(99.5)
+        assert row["cluster_component_id_sum_x"] == pytest.approx(19900.0)
+        assert row["cluster_component_id_count_x"] == 200
+        assert row["cluster_component_id_min_x"] == 0.0
+        assert row["cluster_component_id_max_x"] == 199.0
+        solo = {r["id"]: r for r in stats.collect()}["solo"]
+        assert solo["cluster_component_id_size"] == 1
+        assert solo["cluster_component_id_mean_x"] == pytest.approx(3.0)
+
+    def test_chunk_parts_are_persisted(self, spark, tmp_path, monkeypatch):
+        """Cada chunk de columnas materializa un parquet bajo
+        cluster_stats_parts/group_column=<g>/chunk=<i>_<hash>."""
+        monkeypatch_chunks = {"STATS_COLUMN_CHUNK": 1, "SALT_BUCKETS": 4}
+        step = self._step(spark, tmp_path, monkeypatch, **monkeypatch_chunks)
+        step.cluster_stats.count()
+        parts_dir = tmp_path / "cluster_stats_parts" / "group_column=component_id"
+        parts = [p.name for p in parts_dir.iterdir()]
+        # 2 columnas agregables (x, target_lovelace) con chunk=1 -> 2 partes
+        assert len(parts) == 2
+        assert all(p.startswith("chunk=") for p in parts)
+
+    def test_parts_reloaded_on_second_instance(
+            self, spark, tmp_path, monkeypatch):
+        """Una segunda instancia (reinicio) recarga las partes sin recomputar."""
+        import pipelines.features.ceps.cluster_features as pclf
+        step = self._step(spark, tmp_path, monkeypatch,
+            STATS_COLUMN_CHUNK=1, SALT_BUCKETS=4)
+        first = step.cluster_stats
+        assert first.count() == 202
+
+        calls = []
+        def _boom(*a, **k):
+            calls.append(1)
+            raise AssertionError("recomputó en vez de recargar")
+        monkeypatch.setattr(pclf.lfa, "salted_partial_stats", _boom)
+        step2 = _bare_substep(spark, tmp_path)
+        step2.__dict__["_nodes_enriched_cache"] = self._enriched(spark)
+        reloaded = step2.cluster_stats
+        assert calls == []                    # ninguna etapa recomputó
+        assert reloaded.count() == 202
+
+    def test_light_mode_filters_columns_and_stats(
+            self, spark, tmp_path, monkeypatch):
+        """CLUSTER_LIGHT_MODE solo agrega prefijos LIGHT_AGGREGATE_PREFIXES
+        con LIGHT_STATS."""
+        import config.features.ceps.cluster_features as cclf
+        step = self._step(spark, tmp_path, monkeypatch,
+            CLUSTER_LIGHT_MODE=True,
+            LIGHT_STATS=["count", "mean"],
+            LIGHT_AGGREGATE_PREFIXES=["target_"])
+        stats = step.cluster_stats
+        stat_cols = [c for c in stats.columns if c != "id"]
+        # solo target_lovelace entra, y solo count/mean + size
+        assert "cluster_component_id_size" in stat_cols
+        assert all("target_lovelace" in c or c.endswith("_size")
+            for c in stat_cols)
+        assert all("count_" in c or "mean_" in c or c.endswith("_size")
+            for c in stat_cols)
+        assert not any("_x" in c.split("component_id_")[-1] for c in stat_cols)
 
 
 # ----------------------------------------------------------------------------

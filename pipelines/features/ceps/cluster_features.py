@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Union
 from pyspark.sql import DataFrame
 from graphframes import GraphFrame
 
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, broadcast
 from pyspark.sql.types import NumericType
 # ------------------------------------------------------------------------------
 # Custom
@@ -23,6 +23,7 @@ from pyspark.sql.types import NumericType
 from libs.data_engineering_toolbox.path import HivePath
 from libs.framework.utils import sanitize_column_name
 
+import libs.functions.aggregations as lfa
 import libs.functions.features as lff
 import pipelines.graph_making.special_treatment as p_gm_sp
 
@@ -164,6 +165,101 @@ class StandardClusterFeaturesSubStep(SubStep):
             prefix=prefix,
         )
         #
+    def staged_cluster_group_stats(self,
+        df:DataFrame,
+        group_column:str,
+        aggregate_columns:List[str],
+        stats:Dict,
+        prefix:str = "cluster",
+    ) -> DataFrame:
+        """Stats intra-grupo por nodo, en etapas persistidas y robusto a skew.
+
+        Estrategia (la distribución de `component_id`/`scc` es muy asimétrica:
+        una componente gigante concentraría casi todo el shuffle en un
+        reducer):
+
+        1. Las columnas se agregan en chunks de `STATS_COLUMN_CHUNK`.
+        2. Los stats combinables (count/sum/min/max/mean/std) van por la
+           vía salteada en dos etapas (`lfa.salted_partial_stats` +
+           `lfa.merge_salted_stats`): un grupo gigante se reparte entre
+           `SALT_BUCKETS` reducers.
+        3. Los stats no combinables (median/percentile_approx...) van por
+           `lfa.plain_group_stats` dentro del mismo chunk.
+        4. Cada chunk se materializa como parquet intermedio bajo
+           `cluster_stats_parts/group_column=<g>/chunk=<i>_<hash>`: si el
+           proceso muere solo se recomputan los chunks sin parquet. La huella
+           incluye columnas y stats: cambios de config invalidan el caché.
+        5. Las partes se unen por `group_column` y el resultado (una fila por
+           grupo) se une a los nodos con broadcast si es razonablemente
+           pequeño (`STATS_BROADCAST_MAX_GROUPS`) — evita el shuffle skewed
+           del join sobre la clave asimétrica.
+        """
+        parts_base = HivePath(str(
+            self.output_hive["cluster_stats_parts"]["table_or_hdfs"]))
+        combinable, plain_stats = lfa.split_stats_by_combinable(stats)
+        size_column = f"{prefix}_{group_column}_size"
+        chunk_size = max(1, cclf.STATS_COLUMN_CHUNK)
+        chunks = [aggregate_columns[i:i + chunk_size]
+            for i in range(0, len(aggregate_columns), chunk_size)]
+        #
+        part_frames:List[DataFrame] = []
+        size_emitted = False
+        for index, chunk in enumerate(chunks):
+            chunk_stat_names = combinable + list(plain_stats)
+            digest = lfa.stats_chunk_key(group_column, chunk, chunk_stat_names)
+            part_path = parts_base.joinpath(
+                f"group_column={group_column}",
+                f"chunk={index:03d}_{digest}")
+            emit_size = not size_emitted
+            #
+            def make_chunk(*args, _chunk=chunk, _emit=emit_size, **kwargs) -> DataFrame:
+                frames:List[DataFrame] = []
+                column_prefix = f"{prefix}_{group_column}_"
+                if combinable:
+                    frames.append(lfa.merge_salted_stats(
+                        lfa.salted_partial_stats(
+                            df, group_column, _chunk,
+                            salt_buckets=cclf.SALT_BUCKETS),
+                        group_column, _chunk, combinable,
+                        size_column=size_column if _emit else None,
+                        column_prefix=column_prefix))
+                if plain_stats:
+                    frames.append(lfa.plain_group_stats(
+                        df, group_column, _chunk, plain_stats,
+                        size_column=(size_column
+                            if _emit and not combinable else None),
+                        column_prefix=column_prefix))
+                result = frames[0]
+                for frame in frames[1:]:
+                    result = result.join(frame, on=group_column)
+                return result
+            #
+            part_frames.append(
+                self.get_cached_decorated_table_or_parquet_property(
+                    method=make_chunk,
+                    path=part_path,
+                    property_name=(
+                        f"cluster_stats_part_{group_column}_{index}_{digest}"),
+                    input_or_output="output"))
+            size_emitted = True
+        #
+        if not part_frames:     # sin columnas agregables: solo tamaños de grupo
+            grouped = df.groupBy(group_column).agg(
+                {"*": "count"}).withColumnRenamed(
+                    "count(1)", size_column)
+        else:
+            grouped = part_frames[0]
+            for part in part_frames[1:]:
+                grouped = grouped.join(part, on=group_column)
+        #
+        # Broadcast solo si los grupos caben razonablemente en memoria del
+        # driver/executors (limit barato: las partes ya están en parquet).
+        max_groups = getattr(cclf, "STATS_BROADCAST_MAX_GROUPS", 200000)
+        if grouped.limit(max_groups + 1).count() <= max_groups:
+            grouped = broadcast(grouped)
+        return (df.select("id", group_column)
+            .join(grouped, on=group_column, how="left"))
+        #
 
 
 ###############################################################################
@@ -217,14 +313,28 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             self.input_hive["components"]["table_or_hdfs"])
         #
     @ppf.cached_property
-    @ppf.dynamic_unpartitioned_parquet(path_key="subcluster_df")
     def subcluster_df(self) -> DataFrame:
         """Sub-partición dirigida por nodo (columna `scc`), persistida.
 
         El SCC de GraphFrames usa checkpoints internos no reanudables: este
         parquet es el punto de reanudación real. Si ya existe se recarga y el
-        algoritmo de grafo no vuelve a ejecutarse.
+        algoritmo de grafo no vuelve a ejecutarse. Se escribe bajo
+        `subcluster_df/method=<m>_max_iter=<n>`: cambiar la config no recarga
+        un parquet con el algoritmo equivocado, y el borrado del dir base sigue
+        cubriendo todas las variantes.
         """
+        base = HivePath(str(
+            self.output_hive["subcluster_df"]["table_or_hdfs"]))
+        variant = (f"method={cclf.SUBCLUSTER_METHOD}"
+            f"_max_iter={cclf.SUBCLUSTER_MAX_ITER}")
+        return self.get_cached_decorated_table_or_parquet_property(
+            method=self._compute_subcluster_df,
+            path=base.joinpath(variant),
+            property_name=f"subcluster_df_{variant}",
+            input_or_output="output")
+        #
+    def _compute_subcluster_df(self) -> DataFrame:
+        """Cuerpo de `subcluster_df`: corre el algoritmo de sub-partición."""
         self.define_checkpoint(
             checkpoint_hdfs=self.output_hive["checkpoint"]["table_or_hdfs"])
         edges = self.edges
@@ -238,15 +348,53 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             max_iter=cclf.SUBCLUSTER_MAX_ITER,
         )
         #
+    def _nodes_enriched_mode(self) -> str:
+        """Variante de `nodes_enriched` según la config que altera su contenido.
+
+        Incluye light/full, si el subcluster está activo y una huella de las
+        fuentes de features unidas — evita recargar un parquet intermedio con
+        contenido obsoleto tras un cambio de configuración.
+        """
+        mode = "light" if getattr(cclf, "CLUSTER_LIGHT_MODE", False) else "full"
+        if not cclf.SUBCLUSTER_ENABLED:
+            mode += "_noscc"
+        sources = sorted(self._active_feature_sources().keys())
+        return f"{mode}_{lfa.stats_chunk_key('src', sources, [])}"
+        #
+    @staticmethod
+    def _active_feature_sources() -> Dict[str, HivePath]:
+        """Fuentes de features de grafo que se unen a los nodos enriquecidos.
+
+        En `CLUSTER_LIGHT_MODE` solo se unen `LIGHT_FEATURE_SOURCES` (p.ej.
+        contagion): las fuentes pesadas (pagerank, degrees...) se saltan por
+        completo — el join de todos los parquets es gran parte del coste.
+        """
+        sources = cclf.GRAPH_FEATURE_SOURCES
+        if getattr(cclf, "CLUSTER_LIGHT_MODE", False):
+            keep = getattr(cclf, "LIGHT_FEATURE_SOURCES", [])
+            sources = {k: v for k, v in sources.items() if k in keep}
+        return sources
+        #
     @ppf.cached_property
-    @ppf.dynamic_unpartitioned_parquet(path_key="nodes_enriched")
     def nodes_enriched(self) -> DataFrame:
         """Nodos + targets + antigüedad + features de grafo + columnas de grupo.
 
         Materializado como parquet intermedio: el join de todas las fuentes es
         pesado y su linaje incluye el SCC; al persistirlo, los stats por grupo
-        leen de disco en vez de recomputar el grafo.
+        leen de disco en vez de recomputar el grafo. Se escribe bajo
+        `nodes_enriched/mode=<variante>` (ver `_nodes_enriched_mode`).
         """
+        base = HivePath(str(
+            self.output_hive["nodes_enriched"]["table_or_hdfs"]))
+        mode = self._nodes_enriched_mode()
+        return self.get_cached_decorated_table_or_parquet_property(
+            method=self._compute_nodes_enriched,
+            path=base.joinpath(f"mode={mode}"),
+            property_name=f"nodes_enriched_{mode}",
+            input_or_output="output")
+        #
+    def _compute_nodes_enriched(self) -> DataFrame:
+        """Cuerpo de `nodes_enriched`: join de todas las fuentes por `id`."""
         df = self.nodes_join_target
         if "information_date" in df.columns:
             df = p_gm_sp.calculate_daily_tfrom(
@@ -254,7 +402,7 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
                 current_date=str(self.input_parameters["vintage_date"]),
                 date_column="information_date",
             )
-        for path in cclf.GRAPH_FEATURE_SOURCES.values():
+        for path in self._active_feature_sources().values():
             df = df.join(
                 self.feature_dataframe(self.sqlContext, path),
                 on="id", how="left")
@@ -272,6 +420,23 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
             if isinstance(field.dataType, NumericType)
             and field.name not in cclf.AGGREGATE_EXCLUDE_COLUMNS
         ]
+        # Aligeramiento: en modo ligero (o con AGGREGATE_INCLUDE_PREFIXES) solo
+        # se agregan las columnas de los prefijos elegidos.
+        include_prefixes = getattr(cclf, "AGGREGATE_INCLUDE_PREFIXES", None)
+        if getattr(cclf, "CLUSTER_LIGHT_MODE", False):
+            include_prefixes = cclf.LIGHT_AGGREGATE_PREFIXES
+        if include_prefixes:
+            aggregate_columns = [
+                c for c in aggregate_columns
+                if any(c.startswith(p) or c.endswith(p)
+                    for p in include_prefixes)]
+            logger.info("Columnas agregadas tras filtro de aligeramiento: %s",
+                aggregate_columns)
+        stats = cclf.CLUSTER_STATS
+        if getattr(cclf, "CLUSTER_LIGHT_MODE", False):
+            stats = {k: v for k, v in stats.items()
+                if k in cclf.LIGHT_STATS}
+            logger.info("CLUSTER_LIGHT_MODE activo: stats %s", list(stats))
         logger.info("Columnas agregadas por grupo: %s", aggregate_columns)
         # Guarda: la target y la target propagada (y los pesos) deben entrar
         # en los estadísticos de grupo; si ningún prefijo obligatorio tiene
@@ -296,8 +461,8 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
         result = df.select("id")
         for group_column in group_columns:
             result = result.join(
-                self.standard_cluster_group_stats(
-                    df, group_column, aggregate_columns, cclf.CLUSTER_STATS),
+                self.staged_cluster_group_stats(
+                    df, group_column, aggregate_columns, stats),
                 on="id", how="left")
         return result
         #

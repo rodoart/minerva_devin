@@ -7,7 +7,7 @@
 # General
 # ------------------------------------------------------------------------------
 import inspect
-from typing import List, Union, Dict, Any, Optional
+from typing import List, Union, Dict, Any, Optional, Callable
 
 
 # ------------------------------------------------------------------------------
@@ -255,10 +255,11 @@ class StandardGraphFeaturesUnWeightedStep(SubStep):
     @staticmethod
     def degrees_ft(
         graph:GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Grado de entrada, salida y total por nodo."""
-        return lff.degrees(graph)
+        return lff.degrees(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def components_ft(
@@ -279,26 +280,29 @@ class StandardGraphFeaturesUnWeightedStep(SubStep):
     @staticmethod
     def degree_balance_ft(
         graph:GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Balance direccional del grado por nodo (net_degree, in_out_degree_ratio)."""
-        return lff.degree_balance(graph)
+        return lff.degree_balance(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def reciprocity_ft(
         graph:GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Reciprocidad por nodo (vecinos que también enlazan de vuelta)."""
-        return lff.reciprocity(graph)
+        return lff.reciprocity(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def self_loops_ft(
         graph:GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Número de aristas src==dst por nodo (self_loop_count)."""
-        return lff.self_loops(graph)
+        return lff.self_loops(graph, salt_buckets=salt_buckets)
     #
     # def k_core_ft(self, graph:GraphFrame, k:int) -> DataFrame:
     #     return graph.kCore(k).withColumnRenamed("core", f"k_core_{k}")
@@ -319,42 +323,50 @@ class StandardGraphFeaturesWeightedStep(SubStep):
     @staticmethod
     def weighted_degrees_ft(
         graph: GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Fuerza (strength) ponderada: suma de pesos entrantes/salientes por nodo. ..."""
-        return lff.weighted_degrees(graph)
+        return lff.weighted_degrees(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def weighted_edge_stats_ft(
         graph: GraphFrame,
         aggregations:Optional[List[Column]] = None,
+        stats:Optional[Dict[str, Callable[..., Column]]] = None,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Estadísticas de peso de aristas incidentes por nodo (in + out). ..."""
-        return lff.weighted_edge_stats(graph, aggregations=aggregations)
+        return lff.weighted_edge_stats(
+            graph, aggregations=aggregations, stats=stats,
+            salt_buckets=salt_buckets)
     #
     @staticmethod
     def weighted_degree_balance_ft(
         graph: GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Balance direccional de la fuerza ponderada (net_strength, in_out_strength_ratio)."""
-        return lff.weighted_degree_balance(graph)
+        return lff.weighted_degree_balance(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def weighted_components_ft(
         graph: GraphFrame,
+        salt_buckets:Optional[int] = None,
         **kwargs
     ) -> DataFrame:
         """Componentes conexas enriquecidas con el peso total de cada componente. ..."""
-        return lff.weighted_components(graph)
+        return lff.weighted_components(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def weighted_triangle_count_ft(
         graph: GraphFrame,
+        salt_buckets:Optional[int] = None,
         *args,
         **kwargs
     ) -> DataFrame:
         """Conteo de triángulos por nodo (estructural, no ponderado) + fuerza. ..."""
-        return lff.weighted_triangle_count(graph)
+        return lff.weighted_triangle_count(graph, salt_buckets=salt_buckets)
         #

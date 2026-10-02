@@ -200,3 +200,76 @@ class TestAssembleVector:
         result = assemble_vector(df, ["f1", "f2"], output_column="vec")
         assert "vec" in result.columns
         assert "features" not in result.columns
+
+
+class TestSaltedAssemblyGroupby:
+    """`salted_assembly_groupby`: groupBy por nivel en dos etapas con sal."""
+
+    @pytest.fixture()
+    def nodes_exploded(self, spark):
+        """Simula nodos explotados a llave con varias features y peso."""
+        return spark.createDataFrame(
+            [
+                # numcliente, id nodo, f1, f2, oper_mto, tfrom
+                ("c1", "n1", 10.0, 1.0, 100.0, 0.0),
+                ("c1", "n2", 20.0, 3.0, 200.0, 0.0),
+                ("c1", "n3", None, 5.0, 50.0, 0.0),
+                ("c2", "n4", 5.0, 7.0, 10.0, 0.0),
+            ],
+            ["numcliente", "id", "f1", "f2", "oper_mto", "tfrom_days"],
+        )
+
+    @staticmethod
+    def _rows(df, key):
+        return {r[key]: {k: v for k, v in r.asDict().items() if k != key}
+            for r in df.collect()}
+
+    def test_matches_plain_aggregation(self, nodes_exploded):
+        """Mismo resultado que build_aggregation_expressions + groupBy."""
+        from libs.functions.assembly import salted_assembly_groupby
+        weight = col("oper_mto") / (col("tfrom_days") + lit(1.0))
+        aggregation = {"default": ["weighted_mean", "mean", "min", "max"]}
+        salted = self._rows(salted_assembly_groupby(
+            nodes_exploded, "numcliente", ["f1", "f2"],
+            aggregation, weight, salt_buckets=4), "numcliente")
+        plain = self._rows(nodes_exploded.groupBy("numcliente").agg(
+            *build_aggregation_expressions(
+                ["f1", "f2"], aggregation=aggregation, weight=weight),
+            countDistinct("id").alias("node_count")), "numcliente")
+        assert salted.keys() == plain.keys()
+        for key, expected in plain.items():
+            for name, value in expected.items():
+                actual = salted[key][name]
+                if isinstance(value, float):
+                    assert actual == pytest.approx(value, rel=1e-6), name
+                else:
+                    assert actual == value, name
+
+    def test_weighted_mean_null_denominator(self, spark):
+        """Σw del denominador incluye filas con valor nulo (semántica de
+        `weighted_mean`)."""
+        from libs.functions.assembly import salted_assembly_groupby
+        df = spark.createDataFrame(
+            [("c2", "n1", 5.0, 1.0), ("c2", "n2", None, 1.0)],
+            ["numcliente", "id", "feat", "w"])
+        result = self._rows(salted_assembly_groupby(
+            df, "numcliente", ["feat"], "weighted_mean",
+            col("w"), salt_buckets=2), "numcliente")
+        # (5*1 + null*1)/(1+1) = 2.5 — el nulo aporta al denominador
+        assert result["c2"]["feat"] == pytest.approx(2.5)
+        assert result["c2"]["node_count"] == 2
+
+    def test_mixed_combinable_and_plain(self, nodes_exploded):
+        """median va por vía directa; weighted_mean/std por la salteada."""
+        from libs.functions.assembly import salted_assembly_groupby
+        weight = col("oper_mto") / (col("tfrom_days") + lit(1.0))
+        aggregation = {"default": ["weighted_mean", "median", "std"]}
+        result = self._rows(salted_assembly_groupby(
+            nodes_exploded, "numcliente", ["f1"],
+            aggregation, weight, salt_buckets=4), "numcliente")
+        c1 = result["c1"]
+        assert c1["weighted_mean_f1"] == pytest.approx(
+            (10.0*100 + 20.0*200) / (100 + 200 + 50))
+        assert c1["median_f1"] == pytest.approx(15.0)
+        assert c1["std_f1"] == pytest.approx(7.0710678, rel=1e-4)
+        assert c1["node_count"] == 3

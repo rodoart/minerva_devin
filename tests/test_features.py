@@ -404,3 +404,97 @@ class TestJoinTarget:
             target_column="target_agg_numcliente")
         assert result.count() == 2
         assert result.filter("id = 'n2'").first()["target_numcliente"] is None
+
+
+class TestSaltedDegree:
+    """get_degree con sal en dos etapas (grados sesgados por supernodos)."""
+
+    def test_salted_degree_matches_plain(self, tiny_graph):
+        plain = {r["node"]: r["deg_sum"] for r in
+                 lff.get_degree(tiny_graph).collect()}
+        salted = {r["node"]: r["deg_sum"] for r in
+                  lff.get_degree(tiny_graph, salt_buckets=4).collect()}
+        assert salted == plain
+
+    def test_salted_degree_zero_buckets_matches_plain(self, tiny_graph):
+        plain = {r["node"]: r["deg_sum"] for r in
+                 lff.get_degree(tiny_graph).collect()}
+        salted = {r["node"]: r["deg_sum"] for r in
+                  lff.get_degree(tiny_graph, salt_buckets=0).collect()}
+        assert salted == plain
+
+
+@pytest.mark.graphframes
+class TestSaltedEdgeAggregations:
+    """Las variantes con sal en dos etapas producen los mismos resultados
+    que el groupBy directo (y soportan el skew de supernodos)."""
+
+    @staticmethod
+    def _rows(df):
+        return {r["id"]: {k: v for k, v in r.asDict().items() if k != "id"}
+            for r in df.collect()}
+
+    @staticmethod
+    def _assert_same_rows(salted_df, plain_df):
+        salted = TestSaltedEdgeAggregations._rows(salted_df)
+        plain = TestSaltedEdgeAggregations._rows(plain_df)
+        assert salted.keys() == plain.keys()
+        for node, expected in plain.items():
+            for key, value in expected.items():
+                actual = salted[node][key]
+                if isinstance(value, float):
+                    assert actual == pytest.approx(value, rel=1e-6)
+                else:
+                    assert actual == value
+
+    def test_degrees_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.degrees(tiny_graph, salt_buckets=4),
+            lff.degrees(tiny_graph, salt_buckets=0))
+
+    def test_degree_balance_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.degree_balance(tiny_graph, salt_buckets=4),
+            lff.degree_balance(tiny_graph, salt_buckets=0))
+
+    def test_reciprocity_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.reciprocity(tiny_graph, salt_buckets=4),
+            lff.reciprocity(tiny_graph, salt_buckets=0))
+
+    def test_self_loops_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.self_loops(tiny_graph, salt_buckets=4),
+            lff.self_loops(tiny_graph, salt_buckets=0))
+
+    def test_weighted_degrees_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.weighted_degrees(tiny_graph, salt_buckets=4),
+            lff.weighted_degrees(tiny_graph, salt_buckets=0))
+
+    def test_weighted_degree_balance_salted(self, tiny_graph):
+        self._assert_same_rows(
+            lff.weighted_degree_balance(tiny_graph, salt_buckets=4),
+            lff.weighted_degree_balance(tiny_graph, salt_buckets=0))
+
+    def test_weighted_edge_stats_salted(self, tiny_graph):
+        """Mezcla de combinables (incl. ratios de momentos curt/skew/so) y
+        no combinables (countDistinct) con la misma salida."""
+        self._assert_same_rows(
+            lff.weighted_edge_stats(tiny_graph, salt_buckets=4),
+            lff.weighted_edge_stats(tiny_graph, salt_buckets=0))
+
+    def test_weighted_edge_stats_raw_aggregations_plain(self, tiny_graph):
+        """Con `aggregations` crudas (sin nombres) siempre es vía directa."""
+        from pyspark.sql.functions import sum as spark_sum
+        result = lff.weighted_edge_stats(
+            tiny_graph,
+            aggregations=[spark_sum("weight").alias("total_w")],
+            salt_buckets=8)
+        rows = self._rows(result)
+        assert rows["a"]["total_w"] == pytest.approx(14.0)
+
+    def test_weighted_components_salted(self, tiny_graph, checkpoint_dir):
+        self._assert_same_rows(
+            lff.weighted_components(tiny_graph, salt_buckets=4),
+            lff.weighted_components(tiny_graph, salt_buckets=0))

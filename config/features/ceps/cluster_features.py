@@ -72,6 +72,27 @@ AGGREGATE_EXCLUDE_COLUMNS = [
     "seed_score",
 ]
 
+# --- Robustez de los groupBy de stats (skew fuerte en component_id/scc) ---
+# La distribución de grupos es muy asimétrica (una componente gigante): el
+# groupBy se ejecuta en dos etapas con sal — parciales por (grupo, sal) con
+# SALT_BUCKETS buckets, merge por grupo — y en chunks de columnas, cada uno
+# persistido como parquet intermedio en `cluster_stats_parts` (reanudable).
+SALT_BUCKETS = 64           # buckets de sal por grupo (des-skew en 2 etapas)
+STATS_COLUMN_CHUNK = 8      # columnas agregadas por etapa/parquet intermedio
+STATS_BROADCAST_MAX_GROUPS = 200000   # broadcast del join final hasta N grupos
+
+# --- Aligeramiento del step (si sigue pesado) ---
+# CLUSTER_LIGHT_MODE=True limita stats y columnas a las listas LIGHT_* Y solo
+# une LIGHT_FEATURE_SOURCES a los nodos enriquecidos (salta los joins de
+# fuentes pesadas de features de grafo).
+CLUSTER_LIGHT_MODE = False
+LIGHT_STATS = ["count", "mean", "min", "max", "sum"]
+LIGHT_AGGREGATE_PREFIXES = [
+    "target_", "contagion_", "oper_mto", "_strength",
+]
+LIGHT_FEATURE_SOURCES = ["contagion"]   # fuentes unidas en modo ligero
+AGGREGATE_INCLUDE_PREFIXES = None       # lista -> solo columnas con esos prefijos/sufijos
+
 # Prefijos de columnas que DEBEN entrar en los estadísticos de grupo: la
 # etiqueta original (target_lovelace*), la propagada (contagion_*) y las
 # columnas de peso/monto (oper_mto, weight*, *_strength). Si ninguna columna
@@ -135,6 +156,11 @@ output = {
         "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
     },
     "nodes_enriched": {"table_or_hdfs": current_hdfs.joinpath("nodes_enriched"),
+        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+    },
+    # Partes de los stats por grupo (un parquet por chunk de columnas y
+    # group_column): puntos de reanudación de los groupBy etapados.
+    "cluster_stats_parts": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats_parts"),
         "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
     },
     # Directorio de checkpoint de GraphFrames para stronglyConnectedComponents.

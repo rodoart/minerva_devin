@@ -170,10 +170,10 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
     @staticmethod
     def standard_get_degree(
         graph:GraphFrame, # with  weight
-
+        salt_buckets:Optional[int] = None,
     ) -> DataFrame:
-        """Grado ponderado por nodo: suma de `weight` de aristas incidentes (in+out)."""
-        return lff.get_degree(graph)
+        """Grado ponderado por nodo (dos etapas con sal si `salt_buckets`)."""
+        return lff.get_degree(graph, salt_buckets=salt_buckets)
     #
     @staticmethod
     def standard_weight_normalization(
@@ -241,7 +241,8 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
                 # edge_final_columns=edge_final_columns,
                 # node_final_columns=node_final_columns,
                 **kwargs)
-            degree = self.standard_get_degree(graph)
+            degree = self.standard_get_degree(
+                graph, salt_buckets=getattr(cfcf, "DEGREE_SALT_BUCKETS", None))
             edges_norm = self.standard_weight_normalization(graph, degree)
             return edges_norm
         #

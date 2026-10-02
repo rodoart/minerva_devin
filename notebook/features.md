@@ -82,6 +82,18 @@ Réplica de `group_by_id` + columnas de fecha: `id`, `numcliente` (array),
 | `component_weight` | `weighted_components` | Peso total de las aristas de la componente del nodo |
 | `triangle_count` | `weighted_triangle_count` | Conteo estructural de triángulos + `total_strength` |
 
+**GroupBy por nodo en dos etapas con sal**: todas las features que agregan
+aristas por nodo (`degrees`, `degree_balance`, `reciprocity`, `self_loops`,
+`weighted_degrees`, `weighted_edge_stats`, `weighted_degree_balance`,
+`weighted_components`, `weighted_triangle_count` y `get_degree` de la
+propagación) aceptan `salt_buckets` (default `EDGE_GROUPBY_SALT_BUCKETS`=64;
+`<=1` = groupBy directo): los supernodos reparten sus aristas entre buckets.
+Los stats `curt`/`skew`/`so` (`Σxᵏ/(Σx²)^(k/2)`) son combinables exactos vía
+momentos 3-4; `countDistinct` va por la vía directa unida por `id`. El
+parámetro puede ajustarse por feature desde `params` en
+`GRAPH_CENTRALITY_FEATURES`/`WEIGHTED_FEATURES` (fluye como kwarg al método
+`{feature}_ft`).
+
 ## 3. Propagación de target
 
 ### Intermedios
@@ -119,7 +131,9 @@ Una columna por cada (`weight_type` × columna propagada) — subdirs
 
 - `edges_norm/weight_type=<w>` — aristas normalizadas por grado del receptor,
   compartidas por todas las columnas propagadas con ese peso (dir hermano de
-  `target_propagation`; `keep_or_delete="delete"` lo limpia al final).
+  `target_propagation`; `keep_or_delete="delete"` lo limpia al final). El
+  grado se calcula con sal en dos etapas (`DEGREE_SALT_BUCKETS`) porque los
+  supernodos sesgan el `groupBy`; con `<= 1` vuelve al groupBy directo.
 - `target_propagation/<params>` — un parquet por combinación
   (weight_type × target_column × alpha × max_iter × keep_seed_floor); cada
   feature de contagio es su propio punto de reanudación: si el proceso muere,
@@ -141,12 +155,39 @@ Una columna por cada (`weight_type` × columna propagada) — subdirs
 no se corre el algoritmo de grafo: el step solo agrupa por `component_id` y
 omite `scc` con un warning (aunque siga en `GROUP_COLUMNS`).
 
+**GroupBy anti-skew en dos etapas** (`SALT_BUCKETS`, por
+defecto 64): un solo componente gigante concentraría todo el shuffle en un
+executor. `cluster_stats` se calcula **por cada columna de grupo** y en dos
+etapas, reutilizando la aritmética de momentos combinables de
+`libs.functions.aggregations` (la misma del group-by mensual):
+
+1. *Etapa sal* — `salted_partial_stats`: añade `salt = pmod(hash(id), N)` y
+   agrega momentos parciales (`n`, `sum`, `sum(x²)`, min, max) por
+   `(grupo, sal)`. Una partición gigante se reparte en `N` tareas.
+2. *Etapa merge* — `merge_salted_stats`: combina los momentos por grupo
+   (std vía varianza poblacional: `E[x²] - E[x]²`).
+
+Cada chunk `(group_column, chunk)` se materializa en
+`cluster_stats_parts/group_column=<g>/chunk=<hash>/` antes de unirse —
+un fallo a mitad solo recomputa los chunks que falten. Las stats no
+combinables (`median` u otras custom en `CLUSTER_STATS`) van por la vía
+directa (`plain_group_stats`) con su propio parquet por chunk. Con
+`SALT_BUCKETS <= 1` todo el cálculo es la vía directa.
+
+**Modo ligero** (`LIGHT_CLUSTER_STATS = True`): las stats solo se calculan
+sobre las columnas que ya trae `nodes_join_target` — no se unen las fuentes
+de `GRAPH_FEATURE_SOURCES` a `nodes_enriched` (el join multi-parquet es gran
+parte del coste del step).
+
 **Reanudación del step**: los intermedios pesados se materializan como
 parquets propios (`dynamic_unpartitioned_parquet`), porque los checkpoints
-orgánicos de GraphFrames no son reanudables:
+orgánicos de GraphFrames no son reanudables. Los paths llevan subdirs de
+variante para que un cambio de config no recargue datos obsoletos:
 
-- `subcluster_df` — resultado del SCC/label-propagation (id, scc).
-- `nodes_enriched` — join de nodos + targets + todas las features de grafo.
+- `subcluster_df/method=<m>_max_iter=<i>/` — SCC/label-propagation (id, scc).
+- `nodes_enriched/mode=<full|full_noscc|light|light_noscc>/` — join de nodos
+  + targets + features de grafo activas.
+- `cluster_stats_parts/...` — chunks de stats (etapa 1 y 2).
 - `cluster_stats` — salida final.
 
 Si el proceso muere, la siguiente ejecución recarga los parquets ya escritos
@@ -164,6 +205,13 @@ Para cada nivel en `AGGREGATION_LEVELS` (`numcliente`, `cta`):
 | `{func}_<feature>_ceps` | Cada feature de nodo agregada al nivel con `FEATURE_AGGREGATION` (lista de funciones → una columna por función; `AGGREGATION_WEIGHT = oper_mto/(tfrom_days+1)` como peso). Todas las variables llevan `VARIABLE_SUFFIX` (`_ceps`) |
 | `target_lovelace*_ceps` | Etiquetas agregadas igual que las features (para entrenamiento) |
 | `node_count_ceps` | Nº de nodos (`id`) distintos que aportan a la llave |
+
+El groupBy por nivel también es en dos etapas con sal
+(`ASSEMBLY_SALT_BUCKETS`=32): una llave gigante (cliente/cuenta con miles de
+nodos) no concentra el shuffle. `weighted_mean`/`mean`/`std`/`min`/`max`/`sum`
+usan combinadores exactos (Σv·w/Σw, momentos); `median`/`first`/
+`distinct_count` van por la vía directa y se unen por la llave; `node_count`
+se calcula por deduplicación `(llave, id)` → count.
 
 ### `{nivel}_features_vector` (salida final para modelos)
 

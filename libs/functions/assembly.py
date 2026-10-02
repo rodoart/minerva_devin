@@ -16,7 +16,8 @@ from pyspark.sql import DataFrame, Column
 from pyspark.sql.functions import (col, lit, explode,
     mean as spark_mean, min as spark_min, max as spark_max, sum as spark_sum,
     first as spark_first, countDistinct, stddev as spark_std,
-    percentile_approx
+    percentile_approx, count, when, coalesce, sqrt, pmod,
+    hash as spark_hash
 )
 from pyspark.ml.feature import VectorAssembler
 
@@ -78,6 +79,170 @@ def build_aggregation_expressions(
                 expression = expression.alias(f"{agg_name}_{column}")
             expressions.append(expression)
     return expressions
+
+
+# Funciones de ensamblado con combinador exacto a partir de parciales por
+# (llave, sal): mean/sum/min/max/std (momentos) y weighted_mean (Σv·w / Σw).
+# "median", "first", "distinct_count" y customs NO son combinables.
+COMBINABLE_ASSEMBLY_STATS = {
+    "mean", "std", "min", "max", "sum", "weighted_mean", "count"}
+
+
+def _resolve_column_aggs(
+    feature_columns:List[str],
+    aggregation:Union[str, List[str], Dict[str, Union[str, List[str]]]],
+) -> Dict[str, List[str]]:
+    """Normaliza `aggregation` a {columna: [funciones]} (misma resolución que
+    `build_aggregation_expressions`)."""
+    if isinstance(aggregation, (str, list)):
+        aggregation = {"default": aggregation}
+    resolved:Dict[str, List[str]] = {}
+    for column in feature_columns:
+        agg_spec = aggregation.get(
+            column, aggregation.get("default", "weighted_mean"))
+        resolved[column] = (
+            [agg_spec] if isinstance(agg_spec, str) else list(agg_spec))
+    return resolved
+
+
+def _assembly_output_name(agg_name:str, column:str, agg_names:List[str]) -> str:
+    """Alias de salida (convención de `build_aggregation_expressions`)."""
+    return column if len(agg_names) == 1 else f"{agg_name}_{column}"
+
+
+def salted_assembly_groupby(
+    df:DataFrame,
+    group_column:str,
+    feature_columns:List[str],
+    aggregation:Union[str, List[str], Dict[str, Union[str, List[str]]]],
+    weight:Column,
+    salt_buckets:int,
+    id_column:Optional[str] = "id",
+) -> DataFrame:
+    """`groupBy(group_column)` de features agregadas en dos etapas con sal.
+
+    Robusto a llaves gigantes (p.ej. un `numcliente`/`cta` con miles de nodos):
+    la etapa 1 agrega parciales por (llave, sal) — la sal deriva de
+    `id_column` — y la etapa 2 los combina por llave.
+
+    - Stats combinables (`COMBINABLE_ASSEMBLY_STATS`: mean/sum/min/max/std/
+      weighted_mean) van por la vía salteada con combinadores exactos.
+    - El resto (median, first, distinct_count, ...) se calcula por la vía
+      directa `groupBy` y se une por la llave.
+    - `countDistinct(id_column)` se emite como `node_count` por deduplicación
+      (distinct(llave, id) -> count), también en dos etapas.
+
+    Devuelve una fila por `group_column` con los mismos nombres de columna
+    que produciría `build_aggregation_expressions` + `node_count`.
+    """
+    resolved = _resolve_column_aggs(feature_columns, aggregation)
+    for column, names in resolved.items():
+        for name in names:
+            if name not in ASSEMBLY_AGGREGATION_FUNCTIONS:
+                raise ValueError(
+                    f"Unsupported assembly aggregation '{name}' for column "
+                    f"'{column}'.")
+    combinable = {c: [n for n in names if n in COMBINABLE_ASSEMBLY_STATS]
+        for c, names in resolved.items()}
+    combinable = {c: names for c, names in combinable.items() if names}
+    plain = {c: [n for n in names if n not in COMBINABLE_ASSEMBLY_STATS]
+        for c, names in resolved.items()}
+    plain = {c: names for c, names in plain.items() if names}
+    #
+    frames:List[DataFrame] = []
+    if combinable:
+        salted = df.withColumn(
+            "__asalt", pmod(spark_hash(col(id_column)), lit(salt_buckets))
+        ).withColumn("__aw", weight)
+        partial_aggs:List[Column] = [count(lit(1)).alias("__size")]
+        # Denominador de weighted_mean: Σw sobre TODAS las filas del grupo —
+        # incluidas las de valor nulo (misma semántica que `weighted_mean`).
+        if any("weighted_mean" in names for names in combinable.values()):
+            partial_aggs.append(spark_sum(col("__aw")).alias("__w"))
+        for column, names in combinable.items():
+            value = col(column)
+            partial_aggs += [
+                count(value).alias(f"__n_{column}"),
+                spark_sum(value).alias(f"__s_{column}"),
+            ]
+            if any(n in names for n in ("std",)):
+                partial_aggs.append(
+                    spark_sum(value * value).alias(f"__s2_{column}"))
+            if "min" in names:
+                partial_aggs.append(spark_min(value).alias(f"__min_{column}"))
+            if "max" in names:
+                partial_aggs.append(spark_max(value).alias(f"__max_{column}"))
+            if "weighted_mean" in names:
+                partial_aggs.append(
+                    spark_sum(value * col("__aw")).alias(f"__sw_{column}"))
+        partials = salted.groupBy(group_column, "__asalt").agg(*partial_aggs)
+        #
+        merges:List[Column] = [spark_sum("__size").alias("__size")]
+        if "__w" in partials.columns:
+            merges.append(spark_sum("__w").alias("__w"))
+        for column in combinable:
+            merges += [spark_sum(f"__n_{column}").alias(f"__n_{column}"),
+                       spark_sum(f"__s_{column}").alias(f"__s_{column}")]
+            if f"__s2_{column}" in partials.columns:
+                merges.append(spark_sum(f"__s2_{column}").alias(f"__s2_{column}"))
+            if f"__min_{column}" in partials.columns:
+                merges.append(spark_min(f"__min_{column}").alias(f"__min_{column}"))
+            if f"__max_{column}" in partials.columns:
+                merges.append(spark_max(f"__max_{column}").alias(f"__max_{column}"))
+            if f"__sw_{column}" in partials.columns:
+                merges.append(
+                    spark_sum(f"__sw_{column}").alias(f"__sw_{column}"))
+        grouped = partials.groupBy(group_column).agg(*merges)
+        #
+        finals:List[Column] = [col(group_column)]
+        for column, names in combinable.items():
+            for name in names:
+                out = _assembly_output_name(name, column, resolved[column])
+                if name == "count":
+                    finals.append(col(f"__n_{column}").alias(out))
+                elif name == "sum":
+                    finals.append(col(f"__s_{column}").alias(out))
+                elif name == "min":
+                    finals.append(col(f"__min_{column}").alias(out))
+                elif name == "max":
+                    finals.append(col(f"__max_{column}").alias(out))
+                elif name == "mean":
+                    finals.append(
+                        (col(f"__s_{column}") / col(f"__n_{column}"))
+                        .alias(out))
+                elif name == "std":
+                    variance = ((col(f"__s2_{column}")
+                        - col(f"__s_{column}")**2 / col(f"__n_{column}"))
+                        / (col(f"__n_{column}") - 1))
+                    finals.append(
+                        coalesce(sqrt(variance), lit(0.0)).alias(out))
+                elif name == "weighted_mean":
+                    finals.append(
+                        (col(f"__sw_{column}") / col("__w")).alias(out))
+        frames.append(grouped.select(*finals))
+    #
+    if plain:
+        plain_aggs:List[Column] = []
+        for column, names in plain.items():
+            for name in names:
+                expression = ASSEMBLY_AGGREGATION_FUNCTIONS[name](
+                    column, weight)
+                plain_aggs.append(
+                    expression.alias(
+                        _assembly_output_name(name, column, resolved[column])))
+        frames.append(df.groupBy(group_column).agg(*plain_aggs))
+    #
+    # node_count: nº de ids distintos por llave, vía distinct en dos etapas.
+    if id_column is not None:
+        node_counts = (df.select(group_column, id_column).distinct()
+            .groupBy(group_column)
+            .agg(count(lit(1)).alias("node_count")))
+        frames.append(node_counts)
+    #
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.join(frame, on=group_column, how="outer")
+    return result
 
 
 def explode_array_column(df:DataFrame, column:str, explode_into:Optional[str] = None) -> DataFrame:

@@ -127,3 +127,85 @@ class TestResolveGroupByExpressions:
         features = select_group_by_features(["mean"])
         with pytest.raises(ValueError, match="Unknown txn aggregation"):
             resolve_group_by_expressions(["mediana_oper_mto"], features)
+
+
+# ----------------------------------------------------------------------------
+# Salted two-stage group-by (skew)
+# ----------------------------------------------------------------------------
+
+import libs.functions.aggregations as lfa
+
+
+class TestSaltedGroupStats:
+    """Agregación en dos etapas con sal: parciales por (grupo, sal) -> merge."""
+
+    @pytest.fixture()
+    def skewed_df(self, spark):
+        # grupo "big" con 100 filas (x=0..99), "s1" y "s2" con 1 fila
+        rows = ([(f"n{i}", "big", float(i)) for i in range(100)]
+            + [("m1", "s1", 5.0), ("m2", "s2", 7.0)])
+        return spark.createDataFrame(rows, ["id", "grp", "x"])
+
+    def test_split_stats_by_combinable(self):
+        from pyspark.sql.functions import (mean as spark_mean,
+            count as spark_count, percentile_approx)
+        stats = {"mean": spark_mean,
+                 "median": lambda c: percentile_approx(col(c), 0.5),
+                 "count": spark_count}
+        combinable, other = lfa.split_stats_by_combinable(stats)
+        assert set(combinable) == {"mean", "count"}
+        assert set(other) == {"median"}
+
+    def test_salted_matches_plain(self, skewed_df):
+        """La vía salteada produce los mismos stats que un groupBy directo."""
+        from pyspark.sql.functions import (count as spark_count,
+            sum as spark_sum, mean as spark_mean, stddev as spark_std,
+            min as spark_min, max as spark_max, lit)
+        stats = {"count": spark_count, "sum": spark_sum, "mean": spark_mean,
+                 "std": spark_std, "min": spark_min, "max": spark_max}
+        plain = (skewed_df.groupBy("grp")
+            .agg(*[f(col("x")).alias(f"{n}_x") for n, f in stats.items()],
+                 spark_count(lit(1)).alias("size")))
+        salted = lfa.merge_salted_stats(
+            lfa.salted_partial_stats(skewed_df, "grp", ["x"], salt_buckets=8),
+            "grp", ["x"], list(stats), size_column="size")
+        plain_rows = {r["grp"]: r.asDict() for r in plain.collect()}
+        salted_rows = {r["grp"]: r.asDict() for r in salted.collect()}
+        for grp, expected in plain_rows.items():
+            actual = salted_rows[grp]
+            for key, value in expected.items():
+                if isinstance(value, float):
+                    assert actual[key] == pytest.approx(value, rel=1e-9)
+                else:
+                    assert actual[key] == value
+
+    def test_salt_deterministic_and_bounded(self, skewed_df):
+        """La sal reparte un grupo gigante en exactamente salt_buckets filas."""
+        partials = lfa.salted_partial_stats(
+            skewed_df, "grp", ["x"], salt_buckets=8)
+        big_parts = partials.where(col("grp") == "big")
+        assert big_parts.count() == 8          # el grupo grande se reparte
+        sizes = [r["__size"] for r in big_parts.collect()]
+        assert sum(sizes) == 100               # todas las filas contadas
+
+    def test_stats_chunk_key_stable_and_sensitive(self):
+        k1 = lfa.stats_chunk_key("component_id", ["x", "y"], ["mean"])
+        k2 = lfa.stats_chunk_key("component_id", ["x", "y"], ["mean"])
+        k3 = lfa.stats_chunk_key("component_id", ["x"], ["mean"])
+        assert k1 == k2 and k1 != k3
+
+
+class TestPlainGroupStats:
+    def test_median_and_size(self, spark):
+        from pyspark.sql.functions import percentile_approx
+        df = spark.createDataFrame(
+            [("a", 1.0), ("a", 2.0), ("a", 3.0), ("b", 9.0)],
+            ["grp", "x"])
+        result = lfa.plain_group_stats(
+            df, "grp", ["x"],
+            {"median": lambda c: percentile_approx(col(c), 0.5)},
+            size_column="size")
+        rows = {r["grp"]: r for r in result.collect()}
+        assert rows["a"]["size"] == 3
+        assert rows["a"]["median_x"] == pytest.approx(2.0)
+        assert rows["b"]["median_x"] == pytest.approx(9.0)
