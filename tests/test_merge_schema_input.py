@@ -18,7 +18,9 @@ pytestmark = pytest.mark.spark
 from libs.data_engineering_toolbox.path import HivePath
 from pipelines.features.vector_assembler import StandardVectorAssemblerSubStep
 
-TEST_MODE = os.environ.get("APP_TEST_MODE", "local")
+TEST_MODE = (os.environ.get("APP_TEST_MODE")
+             or os.environ.get("APP_MODE") or "unix").lower()
+_IS_CLUSTER = TEST_MODE in ("cluster", "hdfs")
 
 
 @pytest.fixture()
@@ -26,10 +28,10 @@ def real_listparquets(monkeypatch):
     """Registra los leaves escritos; en local parchea el listparquets de HDFS.
 
     Devuelve una lista mutable: los tests añaden sus leaves y el monkeypatch
-    los sirve. En modo "cluster" no se parchea nada (HDFS real).
+    los sirve. En modo "cluster"/"hdfs" no se parchea nada (HDFS real).
     """
     leaves = []
-    if TEST_MODE == "local":
+    if not _IS_CLUSTER:
         monkeypatch.setattr(HivePath, "listparquets",
             lambda self, recursive=True, sorted_by_time=False: iter(leaves))
     return leaves

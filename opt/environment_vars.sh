@@ -5,117 +5,53 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 # =============================================================================
-# environment_vars.sh — plantilla de variables de entorno del framework.
+# environment_vars.sh — SELECTOR de entorno por plataforma.
 #
-# Ajusta los valores a tu cluster. Convención de nombres:
-#   APP_*      parámetros/propios de la aplicación
-#   PYSPARK_*  configuración de la sesión Spark (los lee SparkSessionBuilder)
-#   VENV_*     virtualenv empaquetado con conda-pack
+# No define variables: delega en el fichero específico del modo:
+#
+#   APP_MODE=cluster|hdfs  -> environment_vars.cluster.sh (YARN + HDFS)
+#   APP_MODE=wsl           -> environment_vars.wsl.sh     (unix + overrides)
+#   APP_MODE=unix          -> environment_vars.unix.sh    (local POSIX)
+#   APP_MODE=windows       -> (no aplica — Windows no ejecuta bash; el modo
+#                             windows no necesita env file, los defaults de
+#                             código/conftest bastan)
+#
+# Sin APP_MODE: autodetección — si el kernel reporta "microsoft"/"wsl" se
+# usa WSL; si no, **unix (default)**. El cluster NUNCA es el default: hay
+# que pedirlo explícitamente con APP_MODE=cluster|hdfs.
+#
+# Uso:
+#   source opt/environment_vars.sh            # wsl o unix (autodetect)
+#   APP_MODE=cluster source opt/environment_vars.sh
 # =============================================================================
 
-# Parameters
-export APP_HIVE_DATABASE="your_hive_database"
+_CURRENT_SCRIPT_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
 
-# Paths
-CURRENT_SCRIPT_DIR_LINUX=$(dirname "$(realpath "$0")")
-export TESTING_DIR_LINUX=$(realpath "$CURRENT_SCRIPT_DIR_LINUX/../..")
-export LOGS_DIR_LINUX="${TESTING_DIR_LINUX}/logs"
-export APP_TMP_DIR_LINUX=$(realpath "$TESTING_DIR_LINUX/tmp/tests")
+_detect_mode() {
+    if [ -n "${APP_MODE}" ]; then
+        echo "${APP_MODE}"
+        return
+    fi
+    # WSL: el release del kernel contiene "microsoft" o "WSL".
+    if uname -r 2>/dev/null | grep -qi "microsoft\|wsl"; then
+        echo "wsl"
+    else
+        echo "unix"
+    fi
+}
 
-export APP_WORKSPACE_DIR_LINUX=$(realpath "$CURRENT_SCRIPT_DIR_LINUX/..")
-
-# PYSPARK
-
-# Parameters
-export PYSPARK_PORT=4040
-export PYSPARK_QUEUE="default"
-
-# Paths (ajusta a las rutas de tu distribución Hadoop/Spark)
-export JAVA_HOME="/usr/java/default"
-export SPARK_HOME="/opt/cloudera/parcels/SPARK3/lib/spark3"
-export PYLIB="${SPARK_HOME}/python/lib"
-export HADOOP_CONF_DIR="/etc/hadoop/conf"
-export HIVE_CONF_DIR="/etc/hive/conf"
-export PYSPARK_PYTHON="python"
-export PYSPARK_DRIVER_PYTHON="${PYSPARK_PYTHON}"
-
-export PYSPARK_TMP_DIR_HDFS="/user/${USER}/spark_app/tmp"
-export PYSPARK_STAGING_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/spark_staging"
-export PYSPARK_LOGS_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/spark_logs"
-export PYSPARK_WAREHOUSE_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/warehouse"
-export PYSPARK_CHECKPOINTS_DIR_HDFS="${PYSPARK_TMP_DIR_HDFS}/checkpoints"
-
-export APP_WORKSPACE_DIR_HDFS="/user/${USER}/spark_app"
-export APP_TMP_TESTS_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/tests"
-export APP_CHECKPOINT_BASE_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/checkpoints"
-export APP_STAGING_BASE_DIR_HDFS="${APP_WORKSPACE_DIR_HDFS}/tmp/staging"
-export APP_WAREHOUSE_DIR_HDFS="/user/${USER}/hive"
-
-# VIRTUAL ENVIRONMENT
-
-# Parameters
-export APP_NAME="spark-app"
-export VENV_NAME="spark-app"
-export APP_TODAY="$(date '+%Y-%m-%d')"
-
-# Paths
-export MINIFORGE_DIR_LINUX="${HOME}/miniforge"
-export CONDA_LINUX="${MINIFORGE_DIR_LINUX}/bin/conda"
-
-export VENV_TAR_GZ_PARENT_DIR_LINUX="${APP_WORKSPACE_DIR_LINUX}/tmp"
-export VENV_TAR_GZ_PARENT_DIR_HDFS="/tmp/spark/env"
-
-export VENV_TAR_GZ_LINUX="${VENV_TAR_GZ_PARENT_DIR_LINUX}/${VENV_NAME}.tar.gz"
-export PYSPARK_VENV_TAR_GZ_HDFS="${VENV_TAR_GZ_PARENT_DIR_HDFS}/${VENV_NAME}.tar.gz"
-
-# Jars extra para la sesión (p.ej. graphframes). Lista separada por comas en HDFS.
-export EXTRA_JAR_LINUX="${APP_WORKSPACE_DIR_LINUX}/jars/graphframes-0.8.1-spark3.0-s_2.12.jar"
-export EXTRA_JAR_PARENT_DIR_HDFS="/tmp/spark/jars"
-export PYSPARK_JARS_HDFS="${EXTRA_JAR_PARENT_DIR_HDFS}/graphframes-0.8.1-spark3.0-s_2.12.jar"
-
-# Parameters
-
-PATH_VARS=(
-    CURRENT_SCRIPT_DIR_LINUX
-    TESTING_DIR_LINUX
-    LOGS_DIR_LINUX
-    APP_TMP_DIR_LINUX
-    APP_WORKSPACE_DIR_LINUX
-    MINIFORGE_DIR_LINUX
-    VENV_TAR_GZ_PARENT_DIR_LINUX
-)
-
-for var in "${PATH_VARS[@]}"; do
-    echo "$var: ${!var}"
-    mkdir -p "${!var}"
-done
-
-INFO_VARS=(
-    APP_TODAY
-    APP_NAME
-    VENV_NAME
-    VENV_TAR_GZ_PARENT_DIR_HDFS
-    CONDA_LINUX
-)
-
-for var in "${INFO_VARS[@]}"; do
-    echo "$var: ${!var}"
-done
-
-HIVE_DIR_VARS=(
-    PYSPARK_TMP_DIR_HDFS
-    PYSPARK_STAGING_DIR_HDFS
-    PYSPARK_LOGS_DIR_HDFS
-    PYSPARK_WAREHOUSE_DIR_HDFS
-    PYSPARK_CHECKPOINTS_DIR_HDFS
-    APP_WORKSPACE_DIR_HDFS
-    APP_TMP_TESTS_DIR_HDFS
-    APP_STAGING_BASE_DIR_HDFS
-    APP_WAREHOUSE_DIR_HDFS
-    EXTRA_JAR_PARENT_DIR_HDFS
-)
-
-for var in "${HIVE_DIR_VARS[@]}"; do
-    echo "$var: ${!var}"
-    # hdfs dfs -mkdir -p "${!var}"
-done
+case "$(_detect_mode | tr '[:upper:]' '[:lower:]')" in
+    cluster|hdfs)
+        source "${_CURRENT_SCRIPT_DIR}/environment_vars.cluster.sh"
+        ;;
+    wsl)
+        source "${_CURRENT_SCRIPT_DIR}/environment_vars.wsl.sh"
+        ;;
+    unix|local)
+        source "${_CURRENT_SCRIPT_DIR}/environment_vars.unix.sh"
+        ;;
+    *)
+        echo "environment_vars.sh: APP_MODE='${APP_MODE}' desconocido; usando unix" >&2
+        source "${_CURRENT_SCRIPT_DIR}/environment_vars.unix.sh"
+        ;;
+esac

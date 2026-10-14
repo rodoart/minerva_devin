@@ -2,10 +2,6 @@ import re
 import unicodedata
 from typing import Union
 
-import re
-import unicodedata
-from typing import Union
-
 Sanitizable = Union[str, int, float, bool, None]
 
 

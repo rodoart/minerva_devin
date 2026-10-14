@@ -13,7 +13,7 @@ data_engineering_coe.git
 """
 # !/usr/bin/env python
 from subprocess import Popen, PIPE
-import regex as re
+import re
 from typing import List, Union, Iterable
 from os.path import join
 from datetime import datetime

@@ -1,13 +1,15 @@
 """Fixtures compartidas de la suite de tests del framework.
 
-Modo de ejecución (variable `APP_TEST_MODE`):
-- `"local"` (default): SparkSession local[2], rutas temporales en `tmp_path`
-  del filesystem local y `PYLIB` dummy. Corre sin cluster.
-- `"cluster"`: `SparkSessionBuilder()` (sesión YARN real) y `tmp_hdfs` sobre
-  HDFS (`APP_TMP_TESTS_DIR_HDFS`). Requiere `opt/environment_vars.sh`.
+Modo de ejecución (variables `APP_TEST_MODE`/`APP_MODE`):
+- `"unix"` (**default**), `"windows"`, `"wsl"`, `"local"` (alias legacy):
+  SparkSession local[2], rutas temporales en `tmp_path` del filesystem local
+  y `PYLIB` dummy. Corre sin cluster.
+- `"cluster"`/`"hdfs"`: `SparkSessionBuilder()` (sesión YARN real) y
+  `tmp_hdfs` sobre HDFS (`APP_TMP_TESTS_DIR_HDFS`). Requiere
+  `opt/environment_vars.sh` (o `environment_vars.cluster.sh`).
 
 Fixtures:
-- `spark`: SparkSession (local[2] en modo local, YARN en modo cluster).
+- `spark`: SparkSession (local[2] en modos locales, YARN en cluster).
 - `graphframes`: verifica que GraphFrame se puede instanciar.
 - `tmp_hdfs`: directorio temporal — `tmp_path` en local, HivePath en cluster.
 - `checkpoint_dir`: directorio de checkpoint bajo `tmp_hdfs`.
@@ -18,9 +20,11 @@ import sys
 
 import pytest
 
-TEST_MODE = os.environ.get("APP_TEST_MODE", "local")
+TEST_MODE = (os.environ.get("APP_TEST_MODE")
+             or os.environ.get("APP_MODE") or "unix").lower()
+_IS_CLUSTER = TEST_MODE in ("cluster", "hdfs")
 
-if TEST_MODE == "local":
+if not _IS_CLUSTER:
     # libs.data_engineering_toolbox.__init__ inserta en sys.path los zips de
     # pyspark del cluster leyendo PYLIB; en local basta un path dummy.
     os.environ.setdefault("PYLIB", "/dev/null")
@@ -37,7 +41,7 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def spark():
-    if TEST_MODE == "local":
+    if not _IS_CLUSTER:
         pytest.importorskip("pyspark")
         from pyspark.sql import SparkSession
         session = (SparkSession.builder
@@ -60,7 +64,7 @@ def graphframes(spark):
     """SparkSession con GraphFrames verificado (salta si el jar no está)."""
     from graphframes import GraphFrame
     from pyspark.sql import Row
-    if TEST_MODE == "local":
+    if not _IS_CLUSTER:
         pytest.importorskip("graphframes")
         try:
             v = spark.createDataFrame([Row(id="a")])
@@ -79,10 +83,10 @@ def graphframes(spark):
 def tmp_hdfs(tmp_path):
     """Directorio temporal para tests que escriben parquets.
 
-    - modo "local": `tmp_path` de pytest (filesystem local).
-    - modo "cluster": HivePath de `APP_TMP_TESTS_DIR_HDFS`.
+    - modos locales (unix/windows/wsl): `tmp_path` de pytest.
+    - modo "cluster"/"hdfs": HivePath de `APP_TMP_TESTS_DIR_HDFS`.
     """
-    if TEST_MODE == "local":
+    if not _IS_CLUSTER:
         return tmp_path
     from libs.data_engineering_toolbox.path import HivePath
     return HivePath(os.environ.get("APP_TMP_TESTS_DIR_HDFS"))
@@ -105,51 +109,16 @@ def df_factory(spark):
 
 @pytest.fixture()
 def local_hdfs(monkeypatch):
-    """Redirige `libs.data_engineering_toolbox.path` al filesystem local.
+    """Fuerza el backend local de `libs.data_engineering_toolbox.path`.
 
-    Parchea las primitivas HDFS (`_ls`, `exists`, `is_dir`, ...) para que los
-    decoradores de particionado del framework funcionen sobre `tmp_path` en
-    modo "local". En modo "cluster" no parchea nada.
+    Exporta ``APP_FS_MODE`` con el modo de la plataforma actual
+    (`windows`/`wsl`/`unix`): las funciones del módulo (`exists`, `_ls`,
+    `is_dir`, `mkdir`, ...) despachan entonces a ``path.local`` (filesystem
+    real) y `HivePath`/`UniversalPath` funcionan sobre `tmp_path` sin
+    parcheos. En modo "cluster"/"hdfs" no hace nada.
     """
-    if TEST_MODE != "local":
+    if _IS_CLUSTER:
         return None
-    import shutil
-    from datetime import datetime
-    from pathlib import Path
     import libs.data_engineering_toolbox.path as pm
-
-    def _local_ls(path, *args):
-        base = Path(path)
-        if not base.exists():
-            return []
-        it = base.rglob("*") if "-R" in args else base.glob("*")
-        entries = []
-        for p in sorted(it):
-            if not p.exists():
-                continue
-            st = p.stat()
-            entries.append({
-                "file_type": "d" if p.is_dir() else "-",
-                "permissions": "drwxrwxrwx" if p.is_dir() else "-rw-r--r--",
-                "copies": "1", "user": "u", "group": "g",
-                "size": str(st.st_size),
-                "date_and_time": datetime.fromtimestamp(st.st_mtime),
-                "path": p.as_posix(),
-            })
-        return entries
-
-    monkeypatch.setattr(pm, "_ls", _local_ls)
-    monkeypatch.setattr(pm, "exists", lambda p: Path(p).exists())
-    monkeypatch.setattr(pm, "is_dir", lambda p: Path(p).is_dir())
-    monkeypatch.setattr(pm, "is_file", lambda p: Path(p).is_file())
-    monkeypatch.setattr(
-        pm, "mkdir", lambda p, *a: Path(p).mkdir(parents=True, exist_ok=True))
-
-    def _touch(p):
-        Path(p).parent.mkdir(parents=True, exist_ok=True)
-        Path(p).touch()
-    monkeypatch.setattr(pm, "touch", _touch)
-    monkeypatch.setattr(pm, "rmdir",
-        lambda p, *a: shutil.rmtree(p, ignore_errors=True))
-    monkeypatch.setattr(pm, "mv", lambda s, d: shutil.move(str(s), str(d)))
+    monkeypatch.setenv("APP_FS_MODE", pm.os_mode())
     return pm

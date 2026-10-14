@@ -10,8 +10,6 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("numpy")  # el módulo importa `from numpy import True_`
-
 _mod_path = (Path(__file__).resolve().parents[1]
     / "libs" / "data_engineering_toolbox" / "context" / "logging.py")
 _spec = importlib.util.spec_from_file_location("framework_logging", _mod_path)
@@ -65,6 +63,48 @@ class TestSetupLogging:
         for handler in logging.getLogger("app").handlers:
             handler.flush()
         assert "hola-app-test" in log_file.read_text()
+
+
+class TestLogFileResolution:
+    """Resolución del .log por variables de entorno (consola + archivo)."""
+
+    def test_app_log_file_env(self, tmp_path, monkeypatch):
+        log_file = tmp_path / "env_test.log"
+        monkeypatch.setenv("APP_LOG_FILE", str(log_file))
+        monkeypatch.delenv("LOGS_DIR_LINUX", raising=False)
+        resolved = setup_logging(level="INFO", force_reload=True)
+        assert resolved == str(log_file)
+        get_logger("app").info("via-env")
+        logging.getLogger("app").handlers[-1].flush()
+        assert "via-env" in log_file.read_text()
+
+    def test_logs_dir_linux_env(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("APP_LOG_FILE", raising=False)
+        monkeypatch.setenv("LOGS_DIR_LINUX", str(tmp_path))
+        monkeypatch.setenv("APP_NAME", "mi_app")
+        resolved = setup_logging(level="INFO", force_reload=True)
+        assert resolved is not None
+        assert resolved.startswith(tmp_path.as_posix())
+        assert "mi_app_" in resolved and resolved.endswith(".log")
+
+    def test_off_disables_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APP_LOG_FILE", "off")
+        monkeypatch.setenv("LOGS_DIR_LINUX", str(tmp_path))
+        assert setup_logging(level="INFO", force_reload=True) is None
+
+    def test_no_env_no_file(self, monkeypatch):
+        monkeypatch.delenv("APP_LOG_FILE", raising=False)
+        monkeypatch.delenv("LOGS_DIR_LINUX", raising=False)
+        assert setup_logging(level="INFO", force_reload=True) is None
+
+    def test_console_and_file_both_emit(self, tmp_path, monkeypatch, capsys):
+        log_file = tmp_path / "both.log"
+        monkeypatch.setenv("APP_LOG_FILE", str(log_file))
+        setup_logging(level="INFO", force_reload=True)
+        get_logger("app").info("doble-salida")
+        logging.getLogger("app").handlers[-1].flush()
+        assert "doble-salida" in capsys.readouterr().out
+        assert "doble-salida" in log_file.read_text()
 
 
 class TestLogMethod:

@@ -193,7 +193,7 @@ class TestMain:
         monkeypatch.setattr(supervisor, "MAX_RESTARTS", 1)
         assert supervisor.main() == 1
 
-    def test_restarts_and_eventually_succeeds(self, monkeypatch, tmp_path, capsys):
+    def test_restarts_and_eventually_succeeds(self, monkeypatch, tmp_path, caplog):
         """Primer intento muere, segundo funciona: el supervisor reanuda solo."""
         marker = tmp_path / "already_ran"
         script = tmp_path / "flaky.py"
@@ -209,7 +209,9 @@ class TestMain:
         monkeypatch.setattr(supervisor, "COMMAND", f"{sys.executable} {script}")
         monkeypatch.setattr(supervisor, "MAX_RESTARTS", 3)
         assert supervisor.main() == 0
-        assert "Reinicio 1/3" in capsys.readouterr().out
+        # caplog captura los records del logger del supervisor
+        # (los handlers stdout se ligaron en import, antes del capture)
+        assert "Reinicio 1/3" in caplog.text
 
     def test_zombie_death_also_counts_as_restart(self, monkeypatch):
         """Un hijo zombie consume un reinicio igual que una muerte normal."""
@@ -232,7 +234,9 @@ class TestRunSupervisedScript:
         script = os.path.join(
             os.path.dirname(supervisor.__file__), "opt", "run-supervised.sh")
         assert os.path.isfile(script)
-        subprocess.run(["bash", "-n", script], check=True)
+        # cwd + basename: git-bash en Windows no entiende 'D:\...' ni 'D:/...'
+        subprocess.run(["bash", "-n", "run-supervised.sh"], check=True,
+                       cwd=os.path.dirname(script))
 
     def test_script_loads_env_and_execs_supervisor(self):
         script = os.path.join(
@@ -240,3 +244,24 @@ class TestRunSupervisedScript:
         content = open(script).read()
         assert "environment_vars.sh" in content
         assert "supervisor.py" in content
+
+
+# ----------------------------------------------------------------------------
+# Wrapper opt/run.sh (modo SIN supervisor)
+# ----------------------------------------------------------------------------
+
+class TestRunScript:
+    def test_script_syntax_ok(self):
+        script = os.path.join(
+            os.path.dirname(supervisor.__file__), "opt", "run.sh")
+        assert os.path.isfile(script)
+        subprocess.run(["bash", "-n", "run.sh"], check=True,
+                       cwd=os.path.dirname(script))
+
+    def test_script_loads_env_and_runs_main(self):
+        script = os.path.join(
+            os.path.dirname(supervisor.__file__), "opt", "run.sh")
+        content = open(script).read()
+        assert "environment_vars.sh" in content
+        assert "APP_MAIN_SCRIPT" in content
+        assert "supervisor.py" not in content

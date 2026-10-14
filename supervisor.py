@@ -23,17 +23,25 @@ El progreso por Step se infiere del stdout del hijo (los mensajes
 cambios en el pipeline.
 
 Env vars:
-    SUPERVISOR_COMMAND           comando a vigilar          (default "python main.py")
+    SUPERVISOR_COMMAND           comando a vigilar
+                                 (default "$PYSPARK_DRIVER_PYTHON $APP_MAIN_SCRIPT")
     SUPERVISOR_STEP_TIMEOUT      seg. máx. en el mismo Step (default 7200)
     SUPERVISOR_STALL_TIMEOUT     seg. sin progreso de tareas para declarar zombie (600)
     SUPERVISOR_WATCHDOG_INTERVAL periodo del watchdog en seg. (30)
     SUPERVISOR_MAX_RESTARTS      reinicios antes de rendirse (10)
     PYSPARK_PORT              puerto de la Spark UI      (4040)
 
+Los logs del supervisor y del hijo pasan por la suite de logging del
+framework (``libs.data_engineering_toolbox.context.logging``): consola +
+archivo ``.log`` bajo ``LOGS_DIR_LINUX`` cuando
+``opt/environment_vars.sh`` está cargado.
+
 Uso:
     source opt/environment_vars.sh && python supervisor.py
-    # o: opt/run-supervised.sh
+    # o: opt/run-supervised.sh   (supervisado)
+    # o: opt/run.sh              (sin supervisor)
 """
+import importlib.util
 import json
 import os
 import re
@@ -44,7 +52,36 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _THIS_DIR)
+
+
+def _load_module(name: str, *relparts: str):
+    """Carga un módulo del framework por ruta sin arrastrar los ``__init__``
+    de los paquetes (que importan pyspark y exigen ``PYLIB``)."""
+    mod_path = os.path.join(_THIS_DIR, *relparts)
+    spec = importlib.util.spec_from_file_location(name, mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_log_suite = _load_module(
+    "framework_logging",
+    "libs", "data_engineering_toolbox", "context", "logging.py")
+setup_logging = _log_suite.setup_logging
+get_logger = _log_suite.get_logger
+
+# Manejo de paths y plataforma con la suite del framework: LocalPath
+# (filesystem local — los .log del driver lo son también en el clúster)
+# y os_mode() ("unix" default | "wsl" | "windows").
+_path_local = _load_module(
+    "framework_path_local",
+    "libs", "data_engineering_toolbox", "path", "local.py")
+LocalPath = _path_local.LocalPath
+os_mode = _path_local.os_mode
+_IS_WINDOWS = os_mode() == "windows"
 
 STEP_START_RE = re.compile(r"Executing step:\s*(\S+)")
 STEP_DONE_RE = re.compile(r"Step finished:\s*(\S+)")
@@ -57,16 +94,23 @@ def _env_seconds(name: str, default: float) -> float:
         return default
 
 
-COMMAND = os.environ.get("SUPERVISOR_COMMAND", "python main.py")
+COMMAND = os.environ.get("SUPERVISOR_COMMAND") or (
+    f"{os.environ.get('PYSPARK_DRIVER_PYTHON', 'python')} "
+    f"{os.environ.get('APP_MAIN_SCRIPT', 'examples/main.py')}")
 STEP_TIMEOUT = _env_seconds("SUPERVISOR_STEP_TIMEOUT", 2 * 3600)
 STALL_TIMEOUT = _env_seconds("SUPERVISOR_STALL_TIMEOUT", 600)
 WATCHDOG_INTERVAL = _env_seconds("SUPERVISOR_WATCHDOG_INTERVAL", 30)
 MAX_RESTARTS = int(os.environ.get("SUPERVISOR_MAX_RESTARTS", 10))
 SPARK_UI_PORT = int(os.environ.get("PYSPARK_PORT", 4040))
 
+# Loggers del supervisor: propagan a root -> consola + .log (si
+# LOGS_DIR_LINUX/APP_LOG_FILE están configurados).
+logger = get_logger("supervisor")
+child_logger = get_logger("supervisor.child")
+
 
 def log(msg: str) -> None:
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [supervisor] {msg}", flush=True)
+    logger.info("%s", msg)
 
 
 class PipelineMonitor:
@@ -148,36 +192,53 @@ def is_zombie(monitor: PipelineMonitor) -> bool:
 
 
 def _drain_stdout(proc: subprocess.Popen, monitor: PipelineMonitor) -> None:
+    """Copia el stdout del hijo al log del supervisor (consola + .log) y
+    alimenta el monitor de progreso por Step."""
     for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+        line = line.rstrip("\n")
+        child_logger.info("%s", line)
         monitor.feed_line(line)
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+    except (ProcessLookupError, AttributeError, PermissionError):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        except (ProcessLookupError, AttributeError, PermissionError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 def run_child(monitor: PipelineMonitor) -> int:
     """Lanza el hijo y lo vigila; devuelve su exit code o -9 si se mató por zombie."""
     env = dict(os.environ, PYTHONUNBUFFERED="1")
+    if _IS_WINDOWS:
+        # shlex POSIX se comería los "\" de las rutas Windows; posix=False
+        # conserva la ruta y las comillas (se quitan después — CreateProcess
+        # ya recibe argv, no vuelve a parsear)
+        child_args = [a.strip("'\"") for a in shlex.split(COMMAND, posix=False)]
+    else:
+        # unix / wsl: shlex POSIX normal
+        child_args = shlex.split(COMMAND)
     proc = subprocess.Popen(
-        shlex.split(COMMAND),
+        child_args,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
-        start_new_session=True,   # grupo de procesos propio: killpg mata el árbol
+        # grupo de procesos propio: killpg mata el árbol (unix/wsl)
+        start_new_session=(not _IS_WINDOWS),
     )
     threading.Thread(target=_drain_stdout, args=(proc, monitor), daemon=True).start()
     while proc.poll() is None:

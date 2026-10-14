@@ -76,7 +76,9 @@ def build_pipeline(spark):
 
 def main() -> int:
     args = parse_args()
-    setup_logging(level="INFO", force_reload=True)
+    log_path = setup_logging(level="INFO", force_reload=True)
+    if log_path:
+        logger.info("logging a archivo: %s", log_path)
 
     spark = build_spark(local=args.local)
     last_step = build_pipeline(spark)

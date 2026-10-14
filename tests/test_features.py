@@ -9,7 +9,7 @@ import pytest
 pytest.importorskip("pyspark")
 
 from pyspark.sql.functions import (sum as spark_sum,
-    mean as spark_mean)
+    max as spark_max, mean as spark_mean)
 
 import libs.functions.features as lff
 

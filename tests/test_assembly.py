@@ -106,7 +106,10 @@ class TestBuildAggregationExpressions:
         assert {"mean_feat", "median_feat", "std_feat"} <= set(result.columns)
         row = [r for r in result.collect() if r["numcliente"] == "c1"][0]
         assert row["mean_feat"] == pytest.approx(15.0)
-        assert row["median_feat"] == pytest.approx(15.0)
+        # "median" es percentile_approx(col, .5): en Spark 3.3 devuelve un
+        # valor OBSERVADO del dataset (sin interpolación) — para {10, 20}
+        # cualquiera de los dos extremos es un resultado válido.
+        assert row["median_feat"] in (10.0, 20.0)
         # stddev muestral de {10, 20} = sqrt(50)
         assert row["std_feat"] == pytest.approx(7.0710678118654755)
 

@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Artefactos del modo local (unix/wsl): logs, tmp, JRE y venv locales
+logs/
+tmp/
+.local/
+.venv/

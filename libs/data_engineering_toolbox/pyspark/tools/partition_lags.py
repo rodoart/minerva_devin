@@ -516,9 +516,12 @@ class SparkTwoPartitionMonthlyInterval(SparkTwoPartition):
             df[self.process_date_column] = df[self.information_date_column]
         #
 
-        # rango de fechas
-        min_date = df[self.information_date_column].min()
-        max_date = df[self.information_date_column].max()
+        # rango de fechas (los límites se bajan a inicio de mes: con
+        # freq='MS' un start que no cae a día 1 excluye su propio mes)
+        min_date = pd.Timestamp(
+            df[self.information_date_column].min()).to_period('M').to_timestamp()
+        max_date = pd.Timestamp(
+            df[self.information_date_column].max()).to_period('M').to_timestamp()
         #
         # Generar un rango de meses sin huecos
         date_range = pd.date_range(start=min_date, end=max_date, freq='MS').strftime("%Y-%m").tolist()
@@ -560,9 +563,11 @@ class SparkTwoPartitionMonthlyInterval(SparkTwoPartition):
         # Obtener el rango actual de meses en el DataFrame
         current_months = pd.to_datetime(df['months'])
         #
-        # Determinar el nuevo rango de meses considerando el intervalo proporcionado
-        min_date = min(current_months.min(), start_date)
-        max_date = max(current_months.max(), end_date)
+        # Determinar el nuevo rango de meses considerando el intervalo
+        # proporcionado (límites bajados a inicio de mes: ver
+        # _generate_partitions_pd_dataframe)
+        min_date = min(current_months.min(), start_date).to_period('M').to_timestamp()
+        max_date = max(current_months.max(), end_date).to_period('M').to_timestamp()
         #
         # Generar un rango de meses sin huecos desde min_date hasta max_date
         date_range = pd.date_range(start=min_date, end=max_date, freq='MS').strftime("%Y-%m").tolist()

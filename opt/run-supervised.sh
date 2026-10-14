@@ -16,6 +16,9 @@
 #
 # Uso:
 #   ./opt/run-supervised.sh
+#   nohup ./opt/run-supervised.sh > /dev/null 2>&1 &
+#
+# Para ejecutar SIN supervisor: ./opt/run.sh
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -25,4 +28,4 @@ WORKSPACE="$(dirname "${SCRIPT_DIR}")"
 source "${SCRIPT_DIR}/environment_vars.sh"
 
 cd "${WORKSPACE}"
-exec python "${WORKSPACE}/supervisor.py" "$@"
+exec ${PYSPARK_DRIVER_PYTHON:-python} "${WORKSPACE}/supervisor.py" "$@"

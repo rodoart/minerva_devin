@@ -12,10 +12,107 @@ from fnmatch import fnmatch
 from typing import Optional, Dict, Callable, Union
 from operator import itemgetter
 from multiprocessing.pool import ThreadPool
+import os
+import re
+import shutil
 import sys
 
 
-from .hdfs import mkdir, exists, _ls, is_dir, is_file, touch, rmdir, mv, hdfs_command
+from . import hdfs as _hdfs
+from . import local as _local
+from .local import LocalPath, os_mode, is_windows, is_wsl
+
+# Compatibilidad: acceso directo al comando hdfs.
+hdfs_command = _hdfs.hdfs_command
+
+
+###############################################################################
+# Selección de backend (HDFS vs filesystem local)
+###############################################################################
+
+#: Valores de modo que fuerzan el backend HDFS.
+HDFS_MODES = ("hdfs", "cluster")
+#: Valores de modo que fuerzan el filesystem local. ``local`` se conserva
+#: como alias legacy; ``windows``/``unix``/``wsl`` son los modos nuevos.
+LOCAL_MODES = ("local", "windows", "unix", "wsl")
+
+
+def _configured_fs_mode() -> str:
+    """Modo forzado por env (``APP_FS_MODE`` > ``APP_MODE``/``APP_TEST_MODE``)."""
+    return (os.environ.get("APP_FS_MODE")
+            or os.environ.get("APP_MODE")
+            or os.environ.get("APP_TEST_MODE") or "").lower()
+
+
+def is_hdfs_path(path) -> bool:
+    """Decide si ``path`` vive en HDFS o en el filesystem local.
+
+    - ``hdfs://...``                     -> HDFS
+    - ``file:...``, ``C:\\...``           -> local
+    - env ``APP_FS_MODE``/``APP_MODE``/``APP_TEST_MODE`` con valor
+      ``hdfs``/``cluster`` -> HDFS; ``windows``/``unix``/``wsl``/``local``
+      -> local
+    - resto: automático — CLI ``hdfs`` disponible y ruta POSIX absoluta
+      -> HDFS; en otro caso -> local.
+    """
+    s = str(path)
+    if s.startswith("hdfs://"):
+        return True
+    if s.startswith("file:") or re.match(r"^[A-Za-z]:[/\\]", s):
+        return False
+    mode = _configured_fs_mode()
+    if mode in HDFS_MODES:
+        return True
+    if mode in LOCAL_MODES:
+        return False
+    return s.startswith("/") and shutil.which("hdfs") is not None
+
+
+def _backend(path):
+    """Módulo backend (``.hdfs`` o ``.local``) para ``path``."""
+    return _hdfs if is_hdfs_path(path) else _local
+
+
+# Wrappers con dispatch: misma firma que las funciones de ``hdfs.py``.
+def test(path: str, *args) -> bool:
+    return _backend(path).test(path, *args)
+
+def exists(path: str, *args) -> bool:
+    return _backend(path).exists(path, *args)
+
+def is_dir(path: str, *args) -> bool:
+    return _backend(path).is_dir(path, *args)
+
+def is_file(path: str, *args) -> bool:
+    return _backend(path).is_file(path, *args)
+
+def _ls(path: str, *args) -> list:
+    return _backend(path)._ls(path, *args)
+
+def list_files(path: str) -> list:
+    return _backend(path).list_files(path)
+
+def is_successful(path: str) -> bool:
+    return _backend(path).is_successful(path)
+
+def obtain_path(path: str, substring: str) -> str:
+    return _backend(path).obtain_path(path, substring)
+
+def mkdir(path: str, *args) -> None:
+    _backend(path).mkdir(path, *args)
+
+def touch(path: str, *args) -> None:
+    _backend(path).touch(path, *args)
+
+def rmdir(path: str, *args) -> None:
+    _backend(path).rmdir(path, *args)
+
+def mv(src: str, dst: str, *args) -> None:
+    _backend(src).mv(src, dst, *args)
+
+def cp(src: str, dst_dir: str, *args) -> None:
+    """Copia ``src`` dentro de ``dst_dir`` (``hdfs dfs -cp`` o ``shutil``)."""
+    _backend(src).cp(src, dst_dir, *args)
 
 
 
@@ -300,12 +397,12 @@ class HivePath(type(PurePosixPath())):
                 destiny_hive.mkdir(parents=True, exist_ok=True)
                 if overwrite:
                     try:
-                        hdfs_command('-rm','-r', str(destiny_hive.joinpath(origin_hive.name)))
+                        rmdir(str(destiny_hive.joinpath(origin_hive.name)), '-r')
 
                     except:
                         pass
                 #
-                hdfs_command('-cp',str(origin_hive), str(destiny_hive))
+                cp(str(origin_hive), str(destiny_hive))
                 print(f'Finished {destiny_hive.joinpath(origin_hive.name)}')
                 return True
             except Exception as e:
@@ -369,3 +466,29 @@ class HivePath(type(PurePosixPath())):
             recursive=recursive,
             threads=20
             )
+
+
+class UniversalPath:
+    """Envolvente de :class:`LocalPath` y :class:`HivePath`.
+
+    ``UniversalPath(p)`` devuelve una instancia de ``HivePath`` si la ruta
+    vive en HDFS y de ``LocalPath`` si es del filesystem local, según
+    :func:`is_hdfs_path` (esquema ``hdfs://``/``file:``, letra de unidad
+    Windows, ``APP_FS_MODE``/``APP_TEST_MODE`` o autodetección por el CLI
+    ``hdfs``).
+
+    Es el punto de entrada recomendado cuando el mismo código debe manejar
+    rutas de ambos backends; si se sabe de antemano que la ruta es local
+    incluso en el clúster (p. ej. los ``.log`` del driver), úsese
+    ``LocalPath`` directamente.
+
+    Nota: al devolver instancias de otra clase, ``isinstance`` y la
+    construcción con kwargs de metadatos se delegan en la clase destino.
+    """
+
+    def __new__(cls, *pathsegments, **kwargs):
+        # Ojo: evaluar el string crudo — PurePosixPath colapsa "hdfs:///x"
+        # a "hdfs:/x" y el esquema dejaría de reconocerse.
+        raw = "/".join(str(s) for s in pathsegments)
+        target = HivePath if is_hdfs_path(raw) else LocalPath
+        return target(*pathsegments, **kwargs)

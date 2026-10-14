@@ -50,21 +50,14 @@ class SparkSessionBuilder:
     # Prefijo hdfs:// para que Spark NO use file:/
     @staticmethod
     def hdfs_uri(p: Union[str, Path]) -> str:
-        if isinstance(p, Path):
-            s = str(p)
-        else:
-            s = copy(p)
-        #
+        # as_posix(): Path("/a/b") stringify con "\" en Windows; las URIs
+        # hdfs/linux son siempre posix independientemente del OS del driver.
+        s = p.as_posix() if isinstance(p, Path) else copy(p)
         return s if s.startswith("hdfs://") else f"hdfs://{s}"
-        #
 
     def linux_uri(self, p: Union[str, Path]) -> str:
         """Devuelve la ruta Linux para Spark (no HDFS)."""
-        if isinstance(p, Path):
-            s = str(p)
-        else:
-            s = copy(p)
-
+        s = p.as_posix() if isinstance(p, Path) else copy(p)
         return s if s.startswith("/") else f"/{s}"
         #
 
