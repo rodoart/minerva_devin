@@ -133,7 +133,18 @@ reemite por el logger del supervisor (`supervisor.child`).
 
 Env vars del supervisor: `SUPERVISOR_COMMAND`, `SUPERVISOR_STEP_TIMEOUT`
 (7200s), `SUPERVISOR_STALL_TIMEOUT` (600s), `SUPERVISOR_WATCHDOG_INTERVAL`
-(30s), `SUPERVISOR_MAX_RESTARTS` (10), `PYSPARK_PORT` (4040).
+(30s), `SUPERVISOR_MAX_RESTARTS` (10), `PYSPARK_PORT` (4040),
+`SUPERVISOR_QUEUES`, `SUPERVISOR_CLEANUP_SCRIPT`.
+
+- **`SUPERVISOR_QUEUES`** (CSV, p.ej. `datalabs,datalabs2,analytics,analytics2`):
+  en cada (re)inicio el supervisor consulta `yarn queue -status` de cada
+  cola y exporta al hijo `PYSPARK_QUEUE` con la de más capacidad libre
+  (best-effort: si el comando falla para todas, conserva la cola heredada).
+- **`SUPERVISOR_CLEANUP_SCRIPT`**: script ejecutado UNA vez cuando el
+  pipeline termina con éxito (rc=0). `opt/cleanup.sh` borra los dirs
+  temporales/staging/checkpoint declarados en
+  `environment_vars.cluster.sh` y se auto-borra; conserva
+  `APP_WAREHOUSE_DIR_HDFS` (datos Hive) y los logs.
 
 ## Logging
 

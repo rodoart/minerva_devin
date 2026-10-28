@@ -183,6 +183,115 @@ class TestRunChild:
         assert monitor.current_step == "stuck"
 
 
+# ----------------------------------------------------------------------------
+# Selección de cola YARN (yarn queue -status)
+# ----------------------------------------------------------------------------
+
+CAPACITY_STATUS = """\
+Queue Information :
+Queue Name : root.datalabs
+	State : RUNNING
+	Capacity : 20.0%
+	Current Capacity : 5.0%
+	Maximum Capacity : 40.0%
+"""
+
+FAIR_STATUS = """\
+Queue Information :
+Queue Name : root.analytics
+	State : RUNNING
+	Steady Fair Share : <memory:4096, vCores:4>
+	Instantaneous Fair Share : <memory:2048, vCores:2>
+	Used Resources : <memory:1024, vCores:1>
+"""
+
+
+class TestQueueSelection:
+    def test_capacity_free_is_max_minus_used(self):
+        assert supervisor._queue_available(CAPACITY_STATUS) == \
+            pytest.approx(35.0)
+
+    def test_capacity_max_unlimited_falls_back(self):
+        """Maximum Capacity <= 0 (ilimitado) -> compara contra Capacity."""
+        status = CAPACITY_STATUS.replace("40.0%", "-1.0%")
+        assert supervisor._queue_available(status) == pytest.approx(15.0)
+
+    def test_fair_scheduler_memory(self):
+        # 1 - 1024/4096 = 0.75 (steady fair share antes que instantaneous)
+        assert supervisor._queue_available(FAIR_STATUS) == \
+            pytest.approx(0.75)
+
+    def test_pick_queue_selects_freest(self, monkeypatch):
+        status = {
+            "datalabs": "Queue Information :\n\tCapacity : 20.0%\n"
+                        "\tCurrent Capacity : 18.0%\n",
+            "analytics": "Queue Information :\n\tCapacity : 20.0%\n"
+                         "\tCurrent Capacity : 2.0%\n",
+        }
+        monkeypatch.setattr(supervisor, "QUEUES", ["datalabs", "analytics"])
+        monkeypatch.setattr(supervisor, "_yarn_queue_status", status.get)
+        assert supervisor.pick_queue() == "analytics"
+
+    def test_pick_queue_all_fail_returns_none(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "QUEUES", ["datalabs"])
+        monkeypatch.setattr(supervisor, "_yarn_queue_status", lambda q: None)
+        assert supervisor.pick_queue() is None
+
+    def test_run_child_exports_picked_queue(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "QUEUES", ["datalabs"])
+        monkeypatch.setattr(
+            supervisor, "_yarn_queue_status",
+            lambda q: "Queue Information :\n\tCapacity : 20.0%\n"
+                      "\tCurrent Capacity : 1.0%\n")
+        monkeypatch.setattr(
+            supervisor, "COMMAND",
+            _cmd("import os, sys; "
+                 "sys.exit(0 if os.environ.get('PYSPARK_QUEUE') == 'datalabs'"
+                 " else 7)"))
+        assert supervisor.run_child(supervisor.PipelineMonitor()) == 0
+
+
+# ----------------------------------------------------------------------------
+# Cleanup script post-éxito
+# ----------------------------------------------------------------------------
+
+class TestCleanupScript:
+    def test_runs_on_success_and_self_deletes(self, monkeypatch, tmp_path):
+        marker = tmp_path / "cleaned"
+        script = tmp_path / "cleanup.sh"
+        # LF explícito (CRLF rompe las rutas) y marker relativo: el
+        # supervisor corre `bash <basename>` con cwd=dir del script, así
+        # 'cleaned' aterriza junto al script en cualquier sabor de bash
+        script.write_bytes(
+            b"#!/usr/bin/env bash\n"
+            b"touch cleaned\n"
+            b'rm -f -- "$0"\n')
+        monkeypatch.setattr(supervisor, "CLEANUP_SCRIPT", str(script))
+        monkeypatch.setattr(supervisor, "COMMAND",
+                            _cmd("import sys; sys.exit(0)"))
+        assert supervisor.main() == 0
+        assert marker.exists()
+        assert not script.exists()      # el script se auto-borró
+
+    def test_missing_script_is_noop(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(supervisor, "CLEANUP_SCRIPT",
+                            str(tmp_path / "gone.sh"))
+        monkeypatch.setattr(supervisor, "COMMAND",
+                            _cmd("import sys; sys.exit(0)"))
+        assert supervisor.main() == 0
+
+    def test_no_cleanup_on_failure(self, monkeypatch, tmp_path):
+        marker = tmp_path / "cleaned"
+        script = tmp_path / "cleanup.sh"
+        script.write_bytes(b"touch cleaned\n")
+        monkeypatch.setattr(supervisor, "CLEANUP_SCRIPT", str(script))
+        monkeypatch.setattr(supervisor, "COMMAND",
+                            _cmd("import sys; sys.exit(1)"))
+        monkeypatch.setattr(supervisor, "MAX_RESTARTS", 0)
+        assert supervisor.main() == 1
+        assert not marker.exists()
+
+
 class TestMain:
     def test_success_returns_zero(self, monkeypatch):
         monkeypatch.setattr(supervisor, "COMMAND", _cmd("import sys; sys.exit(0)"))

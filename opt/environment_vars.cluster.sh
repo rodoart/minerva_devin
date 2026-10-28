@@ -101,6 +101,17 @@ export SUPERVISOR_STALL_TIMEOUT="${SUPERVISOR_STALL_TIMEOUT:-600}"
 export SUPERVISOR_WATCHDOG_INTERVAL="${SUPERVISOR_WATCHDOG_INTERVAL:-30}"
 export SUPERVISOR_MAX_RESTARTS="${SUPERVISOR_MAX_RESTARTS:-10}"
 
+# Colas YARN candidatas (CSV): en cada reinicio el supervisor elige la de
+# más capacidad libre según `yarn queue -status` y la exporta al hijo como
+# PYSPARK_QUEUE (PYSPARK_QUEUE queda como fallback si no se puede medir).
+# Vacío = cola fija.
+export SUPERVISOR_QUEUES="${SUPERVISOR_QUEUES:-datalabs,datalabs2,analytics,analytics2}"
+
+# Limpieza post-éxito: cuando el pipeline termina bien, el supervisor
+# ejecuta este script (borra los dirs tmp/staging/checkpoint declarados
+# arriba en HDFS y locales, y SE AUTO-BORRA). Vacío = no limpiar.
+export SUPERVISOR_CLEANUP_SCRIPT="${SUPERVISOR_CLEANUP_SCRIPT:-${CURRENT_SCRIPT_DIR_LINUX}/cleanup.sh}"
+
 # Parameters
 
 PATH_VARS=(
