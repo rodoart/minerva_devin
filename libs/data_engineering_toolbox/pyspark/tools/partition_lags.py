@@ -520,8 +520,15 @@ class SparkTwoPartitionMonthlyInterval(SparkTwoPartition):
         min_date = df[self.information_date_column].min()
         max_date = df[self.information_date_column].max()
         #
-        # Generar un rango de meses sin huecos
-        date_range = pd.date_range(start=min_date, end=max_date, freq='MS').strftime("%Y-%m").tolist()
+        # Generar un rango de meses sin huecos.
+        # Los límites se normalizan al DÍA 1 del mes: con freq='MS', un min_date
+        # a mitad de mes (p.ej. una partición vintage "2025-06-30") haría que
+        # date_range empezara en el mes siguiente y la partición del mes
+        # extremo se perdería silenciosamente al recargar.
+        date_range = pd.date_range(
+            start=pd.Timestamp(min_date).replace(day=1),
+            end=pd.Timestamp(max_date).replace(day=1),
+            freq='MS').strftime("%Y-%m").tolist()
         #
         # Crear un DataFrame con la columna months
         result_df = pd.DataFrame(date_range, columns=['months'])
