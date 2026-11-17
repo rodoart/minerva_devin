@@ -298,7 +298,19 @@ class StandardClusterFeaturesSubStep(SubStep):
 
 
 class CepsClusterFeaturesStep(StandardClusterFeaturesStep):
-    """Step CEPS de features de clustering: stats intra-grupo por nodo."""
+    """Step CEPS de features de clustering: stats intra-grupo por nodo.
+
+    Acepta `variant` ("rfc" por defecto): las fuentes de features de grafo
+    que se unen a los nodos enriquecidos se derivan de la variante
+    (`cclf.build_graph_feature_sources`), de modo que cada grafo lee sus
+    propios parquets namespaced.
+    """
+    def __init__(self, *args, variant: str = "rfc", **kwargs) -> None:
+        self.variant = variant
+        super().__init__(*args, **kwargs)
+        if variant != "rfc":
+            self.step_name = f"{self.step_name}_{variant}"
+        #
     def step_action(self) -> Dict[str, Any]:
         """Ejecuta la sub-etapa CEPS de clustering y recoge su salida."""
         return ppf.run_substep_and_collect(
@@ -394,15 +406,23 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
         sources = sorted(self._active_feature_sources().keys())
         return f"{mode}_{lfa.stats_chunk_key('src', sources, [])}"
         #
-    @staticmethod
-    def _active_feature_sources() -> Dict[str, HivePath]:
+    def _active_feature_sources(self) -> Dict[str, HivePath]:
         """Fuentes de features de grafo que se unen a los nodos enriquecidos.
 
-        En `CLUSTER_LIGHT_MODE` solo se unen `LIGHT_FEATURE_SOURCES` (p.ej.
-        contagion): las fuentes pesadas (pagerank, degrees...) se saltan por
-        completo — el join de todos los parquets es gran parte del coste.
+        Se derivan de la variante del grafo (`cclf.build_graph_feature_sources`):
+        cada variante lee sus propios parquets namespaced y la "rfc" las rutas
+        históricas. En `CLUSTER_LIGHT_MODE` solo se unen
+        `LIGHT_FEATURE_SOURCES` (p.ej. contagion): las fuentes pesadas
+        (pagerank, degrees...) se saltan por completo — el join de todos los
+        parquets es gran parte del coste.
         """
-        sources = cclf.GRAPH_FEATURE_SOURCES
+        variant = getattr(self, "variant", None) \
+            or getattr(getattr(self, "parent", None), "variant", "rfc")
+        # Para la variante por defecto se usa el atributo de módulo
+        # `GRAPH_FEATURE_SOURCES` (monkeypatch-able en tests); el resto deriva
+        # las rutas namespaced con `build_graph_feature_sources`.
+        sources = cclf.GRAPH_FEATURE_SOURCES if variant == "rfc" \
+            else cclf.build_graph_feature_sources(variant)
         if getattr(cclf, "CLUSTER_LIGHT_MODE", False):
             keep = getattr(cclf, "LIGHT_FEATURE_SOURCES", [])
             sources = {k: v for k, v in sources.items() if k in keep}

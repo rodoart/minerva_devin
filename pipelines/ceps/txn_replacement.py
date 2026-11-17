@@ -17,8 +17,10 @@ from datetime import date
 
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import (col, when, lit, to_date)
+from pyspark.sql.functions import (col, when, lit, to_date,
+    count as spark_count, max as spark_max, first as spark_first, row_number)
 from pyspark.sql.types import StringType
+from pyspark.sql.window import Window
 # ----------------------------------------------------------------------------------------------------------------------
 # Custom
 # ----------------------------------------------------------------------------------------------------------------------
@@ -59,6 +61,53 @@ def limit_txn_history_window(
     txn_date = to_date(col(date_column), spark_date_format)
     return df.filter((txn_date >= lit(str(start))) & (txn_date < lit(str(end))))
 
+
+def build_mapeo_cta_numcliente(replaced_df: DataFrame) -> DataFrame:
+    """Deriva el mapeo cta -> numcliente de las transacciones replaced.
+
+    Toma los pares (cuenta, cliente) de AMBOS lados de la transacción —
+    ordenante (`cve_tipo_orden` == "E": `cta_ord` + `customer_id`) y
+    beneficiario ("R": `cta_ben` + `customer_id`) — y elige UN numcliente por
+    cuenta: el que aparece en más transacciones; a empate, el de la
+    transacción más reciente; al último empate, el numcliente menor
+    (determinista).
+
+    Devuelve una fila por cuenta con `cta`, `numcliente`, `txn_count`,
+    `max_fec_informacion` y las columnas de partición `mis_date` /
+    `process_date` (constantes dentro del vintage: se toma el primer valor).
+
+    Es la implementación por defecto del mapeo; el grafo CEPS-cta lo lee de la
+    clave `mapeo_cta_numcliente` de su input, que puede reapuntarse a una
+    tabla externa equivalente sin tocar este pipeline.
+    """
+    emisor = (replaced_df
+        .filter(col("cve_tipo_orden") == "E")
+        .select(col("cta_ord").alias("cta"), col("customer_id").alias("numcliente"),
+            "fec_informacion", "mis_date", "process_date"))
+    receptor = (replaced_df
+        .filter(col("cve_tipo_orden") == "R")
+        .select(col("cta_ben").alias("cta"), col("customer_id").alias("numcliente"),
+            "fec_informacion", "mis_date", "process_date"))
+    pairs = (emisor.unionByName(receptor)
+        .filter(col("cta").isNotNull() & col("numcliente").isNotNull()))
+    ranked = (pairs
+        .groupBy("cta", "numcliente")
+        .agg(
+            spark_count("*").alias("txn_count"),
+            spark_max("fec_informacion").alias("max_fec_informacion"),
+            spark_first("mis_date").alias("mis_date"),
+            spark_first("process_date").alias("process_date"),
+        ))
+    window = Window.partitionBy("cta").orderBy(
+        col("txn_count").desc(),
+        col("max_fec_informacion").desc(),
+        col("numcliente").asc(),
+    )
+    return (ranked
+        .withColumn("_rank", row_number().over(window))
+        .filter(col("_rank") == 1)
+        .drop("_rank"))
+
 ########################################################################################################################
 # PROCESS
 ########################################################################################################################
@@ -93,8 +142,12 @@ class CepsTxnReplacementStep(ppf.Step):
         super().__init__(*args, **super_class_kwargs)
     #
     def step_action(self) -> Dict[str, dict]:
-        """Colecta el DataFrame final con RFC/CURP reemplazados (`rfc_curp_analysis_s264_ceps_replaced`)."""
-        return ppf.collect_step_output(self, self.rfc_curp_analysis_s264_ceps_replaced, "rfc_curp_analysis_s264_ceps_replaced")
+        """Colecta el DataFrame final con RFC/CURP reemplazados (`rfc_curp_analysis_s264_ceps_replaced`)
+        y el mapeo cta -> numcliente (`mapeo_cta_numcliente`)."""
+        return ppf.collect_step_output(self, {
+            "rfc_curp_analysis_s264_ceps_replaced": self.rfc_curp_analysis_s264_ceps_replaced,
+            "mapeo_cta_numcliente": self.mapeo_cta_numcliente,
+        }, "rfc_curp_analysis_s264_ceps_replaced")
     #
     def standard_load_parquet_or_table(self, config_dict_key, input_or_output:str = "input") -> DataFrame:
         """Carga estándar de una tabla/parquet particionado con validación de historial.
@@ -359,6 +412,18 @@ class CepsTxnReplacementStep(ppf.Step):
             .withColumn("vintage", lit(self.date_treatment["vintage"]).cast(StringType()))
             .withColumn("cohort", lit(self.cohort).cast(StringType()))
         )
+    #
+    @ppf.cached_property
+    @ppf.dynamic_partitioned_table_or_parquet(path_key="mapeo_cta_numcliente")
+    def mapeo_cta_numcliente(self) -> DataFrame:
+        """Mapeo cta -> numcliente de este vintage (ver `build_mapeo_cta_numcliente`).
+
+        Particionado como la tabla `replaced` (una partición por vintage): cada
+        corrida mensual escribe solo su incremento y el grafo CEPS-cta lee la
+        ventana completa deduplicando por cuenta (ver
+        `pipelines.graph_making.ceps.special_treatment`).
+        """
+        return build_mapeo_cta_numcliente(self.rfc_curp_analysis_s264_ceps_replaced)
 
 
 

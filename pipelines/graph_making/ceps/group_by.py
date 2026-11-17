@@ -36,7 +36,18 @@ import pipelines.graph_making.group_by as p_gm_gb
 
 
 class CepsGroupByStep(p_gm_gb.StandardGroupByStep):
-    """Step orquestador del group-by del grafo CEPS (por arista y por nodo)."""
+    """Step orquestador del group-by del grafo CEPS (por arista y por nodo).
+
+    Acepta `variant` ("rfc" por defecto; "cta" usa las columnas de split de
+    `ccgb.column_spec("cta")` y no filtra el numcliente por tipo de ordenante:
+    ya viene imputado por lado desde special_treatment).
+    """
+    def __init__(self, *args, variant: str = "rfc", **kwargs) -> None:
+        self.variant = variant
+        super().__init__(*args, **kwargs)
+        if variant != "rfc":
+            self.step_name = f"{self.step_name}_{variant}"
+        #
     def step_action(self) -> Dict[str, Any]:
         """Ejecuta el substep de agregación (`ceps_group_by_step`)."""
         return ppf.run_substep_and_collect(self, self.ceps_group_by_step, "ceps_group_by_step")
@@ -145,32 +156,52 @@ class CepsGroupBySubStep(p_gm_gb.StandardGroupBySubStep):
         #
     @ppf.cached_property
     def txn_src(self) -> DataFrame:
-        """Proyección del lado ordenante; `numcliente` solo se conserva si `cve_tipo_orden` == "E"."""
+        """Proyección del lado ordenante.
+
+        Variante rfc: `numcliente` solo se conserva si `cve_tipo_orden` == "E".
+        Variante cta: el numcliente ya viene imputado por lado
+        (`numcliente_src` -> `numcliente` en el split), sin filtro E/R.
+        """
+        variant = getattr(self, "variant", None) \
+            or getattr(getattr(self, "parent", None), "variant", "rfc")
+        spec = ccgb.column_spec(variant)
         missing_treatment: DataFrame = self.missing_treatment
-        return (self.standard_txn_src_split(
+        txn_src = self.standard_txn_src_split(
             input_df=missing_treatment,
             id_columns=ccgb.ID_SRC_COLUMNS,
-            unique_columns=ccgb.SRC_COLUMNS,
-            common_columns=ccgb.COMMON_COLUMNS,
+            unique_columns=spec["SRC_COLUMNS"],
+            common_columns=spec["COMMON_COLUMNS"],
             suffix="_src"
-            )
-            # custom imputation for ceps
-            .withColumn("numcliente",  when((col("cve_tipo_orden") == "E"),  col("numcliente")).otherwise(lit(None).cast(StringType())))
         )
+        if variant != "cta":
+            # custom imputation for ceps (variante rfc)
+            txn_src = txn_src.withColumn("numcliente",
+                when((col("cve_tipo_orden") == "E"), col("numcliente")).otherwise(lit(None).cast(StringType())))
+        return txn_src
         #
     @ppf.cached_property
     def txn_dst(self) -> DataFrame:
-        """Proyección del lado beneficiario; `numcliente` solo se conserva si `cve_tipo_orden` == "R"."""
+        """Proyección del lado beneficiario.
+
+        Variante rfc: `numcliente` solo se conserva si `cve_tipo_orden` == "R".
+        Variante cta: el numcliente ya viene imputado por lado
+        (`numcliente_dst` -> `numcliente` en el split), sin filtro E/R.
+        """
+        variant = getattr(self, "variant", None) \
+            or getattr(getattr(self, "parent", None), "variant", "rfc")
+        spec = ccgb.column_spec(variant)
         missing_treatment: DataFrame = self.missing_treatment
-        return (self.standard_txn_dst_split(
+        txn_dst = self.standard_txn_dst_split(
             input_df=missing_treatment,
             id_columns=ccgb.ID_DST_COLUMNS,
-            unique_columns=ccgb.DST_COLUMNS,
-            common_columns=ccgb.COMMON_COLUMNS,
+            unique_columns=spec["DST_COLUMNS"],
+            common_columns=spec["COMMON_COLUMNS"],
             suffix="_dst"
-            )
-            .withColumn("numcliente",  when((col("cve_tipo_orden") == "R"),  col("numcliente")).otherwise(lit(None).cast(StringType())))
         )
+        if variant != "cta":
+            txn_dst = txn_dst.withColumn("numcliente",
+                when((col("cve_tipo_orden") == "R"), col("numcliente")).otherwise(lit(None).cast(StringType())))
+        return txn_dst
     @ppf.cached_property
     def group_by_id_monthly(self) -> DataFrame:
         """Agregados parciales por nodo-mes, persistidos incrementalmente.

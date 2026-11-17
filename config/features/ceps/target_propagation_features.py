@@ -145,49 +145,78 @@ PROPAGATION_FEATURES = [
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from config.graph_making.ceps.variants import DEFAULT_VARIANT, variant_subpath  # namespacing por variante de grafo (rfc/cta)
+import config.graph_making.ceps.group_by as _ccgb
+import config.graph_making.ceps.edges_and_nodes as _ccen
+
 
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))            # raíz HDFS de las salidas del job
-current_hdfs = _general_root_hdfs.joinpath("features/ceps/propagation_features")        # salidas persistentes del step
-current_tmp_hdfs = _general_root_hdfs.joinpath("tmp/features/ceps/propagation_features") # salidas temporales (checkpoint)
-
 
 # Directorio padre de special_treatment (target_propagation/lovelace): ahí se
-# escribe nodes_join_target_lovelace, junto a target_cta/target_numcliente.
+# escribe nodes_join_target_lovelace (variante rfc), junto a
+# target_cta/target_numcliente; el resto de variantes lo namespacen un nivel
+# más abajo para no pisar el histórico.
 propagation_hdfs = ctp_l_st.current_hdfs.parent
 
 
-input = ({
-    "group_by_id" : ctp_gb_st.output["group_by_id"],  # correspondencia id -> arrays cta/numcliente de cada nodo
-    "nodes" : ctp_en_st.output["nodes"],              # nodos del grafo
-    "edges" : ctp_en_st.output["edges"]               # aristas con el mapa `weights` de tipos de peso
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) de propagation_features CEPS para una variante de grafo.
+
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `features/ceps/<variant>/propagation_features`
+      e insumos (`group_by_id`, `nodes`, `edges`) de la misma variante. Las
+      semillas `target_cta`/`target_numcliente` son EXTERNAS al grafo y se
+      comparten entre variantes (no se namespacen).
+    """
+    _gb_input, gb_output = _ccgb.build(variant)
+    _ean_input, ean_output = _ccen.build(variant)
+
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("features/ceps", variant, "propagation_features"))        # salidas persistentes del step
+    current_tmp_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("tmp/features/ceps", variant, "propagation_features"))    # salidas temporales (checkpoint)
+
+    # nodes_join_target_lovelace: la variante por defecto conserva la ruta
+    # histórica (target_propagation/lovelace/nodes_join_target_lovelace).
+    nodes_join_parent = propagation_hdfs if variant == DEFAULT_VARIANT \
+        else propagation_hdfs.joinpath(variant)
+
+    input = ({
+        "group_by_id" : gb_output["group_by_id"],   # correspondencia id -> arrays cta/numcliente de cada nodo
+        "nodes" : ean_output["nodes"],              # nodos del grafo
+        "edges" : ean_output["edges"]               # aristas con el mapa `weights` de tipos de peso
+        }
+        # TARGETS
+        # add other targets as neccesary
+        | ctp_l_st.output  # añade target_cta y target_numcliente (semillas del special treatment Lovelace)
+    )
+
+    output = {
+        # Nodos enriquecidos con target_lovelace (tabla particionada por mis_date/process_date).
+        "nodes_join_target_lovelace": {"table_or_hdfs": nodes_join_parent.joinpath("nodes_join_target_lovelace"),
+            "information_date_column": "mis_date",        # columna de fecha de información (partición mensual)
+            "process_date_column": "process_date",        # columna de fecha de proceso/ejecución (segunda partición)
+            "lag": c_gmc.GRAPH_GLOBAL_LAG,                # desplazamiento de la ventana en meses respecto a vintage_date
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,  # nº de meses de historia de la ventana (12)
+            "information_date_mode":"each",               # se usan todos los meses del intervalo
+            "process_date_mode":"last"                    # por cada mes se toma la process_date más reciente
+        },
+        # Aristas con pesos normalizados por grado del receptor (w_src_to_dst/w_dst_to_src);
+        # en disco se escribe por weight_type=... en un directorio hermano.
+        "edges_norm": {"table_or_hdfs": current_hdfs.joinpath("edges_norm"),#simple
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        },
+        # Directorio padre de los scores de contagio, parametrizado por subdirs
+        # (weight_type=.../target_column=.../...) que el assembler lee con merge_schema.
+        "target_propagation": {"table_or_hdfs": current_hdfs.joinpath("target_propagation"),#simple
+            "keep_or_delete": "keep"
+        },
+        "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple  # dir. de checkpoint de GraphFrames
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        }
     }
-    # TARGETS
-    # add other targets as neccesary
-    | ctp_l_st.output  # añade target_cta y target_numcliente (semillas del special treatment Lovelace)
-)
+    return input, output
 
 
-output = {
-    # Nodos enriquecidos con target_lovelace (tabla particionada por mis_date/process_date).
-    "nodes_join_target_lovelace": {"table_or_hdfs": propagation_hdfs.joinpath("nodes_join_target_lovelace"),
-        "information_date_column": "mis_date",        # columna de fecha de información (partición mensual)
-        "process_date_column": "process_date",        # columna de fecha de proceso/ejecución (segunda partición)
-        "lag": c_gmc.GRAPH_GLOBAL_LAG,                # desplazamiento de la ventana en meses respecto a vintage_date
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,  # nº de meses de historia de la ventana (12)
-        "information_date_mode":"each",               # se usan todos los meses del intervalo
-        "process_date_mode":"last"                    # por cada mes se toma la process_date más reciente
-    },
-    # Aristas con pesos normalizados por grado del receptor (w_src_to_dst/w_dst_to_src);
-    # en disco se escribe por weight_type=... en un directorio hermano.
-    "edges_norm": {"table_or_hdfs": current_hdfs.joinpath("edges_norm"),#simple
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
-    },
-    # Directorio padre de los scores de contagio, parametrizado por subdirs
-    # (weight_type=.../target_column=.../...) que el assembler lee con merge_schema.
-    "target_propagation": {"table_or_hdfs": current_hdfs.joinpath("target_propagation"),#simple
-        "keep_or_delete": "keep"
-    },
-    "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple  # dir. de checkpoint de GraphFrames
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
-    }
-}
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

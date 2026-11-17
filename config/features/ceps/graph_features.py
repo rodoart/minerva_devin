@@ -101,60 +101,78 @@ GRAPH_CENTRALITY_FEATURES = [
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from config.graph_making.ceps.variants import DEFAULT_VARIANT, variant_subpath  # namespacing por variante de grafo (rfc/cta)
+
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))   # raíz HDFS de las salidas del job
-current_hdfs = _general_root_hdfs.joinpath("features/ceps/graph_features")       # salidas persistentes del step
-current_tmp_hdfs = _general_root_hdfs.joinpath("tmp/features/ceps/graph_features")  # salidas temporales (checkpoint)
 
 
-input = {
-    "edges": edges_and_nodes_output["edges"],  # aristas del grafo (src/dst + mapa `weights`), particionadas
-    "nodes": edges_and_nodes_output["nodes"]   # nodos del grafo (columna `id`), particionados
-}
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) de graph_features CEPS para una variante de grafo.
 
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `features/ceps/<variant>/graph_features` e
+      insumos `edges`/`nodes` de la misma variante.
+    """
+    _ean_input, ean_output = c_gmc_ean.build(variant)
 
-# Una clave por feature de GRAPH_CENTRALITY_FEATURES: parquet simple por nodo.
-# "keep_or_delete": "keep" = salida persistente; "delete" = temporal (--cleanup).
-output = {
-    "pagerank": {"table_or_hdfs": current_hdfs.joinpath("pagerank"),#simple
-        "keep_or_delete": "keep"
-    },
-    "degrees": {"table_or_hdfs": current_hdfs.joinpath("degrees"),#simple
-        "keep_or_delete": "keep"
-    },
-    "components": {"table_or_hdfs": current_hdfs.joinpath("components"),#simple
-        "keep_or_delete": "keep"
-    },
-    "triangle_count": {"table_or_hdfs": current_hdfs.joinpath("triangle_count"),#simple
-        "keep_or_delete": "keep"
-    },
-    "k_core": {"table_or_hdfs": current_hdfs.joinpath("k_core"),#simple
-        "keep_or_delete": "keep"
-    },
-    "weighted_pagerank": {"table_or_hdfs": current_hdfs.joinpath("weighted_pagerank"),#simple
-        "keep_or_delete": "keep"
-    },
-    "weighted_degrees": {"table_or_hdfs": current_hdfs.joinpath("weighted_degrees"),#simple
-        "keep_or_delete": "keep"
-    },
-    "weighted_edge_stats": {"table_or_hdfs": current_hdfs.joinpath("weighted_edge_stats"),#simple
-        "keep_or_delete": "keep"
-    },
-    "weighted_triangle_count": {"table_or_hdfs": current_hdfs.joinpath("weighted_triangle_count"),#simple
-        "keep_or_delete": "keep"
-    },
-    "degree_balance": {"table_or_hdfs": current_hdfs.joinpath("degree_balance"),#simple
-        "keep_or_delete": "keep"
-    },
-    "reciprocity": {"table_or_hdfs": current_hdfs.joinpath("reciprocity"),#simple
-        "keep_or_delete": "keep"
-    },
-    "self_loops": {"table_or_hdfs": current_hdfs.joinpath("self_loops"),#simple
-        "keep_or_delete": "keep"
-    },
-    "weighted_degree_balance": {"table_or_hdfs": current_hdfs.joinpath("weighted_degree_balance"),#simple
-        "keep_or_delete": "keep"
-    },
-    "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple  # dir. de checkpoint de GraphFrames
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("features/ceps", variant, "graph_features"))       # salidas persistentes del step
+    current_tmp_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("tmp/features/ceps", variant, "graph_features"))   # salidas temporales (checkpoint)
+
+    input = {
+        "edges": ean_output["edges"],  # aristas del grafo (src/dst + mapa `weights`), particionadas
+        "nodes": ean_output["nodes"]   # nodos del grafo (columna `id`), particionados
     }
-}
+
+    # Una clave por feature de GRAPH_CENTRALITY_FEATURES: parquet simple por nodo.
+    # "keep_or_delete": "keep" = salida persistente; "delete" = temporal (--cleanup).
+    output = {
+        "pagerank": {"table_or_hdfs": current_hdfs.joinpath("pagerank"),#simple
+            "keep_or_delete": "keep"
+        },
+        "degrees": {"table_or_hdfs": current_hdfs.joinpath("degrees"),#simple
+            "keep_or_delete": "keep"
+        },
+        "components": {"table_or_hdfs": current_hdfs.joinpath("components"),#simple
+            "keep_or_delete": "keep"
+        },
+        "triangle_count": {"table_or_hdfs": current_hdfs.joinpath("triangle_count"),#simple
+            "keep_or_delete": "keep"
+        },
+        "k_core": {"table_or_hdfs": current_hdfs.joinpath("k_core"),#simple
+            "keep_or_delete": "keep"
+        },
+        "weighted_pagerank": {"table_or_hdfs": current_hdfs.joinpath("weighted_pagerank"),#simple
+            "keep_or_delete": "keep"
+        },
+        "weighted_degrees": {"table_or_hdfs": current_hdfs.joinpath("weighted_degrees"),#simple
+            "keep_or_delete": "keep"
+        },
+        "weighted_edge_stats": {"table_or_hdfs": current_hdfs.joinpath("weighted_edge_stats"),#simple
+            "keep_or_delete": "keep"
+        },
+        "weighted_triangle_count": {"table_or_hdfs": current_hdfs.joinpath("weighted_triangle_count"),#simple
+            "keep_or_delete": "keep"
+        },
+        "degree_balance": {"table_or_hdfs": current_hdfs.joinpath("degree_balance"),#simple
+            "keep_or_delete": "keep"
+        },
+        "reciprocity": {"table_or_hdfs": current_hdfs.joinpath("reciprocity"),#simple
+            "keep_or_delete": "keep"
+        },
+        "self_loops": {"table_or_hdfs": current_hdfs.joinpath("self_loops"),#simple
+            "keep_or_delete": "keep"
+        },
+        "weighted_degree_balance": {"table_or_hdfs": current_hdfs.joinpath("weighted_degree_balance"),#simple
+            "keep_or_delete": "keep"
+        },
+        "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),#simple  # dir. de checkpoint de GraphFrames
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        }
+    }
+    return input, output
+
+
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

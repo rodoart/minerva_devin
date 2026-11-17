@@ -83,39 +83,56 @@ NODES_ID_COLUMNS="id"
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from .variants import DEFAULT_VARIANT, variant_subpath   # namespacing por variante de grafo (rfc/cta)
 
-# Raíz HDFS general del job y directorio donde este step persiste sus salidas.
+# Raíz HDFS general del job (sandbox); base para las rutas de salida del grafo.
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))
-current_hdfs = _general_root_hdfs.joinpath("graph/ceps/edges_and_nodes")
 
 
-# Insumos del step: reutilizan las definiciones de salida del step group_by
-# (misma ruta y mismas claves de particionado/lectura; ver comentarios en special_treatment.input).
-input = {
-    "group_by_txn" : group_by_output["group_by_txn"],   # transacciones agregadas por arista -> base de "edges"
-    "group_by_id" : group_by_output["group_by_id"]      # atributos agregados por nodo -> base de "nodes"
-}
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) de edges_and_nodes CEPS para una variante de grafo.
+
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `graph/ceps/<variant>/edges_and_nodes` e
+      insumos `group_by_txn`/`group_by_id` de la misma variante.
+    """
+    _gb_input, gb_output = c_gmc_gb.build(variant)
+
+    # Directorio HDFS donde este step persiste sus salidas.
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("graph/ceps", variant, "edges_and_nodes"))
+
+    # Insumos del step: reutilizan las definiciones de salida del step group_by
+    # (misma ruta y mismas claves de particionado/lectura; ver comentarios en special_treatment.input).
+    input = {
+        "group_by_txn" : gb_output["group_by_txn"],   # transacciones agregadas por arista -> base de "edges"
+        "group_by_id" : gb_output["group_by_id"]      # atributos agregados por nodo -> base de "nodes"
+    }
+
+    # Salidas del step: mismas claves que los insumos; describen dónde se persiste cada
+    # DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
+    output = {
+        # Aristas del grafo: ids + EDGES_VARS + mapa `weights` + columnas de partición.
+        "edges": {"table_or_hdfs": current_hdfs.joinpath("edges"),                # parquet de salida
+            "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": c_gmc.GRAPH_GLOBAL_LAG,                    # lag global del grafo al releer (0 = sin desfase)
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        },
+        # Nodos del grafo: id + NODE_VARS + columnas de partición.
+        "nodes": {"table_or_hdfs": current_hdfs.joinpath("nodes"),                # parquet de salida
+            "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": c_gmc.GRAPH_GLOBAL_LAG,                    # lag global del grafo al releer (0 = sin desfase)
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        },
+    }
+    return input, output
 
 
-# Salidas del step: mismas claves que los insumos; describen dónde se persiste cada
-# DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
-output = {
-    # Aristas del grafo: ids + EDGES_VARS + mapa `weights` + columnas de partición.
-    "edges": {"table_or_hdfs": current_hdfs.joinpath("edges"),                # parquet de salida
-        "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": c_gmc.GRAPH_GLOBAL_LAG,                    # lag global del grafo al releer (0 = sin desfase)
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
-    },
-    # Nodos del grafo: id + NODE_VARS + columnas de partición.
-    "nodes": {"table_or_hdfs": current_hdfs.joinpath("nodes"),                # parquet de salida
-        "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": c_gmc.GRAPH_GLOBAL_LAG,                    # lag global del grafo al releer (0 = sin desfase)
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
-    },
-}
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

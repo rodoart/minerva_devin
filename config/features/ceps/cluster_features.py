@@ -126,55 +126,88 @@ GRAPH_FEATURE_KEYS = [
     "weighted_pagerank", "weighted_degrees", "weighted_edge_stats",
     "weighted_degree_balance",
 ]
-GRAPH_FEATURE_SOURCES = {
-    key: cfgf.output[key]["table_or_hdfs"] for key in GRAPH_FEATURE_KEYS
-}
-GRAPH_FEATURE_SOURCES["contagion"] = (
-    cfcf.output["target_propagation"]["table_or_hdfs"])
+
+
+def build_graph_feature_sources(variant: str = "rfc") -> dict:
+    """Fuentes de features de grafo por variante: {clave: path} a nivel nodo.
+
+    Deriva las rutas de las factories de la cadena (graph_features +
+    propagation_features de la MISMA variante): la variante "rfc" produce las
+    rutas históricas y el resto las namespaced.
+    """
+    _gf_input, gf_output = cfgf.build(variant)
+    _tp_input, tp_output = cfcf.build(variant)
+    sources = {key: gf_output[key]["table_or_hdfs"] for key in GRAPH_FEATURE_KEYS}
+    sources["contagion"] = tp_output["target_propagation"]["table_or_hdfs"]
+    return sources
+
+
+GRAPH_FEATURE_SOURCES = build_graph_feature_sources()
 
 # --------------------------------------------------------------------------------------
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from config.graph_making.ceps.variants import DEFAULT_VARIANT, variant_subpath  # namespacing por variante de grafo (rfc/cta)
+
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))      # raíz HDFS de las salidas del job
-current_hdfs = _general_root_hdfs.joinpath("features/ceps/cluster_features")  # directorio de salida del step
-current_tmp_hdfs = _general_root_hdfs.joinpath("features/ceps/tmp_cluster_features")  # tmp del step (checkpoint)
 
 
-input = {
-    # Componente conexa por nodo (parquet de la feature `components` ya calculada).
-    "components": cfgf.output["components"],
-    # Aristas del grafo (src/dst) para stronglyConnectedComponents.
-    "edges": ccen.output["edges"],
-    # Nodos + etiquetas target_lovelace_* (base del enriquecimiento por nodo).
-    "nodes_join_target_lovelace": cfcf.output["nodes_join_target_lovelace"],
-}
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) de cluster_features CEPS para una variante de grafo.
+
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `features/ceps/<variant>/cluster_features`
+      e insumos (`components`, `edges`, `nodes_join_target_lovelace`) de la
+      misma variante.
+    """
+    _gf_input, gf_output = cfgf.build(variant)
+    _ean_input, ean_output = ccen.build(variant)
+    _tp_input, tp_output = cfcf.build(variant)
+
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("features/ceps", variant, "cluster_features"))      # directorio de salida del step
+    current_tmp_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("features/ceps", variant, "tmp_cluster_features"))  # tmp del step (checkpoint; ruta histórica bajo features/ceps)
+
+    input = {
+        # Componente conexa por nodo (parquet de la feature `components` ya calculada).
+        "components": gf_output["components"],
+        # Aristas del grafo (src/dst) para stronglyConnectedComponents.
+        "edges": ean_output["edges"],
+        # Nodos + etiquetas target_lovelace_* (base del enriquecimiento por nodo).
+        "nodes_join_target_lovelace": tp_output["nodes_join_target_lovelace"],
+    }
+
+    output = {
+        # Una fila por id: stats intra-grupo (component_id y scc) de todas las
+        # columnas numéricas del nodo enriquecido (targets + monto + antigüedad +
+        # features de grafo + contagio).
+        "cluster_stats": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats"),
+            "keep_or_delete": "keep"
+        },
+        # Intermedios materializados (reload-or-recompute). El SCC de GraphFrames
+        # NO es reanudable (sus checkpoints orgánicos quedan huérfanos al morir el
+        # proceso): si el job cae, sin parquet propio habría que recomputar el
+        # subgrafo entero. Lo mismo aplica al join pesado `nodes_enriched`.
+        "subcluster_df": {"table_or_hdfs": current_hdfs.joinpath("subcluster_df"),
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        },
+        "nodes_enriched": {"table_or_hdfs": current_hdfs.joinpath("nodes_enriched"),
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        },
+        # Partes de los stats por grupo (un parquet por chunk de columnas y
+        # group_column): puntos de reanudación de los groupBy etapados.
+        "cluster_stats_parts": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats_parts"),
+            "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
+        },
+        # Directorio de checkpoint de GraphFrames para stronglyConnectedComponents.
+        "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),
+            "keep_or_delete": "delete"
+        },
+    }
+    return input, output
 
 
-output = {
-    # Una fila por id: stats intra-grupo (component_id y scc) de todas las
-    # columnas numéricas del nodo enriquecido (targets + monto + antigüedad +
-    # features de grafo + contagio).
-    "cluster_stats": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats"),
-        "keep_or_delete": "keep"
-    },
-    # Intermedios materializados (reload-or-recompute). El SCC de GraphFrames
-    # NO es reanudable (sus checkpoints orgánicos quedan huérfanos al morir el
-    # proceso): si el job cae, sin parquet propio habría que recomputar el
-    # subgrafo entero. Lo mismo aplica al join pesado `nodes_enriched`.
-    "subcluster_df": {"table_or_hdfs": current_hdfs.joinpath("subcluster_df"),
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
-    },
-    "nodes_enriched": {"table_or_hdfs": current_hdfs.joinpath("nodes_enriched"),
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
-    },
-    # Partes de los stats por grupo (un parquet por chunk de columnas y
-    # group_column): puntos de reanudación de los groupBy etapados.
-    "cluster_stats_parts": {"table_or_hdfs": current_hdfs.joinpath("cluster_stats_parts"),
-        "keep_or_delete": "delete"     # intermedio: se borra con --cleanup
-    },
-    # Directorio de checkpoint de GraphFrames para stronglyConnectedComponents.
-    "checkpoint": {"table_or_hdfs": current_tmp_hdfs.joinpath("checkpoint"),
-        "keep_or_delete": "delete"
-    },
-}
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

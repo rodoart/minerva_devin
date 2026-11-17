@@ -72,5 +72,22 @@ output = {
         "history": 1,                               # al releer, solo la partición del vintage actual
         "information_date_mode":"each",             # todos los meses del intervalo
         "process_date_mode":"last"                  # por cada mes, solo la carga (process_date) más reciente
+    },
+    # Mapeo cta -> numcliente derivado de las transacciones replaced de este
+    # vintage (lado E: cta_ord+customer_id; lado R: cta_ben+customer_id; gana el
+    # numcliente con más txns de la cuenta y, a empate, el más reciente). Lo
+    # consume el grafo CEPS-cta para imputar el numcliente de cada cuenta.
+    # Es la implementación por defecto y es SUSTITUIBLE: para usar otra tabla
+    # de mapeo basta apuntar la clave "mapeo_cta_numcliente" del input de
+    # config.graph_making.ceps.special_treatment.build("cta") a esa tabla.
+    # Particionada como `replaced` (una partición por vintage): cada corrida
+    # mensual escribe solo su incremento y el grafo lee la ventana completa.
+    "mapeo_cta_numcliente": {"table_or_hdfs": current_hdfs.joinpath("mapeo_cta_numcliente"),
+        "information_date_column": "mis_date",      # misma partición mensual que `replaced` (yyyyMM)
+        "process_date_column": "process_date",      # columna-partición de fecha de carga
+        "lag": 0,                                   # sin desfase
+        "history": 1,                               # al releer, solo la partición del vintage actual
+        "information_date_mode":"each",             # todos los meses del intervalo
+        "process_date_mode":"last"                  # por cada mes, solo la carga más reciente
     }
 }

@@ -4,11 +4,10 @@ from pyspark.sql.functions import col,lpad
 from pyspark.sql.types import StringType
 from ...ceps.txn_replacement import output as ceps_txn_replacement_output    # salidas del step previo (txn_replacement)
 from .. import GRAPH_TOTAL_HISTORY_IN_MONTHS, GRAPH_GLOBAL_LAG               # ventana del grafo: meses de historia y lag global
+from .variants import DEFAULT_VARIANT, variant_subpath                       # namespacing por variante de grafo (rfc/cta)
 
 # Raíz HDFS general del job (sandbox); base para las rutas de salida del grafo.
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))
-# Directorio HDFS donde este step persistirá sus salidas.
-current_hdfs = _general_root_hdfs.joinpath("graph/ceps/special_treatment")
 
 # Tratamiento estándar de nulos aplicado tras la carga (libs.functions.missing_treatment).
 # Cada clave es una columna y el valor indica el tipo de imputación y sus argumentos:
@@ -30,46 +29,75 @@ STANDARD_MISSING_TREATMENT_VARS = {
 #                                 "all" = todas, "each" = exige exactamente una por mes.
 #   "minimum_required_history" -> nº mínimo de meses con datos exigido; si se cargan menos, error (False/0 = sin exigencia).
 #   "select"                   -> proyección (columnas/expresiones) aplicada tras la carga.
-input = {
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) del special treatment CEPS para una variante de grafo.
+
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - "cta": rutas namespaced bajo `graph/ceps/cta/special_treatment` y un
+      insumo extra `mapeo_cta_numcliente` (salida del step txn_replacement;
+      sustituible por una tabla externa reapuntando esta clave) con el que el
+      pipeline imputa `numcliente_src`/`numcliente_dst` por cuenta.
+    """
     # Transacciones CEPS aplanadas/rankeadas con RFC-CURP sustituidos (salida persistida del step txn_replacement).
-    "s264_ceps_flattened_rank_rfc_by_cta_cases_replace" : {
-        "table_or_hdfs": ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["table_or_hdfs"],             # se lee la salida del step previo
-        "information_date_column": ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["information_date_column"],  # hereda la columna de fecha ("mis_date")
-        "lag": GRAPH_GLOBAL_LAG,                                # sin desfase adicional: usa el lag global del grafo
-        "history": GRAPH_TOTAL_HISTORY_IN_MONTHS,               # se leen los 12 meses de historia del grafo
-        "information_date_mode":ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["information_date_mode"],  # "each": todos los meses del intervalo
-        "minimum_required_history": False,                      # no se exige historia mínima; solo avisa si faltan meses
-        "select":                                               # proyección tras la carga: renombra/normaliza a la convención _src/_dst
+    input = {
+        "s264_ceps_flattened_rank_rfc_by_cta_cases_replace" : {
+            "table_or_hdfs": ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["table_or_hdfs"],             # se lee la salida del step previo
+            "information_date_column": ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["information_date_column"],  # hereda la columna de fecha ("mis_date")
+            "lag": GRAPH_GLOBAL_LAG,                                # sin desfase adicional: usa el lag global del grafo
+            "history": GRAPH_TOTAL_HISTORY_IN_MONTHS,               # se leen los 12 meses de historia del grafo
+            "information_date_mode":ceps_txn_replacement_output["rfc_curp_analysis_s264_ceps_replaced"]["information_date_mode"],  # "each": todos los meses del intervalo
+            "minimum_required_history": False,                      # no se exige historia mínima; solo avisa si faltan meses
+            "select":                                               # proyección tras la carga: renombra/normaliza a la convención _src/_dst
 
-        [
-            col("customer_id").alias("numcliente"),                # id interno de cliente -> numcliente
-            col("rfc_curp_ord").alias("id_src"),                   # RFC/CURP ordenante -> id del nodo origen
-            col("rfc_curp_ben").alias("id_dst"),                   # RFC/CURP beneficiario -> id del nodo destino
-            col("cta_ord").alias("cta_src"),                       # cuenta ordenante
-            col("cta_ben").alias("cta_dst"),                       # cuenta beneficiaria
-            col("nom_ord").alias("nom_src"),                       # nombre ordenante
-            col("nom_ben").alias("nom_dst"),                       # nombre beneficiario
-            col("id_ban_ord").alias("id_ban_src"),                 # banco ordenante
-            col("id_ban_ben").alias("id_ban_dst"),                 # banco beneficiario
-            col("fec_informacion").cast(StringType()).alias("information_date"),          # fecha de información normalizada a string
-            lpad(col("hora_oper").cast(StringType()), 6, "0").alias("hora_oper"),         # hora de operación con padding a 6 dígitos (HHmmss)
-            "cve_tipo_orden",                                      # clave de tipo de ordenante ("E" emisor / "R" receptor)
-            "oper_mto"                                             # importe de la operación
-        ]
+            [
+                col("customer_id").alias("numcliente"),                # id interno de cliente -> numcliente
+                col("rfc_curp_ord").alias("id_src"),                   # RFC/CURP ordenante -> id del nodo origen (variante rfc)
+                col("rfc_curp_ben").alias("id_dst"),                   # RFC/CURP beneficiario -> id del nodo destino (variante rfc)
+                col("cta_ord").alias("cta_src"),                       # cuenta ordenante -> id del nodo origen (variante cta)
+                col("cta_ben").alias("cta_dst"),                       # cuenta beneficiaria -> id del nodo destino (variante cta)
+                col("nom_ord").alias("nom_src"),                       # nombre ordenante
+                col("nom_ben").alias("nom_dst"),                       # nombre beneficiario
+                col("id_ban_ord").alias("id_ban_src"),                 # banco ordenante
+                col("id_ban_ben").alias("id_ban_dst"),                 # banco beneficiario
+                col("fec_informacion").cast(StringType()).alias("information_date"),          # fecha de información normalizada a string
+                lpad(col("hora_oper").cast(StringType()), 6, "0").alias("hora_oper"),         # hora de operación con padding a 6 dígitos (HHmmss)
+                "cve_tipo_orden",                                      # clave de tipo de ordenante ("E" emisor / "R" receptor)
+                "oper_mto"                                             # importe de la operación
+            ]
+        }
     }
-}
+    if variant != DEFAULT_VARIANT:
+        # Mapeo cta -> numcliente (solo variante cta): se lee la ventana
+        # completa del grafo y el pipeline deduplica por cuenta (gana la
+        # partición más reciente; ver CepsExtractSubStep.mapeo_cta_numcliente).
+        input["mapeo_cta_numcliente"] = {
+            "table_or_hdfs": ceps_txn_replacement_output["mapeo_cta_numcliente"]["table_or_hdfs"],
+            "information_date_column": ceps_txn_replacement_output["mapeo_cta_numcliente"]["information_date_column"],
+            "lag": GRAPH_GLOBAL_LAG,                                # misma ventana que el resto del grafo
+            "history": GRAPH_TOTAL_HISTORY_IN_MONTHS,               # cobertura de 12 meses de mapeos mensuales
+            "information_date_mode": ceps_txn_replacement_output["mapeo_cta_numcliente"]["information_date_mode"],
+            "minimum_required_history": False,                      # el mapeo es best-effort: no bloquea el grafo
+        }
 
+    # Directorio HDFS donde este step persistirá sus salidas (namespaced por variante).
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("graph/ceps", variant, "special_treatment"))
 
-# Salidas del step: mismas claves que los insumos, pero describen dónde se persiste
-# cada DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
-output = {
-    # Transacciones con tratamiento de faltantes e ids de nodos resueltos.
-    "missing_treatment": {"table_or_hdfs": current_hdfs.joinpath("missing_treatment"),  # parquet de salida del step
-        "information_date_column": "mis_date",    # partición de fecha de información (YYYY-MM) escrita/releída
-        "process_date_column": "process_date",    # partición de fecha de proceso escrita/releída
-        "lag": 0,                                 # al releer la salida no se aplica desfase
-        "history": GRAPH_TOTAL_HISTORY_IN_MONTHS, # al releer se cubre la ventana completa del grafo
-        "information_date_mode":"each",           # todos los meses del intervalo
-        "process_date_mode":"last"                # por cada mes se usa la fecha de proceso más reciente
+    # Salidas del step: mismas claves que los insumos, pero describen dónde se persiste
+    # cada DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
+    output = {
+        # Transacciones con tratamiento de faltantes e ids de nodos resueltos.
+        "missing_treatment": {"table_or_hdfs": current_hdfs.joinpath("missing_treatment"),  # parquet de salida del step
+            "information_date_column": "mis_date",    # partición de fecha de información (YYYY-MM) escrita/releída
+            "process_date_column": "process_date",    # partición de fecha de proceso escrita/releída
+            "lag": 0,                                 # al releer la salida no se aplica desfase
+            "history": GRAPH_TOTAL_HISTORY_IN_MONTHS, # al releer se cubre la ventana completa del grafo
+            "information_date_mode":"each",           # todos los meses del intervalo
+            "process_date_mode":"last"                # por cada mes se usa la fecha de proceso más reciente
+        }
     }
-}
+    return input, output
+
+
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

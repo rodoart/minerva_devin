@@ -137,23 +137,67 @@ VECTOR_OUTPUT_COLUMN = "features"
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from config.graph_making.ceps.variants import DEFAULT_VARIANT, variant_subpath  # namespacing por variante de grafo (rfc/cta)
 
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))      # raíz HDFS de las salidas del job
-current_hdfs = _general_root_hdfs.joinpath("features/ceps/vector_assembler")  # directorio de salida del step
 
 
-input = {
-    # Pivote externo: misma fuente que lovelace_target; de ella solo se toma la
-    # lista de numclientes (cast a string + distinct) para los que se genera vector.
-    "pivot": {"table_or_hdfs": ctp_l_st.output["target_numcliente"]["table_or_hdfs"],
-        "pivot_column": PIVOT_COLUMN},     # columna que se renombra a "numcliente"
-    # Pivote a nivel cuenta: el target agregado por cta del special_treatment
-    # Lovelace (lleva todas las columnas de TARGET_AGGREGATIONS).
-    "pivot_cta": {"table_or_hdfs": ctp_l_st.output["target_cta"]["table_or_hdfs"],
-        "pivot_column": "cta"},            # columna que se renombra a "cta"
-    "nodes": ccen.output["nodes"],          # nodos del grafo: aportan los arrays `numcliente`/`cta` y oper_mto (peso)
-    "nodes_join_target_lovelace": cfcf.output["nodes_join_target_lovelace"],  # nodos + etiquetas target_lovelace*
-}
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) del vector assembler CEPS para una variante de grafo.
+
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `features/ceps/<variant>/vector_assembler`
+      e insumos (`nodes`, `nodes_join_target_lovelace`) de la misma variante.
+      Los pivotes (`pivot`, `pivot_cta`) son EXTERNOS al grafo y se comparten
+      entre variantes (no se namespacen).
+    """
+    _ean_input, ean_output = ccen.build(variant)
+    _tp_input, tp_output = cfcf.build(variant)
+
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("features/ceps", variant, "vector_assembler"))  # directorio de salida del step
+
+    input = {
+        # Pivote externo: misma fuente que lovelace_target; de ella solo se toma la
+        # lista de numclientes (cast a string + distinct) para los que se genera vector.
+        "pivot": {"table_or_hdfs": ctp_l_st.output["target_numcliente"]["table_or_hdfs"],
+            "pivot_column": PIVOT_COLUMN},     # columna que se renombra a "numcliente"
+        # Pivote a nivel cuenta: el target agregado por cta del special_treatment
+        # Lovelace (lleva todas las columnas de TARGET_AGGREGATIONS).
+        "pivot_cta": {"table_or_hdfs": ctp_l_st.output["target_cta"]["table_or_hdfs"],
+            "pivot_column": "cta"},            # columna que se renombra a "cta"
+        "nodes": ean_output["nodes"],          # nodos del grafo: aportan los arrays `numcliente`/`cta` y oper_mto (peso)
+        "nodes_join_target_lovelace": tp_output["nodes_join_target_lovelace"],  # nodos + etiquetas target_lovelace*
+    }
+
+    def _level_output(level:str) -> dict:
+        """Outputs particionados de un nivel de agregación: `{level}_features`
+        (llave + todas las variables con VARIABLE_SUFFIX) y `{level}_features_vector`
+        (solo llave + columna `features` del VectorAssembler)."""
+        base = {
+            "information_date_column": "mis_date",     # columna de fecha de información (partición mensual)
+            "process_date_column": "process_date",     # columna de fecha de proceso/ejecución (segunda partición)
+            "lag": 0,                                  # ventana sin desplazamiento respecto a vintage_date
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,  # meses de historia (12)
+            "information_date_mode":"each",            # se usan todos los meses del intervalo
+            "process_date_mode":"last"                 # por cada mes se toma la process_date más reciente
+        }
+        return {
+            f"{level}_features": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features"), **base},
+            f"{level}_features_vector": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features_vector"), **base},
+        }
+
+    # Salidas por nivel de agregación: tablas/parquets particionados por
+    # mis_date/process_date. `{nivel}_features` = llave + features; la tabla final
+    # `{nivel}_features_vector` = SOLO llave + columna vector.
+    output = {}
+    for _level in AGGREGATION_LEVELS:
+        output.update(_level_output(_level))
+    return input, output
+
+
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()
 
 
 # Fuentes de features a nivel nodo (`id`). Modos:
@@ -174,50 +218,40 @@ _GRAPH_FEATURE_KEYS = [  # claves de `output` de graph_features leídas como fue
     "weighted_degree_balance",
     # "weighted_triangle_count",
 ]
-FEATURE_SOURCES = {
-    key: {"mode": "merge_schema", "path": cfgf.output[key]["table_or_hdfs"]}
-    for key in _GRAPH_FEATURE_KEYS
-}
-# Scores de contagio: el padre target_propagation contiene un subdir por
-# combinación de parámetros y cada uno aporta su columna contagion_<weight_type>.
-FEATURE_SOURCES["contagion"] = {
-    "mode": "merge_schema",
-    "path": cfcf.output["target_propagation"]["table_or_hdfs"],
-}
-# Nodos con el target Lovelace unido: lectura particionada (mis_date/process_date)
-# vía la clave homónima de `input`; aporta las columnas target_lovelace_*.
-FEATURE_SOURCES["nodes_join_target_lovelace"] = {
-    "mode": "partitioned",
-    "key": "nodes_join_target_lovelace",
-}
-# Stats intra-grupo del step de clustering (una fila por `id`).
-FEATURE_SOURCES["cluster_stats"] = {
-    "mode": "simple",
-    "path": cclf.output["cluster_stats"]["table_or_hdfs"],
-}
 
 
-def _level_output(level:str) -> dict:
-    """Outputs particionados de un nivel de agregación: `{level}_features`
-    (llave + todas las variables con VARIABLE_SUFFIX) y `{level}_features_vector`
-    (solo llave + columna `features` del VectorAssembler)."""
-    base = {
-        "information_date_column": "mis_date",     # columna de fecha de información (partición mensual)
-        "process_date_column": "process_date",     # columna de fecha de proceso/ejecución (segunda partición)
-        "lag": 0,                                  # ventana sin desplazamiento respecto a vintage_date
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,  # meses de historia (12)
-        "information_date_mode":"each",            # se usan todos los meses del intervalo
-        "process_date_mode":"last"                 # por cada mes se toma la process_date más reciente
+def build_feature_sources(variant: str = "rfc") -> dict:
+    """Fuentes de features a nivel nodo por variante de grafo.
+
+    Deriva las rutas de las factories de la cadena (graph_features,
+    propagation_features y cluster_features de la MISMA variante): la
+    variante "rfc" produce las rutas históricas y el resto las namespaced.
+    """
+    _gf_input, gf_output = cfgf.build(variant)
+    _tp_input, tp_output = cfcf.build(variant)
+    _cl_input, cl_output = cclf.build(variant)
+    sources = {
+        key: {"mode": "merge_schema", "path": gf_output[key]["table_or_hdfs"]}
+        for key in _GRAPH_FEATURE_KEYS
     }
-    return {
-        f"{level}_features": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features"), **base},
-        f"{level}_features_vector": {"table_or_hdfs": current_hdfs.joinpath(f"{level}_features_vector"), **base},
+    # Scores de contagio: el padre target_propagation contiene un subdir por
+    # combinación de parámetros y cada uno aporta su columna contagion_<weight_type>.
+    sources["contagion"] = {
+        "mode": "merge_schema",
+        "path": tp_output["target_propagation"]["table_or_hdfs"],
     }
+    # Nodos con el target Lovelace unido: lectura particionada (mis_date/process_date)
+    # vía la clave homónima de `input`; aporta las columnas target_lovelace_*.
+    sources["nodes_join_target_lovelace"] = {
+        "mode": "partitioned",
+        "key": "nodes_join_target_lovelace",
+    }
+    # Stats intra-grupo del step de clustering (una fila por `id`).
+    sources["cluster_stats"] = {
+        "mode": "simple",
+        "path": cl_output["cluster_stats"]["table_or_hdfs"],
+    }
+    return sources
 
 
-# Salidas por nivel de agregación: tablas/parquets particionados por
-# mis_date/process_date. `{nivel}_features` = llave + features; la tabla final
-# `{nivel}_features_vector` = SOLO llave + columna vector.
-output = {}
-for _level in AGGREGATION_LEVELS:
-    output.update(_level_output(_level))
+FEATURE_SOURCES = build_feature_sources()

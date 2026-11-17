@@ -129,63 +129,106 @@ GROUP_ID_AGGREGATIONS = [
 ]
 
 
+def column_spec(variant: str = "rfc") -> dict:
+    """Columnas del split por lado (`txn_src`/`txn_dst`) según la variante.
+
+    - "rfc" (histórico): `numcliente` es columna COMÚN (viene del select de
+      special_treatment) y el pipeline la filtra por `cve_tipo_orden`
+      (E en el lado origen, R en el destino).
+    - "cta": el numcliente se imputa por lado en special_treatment
+      (`numcliente_src`/`numcliente_dst` vía `mapeo_cta_numcliente`), así que
+      viaja como columna de LADO (el split le quita el sufijo y queda
+      `numcliente` por lado) y `numcliente` sale de las comunes para no
+      colisionar. Sin filtro E/R: el numcliente imputado no depende del tipo
+      de ordenante.
+    """
+    if variant == "cta":
+        return {
+            "SRC_COLUMNS": SRC_COLUMNS + ["numcliente_src"],
+            "DST_COLUMNS": DST_COLUMNS + ["numcliente_dst"],
+            "COMMON_COLUMNS": [c for c in COMMON_COLUMNS if c != "numcliente"],
+        }
+    return {
+        "SRC_COLUMNS": SRC_COLUMNS,
+        "DST_COLUMNS": DST_COLUMNS,
+        "COMMON_COLUMNS": COMMON_COLUMNS,
+    }
+
+
 # --------------------------------------------------------------------------------------
 # RELATIVE PATHS
 # --------------------------------------------------------------------------------------
 
+from .variants import DEFAULT_VARIANT, variant_subpath   # namespacing por variante de grafo (rfc/cta)
 
-# Raíz HDFS general del job y directorio donde este step persiste sus salidas.
+# Raíz HDFS general del job (sandbox); base para las rutas de salida del grafo.
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))
-current_hdfs = _general_root_hdfs.joinpath("graph/ceps/group_by")
 
 
-# Insumos del step: reutiliza la definición de salida del step special_treatment
-# (misma ruta y mismas claves de particionado/lectura; ver comentarios en special_treatment.input).
-input = {
-    "missing_treatment" : special_treatment_output["missing_treatment"]
-}
+def build(variant: str = DEFAULT_VARIANT):
+    """(input, output) del group_by CEPS para una variante de grafo.
 
+    - "rfc": rutas históricas intactas (cero recomputo de lo persistido).
+    - otras: rutas namespaced bajo `graph/ceps/<variant>/group_by` e insumo
+      `missing_treatment` de la misma variante.
+    """
+    st_input, st_output = c_gmc_st.build(variant)
 
-# Salidas del step: mismas claves que los insumos; describen dónde se persiste cada
-# DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
-output = {
-    # Transacciones agregadas por arista (id_src, id_dst).
-    "group_by_txn": {"table_or_hdfs": current_hdfs.joinpath("group_by_txn"),  # parquet de salida
-        "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": 0,                                         # sin desfase al releer
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
-    },
-    # Nodos agregados por "id" (unión de los lados origen y destino de las txns).
-    "group_by_id": {"table_or_hdfs": current_hdfs.joinpath("group_by_id"),    # parquet de salida
-        "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": 0,                                         # sin desfase al releer
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
-    },
-    # Agregados parciales por arista-MES: base incremental de group_by_txn.
-    # Una partición por mes de información de la transacción; en corridas
-    # mensuales solo se computan los meses ausentes de la ventana
-    # (ver libs.framework.ensure_monthly_partitions).
-    "group_by_txn_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_txn_monthly"),
-        "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": 0,                                         # sin desfase al releer
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
-    },
-    # Agregados parciales por nodo-MES: base incremental de group_by_id.
-    "group_by_id_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_id_monthly"),
-        "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
-        "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
-        "lag": 0,                                         # sin desfase al releer
-        "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
-        "information_date_mode":"each",                   # todos los meses del intervalo
-        "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+    # Raíz HDFS general del job y directorio donde este step persiste sus salidas.
+    current_hdfs = _general_root_hdfs.joinpath(
+        variant_subpath("graph/ceps", variant, "group_by"))
+
+    # Insumos del step: reutiliza la definición de salida del step special_treatment
+    # (misma ruta y mismas claves de particionado/lectura; ver comentarios en special_treatment.input).
+    input = {
+        "missing_treatment" : st_output["missing_treatment"]
     }
-}
+
+    # Salidas del step: mismas claves que los insumos; describen dónde se persiste cada
+    # DataFrame y cómo se relee después (recarga de caché vía `dynamic_partitioned_table_or_parquet`).
+    output = {
+        # Transacciones agregadas por arista (id_src, id_dst).
+        "group_by_txn": {"table_or_hdfs": current_hdfs.joinpath("group_by_txn"),  # parquet de salida
+            "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": 0,                                         # sin desfase al releer
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        },
+        # Nodos agregados por "id" (unión de los lados origen y destino de las txns).
+        "group_by_id": {"table_or_hdfs": current_hdfs.joinpath("group_by_id"),    # parquet de salida
+            "information_date_column": "mis_date",            # partición de fecha de información (YYYY-MM) escrita/releída
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": 0,                                         # sin desfase al releer
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # al releer se cubre la ventana completa del grafo
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        },
+        # Agregados parciales por arista-MES: base incremental de group_by_txn.
+        # Una partición por mes de información de la transacción; en corridas
+        # mensuales solo se computan los meses ausentes de la ventana
+        # (ver libs.framework.ensure_monthly_partitions).
+        "group_by_txn_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_txn_monthly"),
+            "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": 0,                                         # sin desfase al releer
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        },
+        # Agregados parciales por nodo-MES: base incremental de group_by_id.
+        "group_by_id_monthly": {"table_or_hdfs": current_hdfs.joinpath("group_by_id_monthly"),
+            "information_date_column": "month_partition",     # partición mensual (fin de mes de la txn)
+            "process_date_column": "process_date",            # partición de fecha de proceso escrita/releída
+            "lag": 0,                                         # sin desfase al releer
+            "history": c_gmc.GRAPH_TOTAL_HISTORY_IN_MONTHS,   # ventana completa del grafo en meses
+            "information_date_mode":"each",                   # todos los meses del intervalo
+            "process_date_mode":"last"                        # por cada mes se usa la fecha de proceso más reciente
+        }
+    }
+    return input, output
+
+
+# Back-compat: el módulo expone el (input, output) de la variante por defecto.
+input, output = build()

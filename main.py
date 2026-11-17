@@ -77,10 +77,17 @@ def build_spark():
 
 
 def build_pipeline(spark):
-    """Construye la cadena completa de steps y devuelve el último.
+    """Construye la cadena completa de steps y devuelve los steps terminales.
+
+    Construye UNA cadena por cada variante de grafo de
+    `config.graph_making.ceps.variants.ENABLED_VARIANTS` ("rfc": grafo
+    RFC-RFC histórico; "cta": grafo cta-cta con imputación de numcliente vía
+    `mapeo_cta_numcliente`). Los steps previos al grafo (rfc_nom_ranking,
+    txn_replacement) y el special treatment del target Lovelace se comparten
+    entre variantes y se construyen una sola vez.
 
     `Step.execute()` ejecuta recursivamente los `previous_step`, por lo que
-    ejecutar el último step lanza todo el flujo (reanudable: cada etapa
+    ejecutar los steps terminales lanza todo el flujo (reanudable: cada etapa
     recarga su parquet/partición si ya existe).
     """
     # --- pipelines ---
@@ -106,6 +113,7 @@ def build_pipeline(spark):
     import config.features.ceps.target_propagation_features as cfcf
     import config.features.ceps.cluster_features as cclf
     import config.features.ceps.vector_assembler as cvas
+    from config.graph_making.ceps.variants import ENABLED_VARIANTS
     #
     configure_logging(level="WARNING")
     logger.info("Construyendo cadena de steps del pipeline")
@@ -127,82 +135,104 @@ def build_pipeline(spark):
         cohort=cj.COHORT,
         previous_step=[ceps_rfs_nom_ranking_step],
     )
-    graph_special_treatment_step = p_gm_st.CepsSpecialTreatment(
-        date_treatment=cj.date_treatment,
-        input_hive=ccspt.input,
-        output_hive=ccspt.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[ceps_txn_replacement_step],
-    )
-    graph_group_by_step = p_gm_gb.CepsGroupByStep(
-        date_treatment=cj.date_treatment,
-        input_hive=ccgb.input,
-        output_hive=ccgb.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[graph_special_treatment_step],
-    )
-    graph_edges_and_nodes_step = p_gm_en.CepsEdgesAndNodesStep(
-        date_treatment=cj.date_treatment,
-        input_hive=ccgen.input,
-        output_hive=ccgen.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[graph_group_by_step],
-    )
-    graph_features_step = p_f_cgf.CepsGraphFeaturesStep(
-        date_treatment=cj.date_treatment,
-        input_hive=cfgf.input,
-        output_hive=cfgf.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[graph_edges_and_nodes_step],
-    )
-    target_propagation_step = p_tp_l_st.LovelaceTargetPropagationSpecialTreatmentStep(
-        date_treatment=cj.date_treatment,
-        input_hive=ctp_l_st.input,
-        output_hive=ctp_l_st.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[graph_features_step],
-    )
-    target_propagation_features_step = p_f_tp.CepsTargetPropagationFeaturesStep(
-        date_treatment=cj.date_treatment,
-        input_hive=cfcf.input,
-        output_hive=cfcf.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[target_propagation_step],
-    )
-    cluster_features_step = p_f_clf.CepsClusterFeaturesStep(
-        date_treatment=cj.date_treatment,
-        input_hive=cclf.input,
-        output_hive=cclf.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[target_propagation_features_step],
-    )
-    vector_assembler_step = p_f_va.CepsVectorAssemblerStep(
-        date_treatment=cj.date_treatment,
-        input_hive=cvas.input,
-        output_hive=cvas.output,
-        is_dynamic=True,
-        cohort=cj.COHORT,
-        sqlContext=spark,
-        previous_step=[cluster_features_step],
-    )
 
-    logger.info("Cadena construida: 10 steps (último: %s)",
-        vector_assembler_step.step_name)
-    return vector_assembler_step
+    # El special treatment del target Lovelace es EXTERNO al grafo (lee la
+    # tabla de fraudes, no aristas/nodos): se comparte entre variantes y se
+    # construye una sola vez, colgado del primer graph_features.
+    target_propagation_step = None
+    terminal_steps = []
+    for variant in ENABLED_VARIANTS:
+        spt_input, spt_output = ccspt.build(variant)
+        gb_input, gb_output = ccgb.build(variant)
+        ean_input, ean_output = ccgen.build(variant)
+        gf_input, gf_output = cfgf.build(variant)
+        tpf_input, tpf_output = cfcf.build(variant)
+        clf_input, clf_output = cclf.build(variant)
+        va_input, va_output = cvas.build(variant)
+
+        graph_special_treatment_step = p_gm_st.CepsSpecialTreatment(
+            date_treatment=cj.date_treatment,
+            input_hive=spt_input,
+            output_hive=spt_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[ceps_txn_replacement_step],
+            variant=variant,
+        )
+        graph_group_by_step = p_gm_gb.CepsGroupByStep(
+            date_treatment=cj.date_treatment,
+            input_hive=gb_input,
+            output_hive=gb_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[graph_special_treatment_step],
+            variant=variant,
+        )
+        graph_edges_and_nodes_step = p_gm_en.CepsEdgesAndNodesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=ean_input,
+            output_hive=ean_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[graph_group_by_step],
+        )
+        graph_features_step = p_f_cgf.CepsGraphFeaturesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=gf_input,
+            output_hive=gf_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[graph_edges_and_nodes_step],
+        )
+        if target_propagation_step is None:
+            target_propagation_step = p_tp_l_st.LovelaceTargetPropagationSpecialTreatmentStep(
+                date_treatment=cj.date_treatment,
+                input_hive=ctp_l_st.input,
+                output_hive=ctp_l_st.output,
+                is_dynamic=True,
+                cohort=cj.COHORT,
+                sqlContext=spark,
+                previous_step=[graph_features_step],
+            )
+        target_propagation_features_step = p_f_tp.CepsTargetPropagationFeaturesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=tpf_input,
+            output_hive=tpf_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[target_propagation_step],
+        )
+        cluster_features_step = p_f_clf.CepsClusterFeaturesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=clf_input,
+            output_hive=clf_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[target_propagation_features_step],
+            variant=variant,
+        )
+        vector_assembler_step = p_f_va.CepsVectorAssemblerStep(
+            date_treatment=cj.date_treatment,
+            input_hive=va_input,
+            output_hive=va_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[cluster_features_step],
+            variant=variant,
+        )
+        terminal_steps.append(vector_assembler_step)
+
+    logger.info("Cadena construida: %d variante(s) %s (terminales: %s)",
+        len(ENABLED_VARIANTS), ENABLED_VARIANTS,
+        [step.step_name for step in terminal_steps])
+    return terminal_steps
 
 
 def main() -> int:
@@ -213,19 +243,23 @@ def main() -> int:
     try:
         check_environment()
         spark = build_spark()
-        last_step = build_pipeline(spark)
+        last_steps = build_pipeline(spark)
         if args.build_only:
             logger.info("--build-only: cadena construida, no se ejecuta")
             return 0
         if args.cleanup_only:
-            deleted = last_step.delete_tmp_paths()
+            deleted = []
+            for step in last_steps:
+                deleted += step.delete_tmp_paths()
             logger.info("Limpieza: %d parquets intermedios borrados", len(deleted))
             return 0
-        logger.info("Ejecutando flujo completo (último step: %s)",
-            last_step.step_name)
-        last_step.execute()
+        for step in last_steps:
+            logger.info("Ejecutando flujo (step terminal: %s)", step.step_name)
+            step.execute()
         if not args.no_cleanup:
-            deleted = last_step.delete_tmp_paths()
+            deleted = []
+            for step in last_steps:
+                deleted += step.delete_tmp_paths()
             logger.info("Limpieza post-flujo: %d paths intermedios borrados",
                 len(deleted))
     except Exception:

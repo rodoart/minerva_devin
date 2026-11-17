@@ -14,13 +14,12 @@ from typing import Dict, Any, List
 # ------------------------------------------------------------------------------
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import col, countDistinct, max as spark_max, expr as spark_expr
+from pyspark.sql.functions import col, max as spark_max, expr as spark_expr
 # ------------------------------------------------------------------------------
 # Custom
 # ------------------------------------------------------------------------------
-from libs.functions.assembly import (build_aggregation_expressions,
-    explode_array_column, get_feature_columns, assemble_vector,
-    salted_assembly_groupby, run_aggregation_specs
+from libs.functions.assembly import (explode_array_column, get_feature_columns,
+    assemble_vector, run_aggregation_specs
 )
 from libs.functions.missing_treatment import apply_missing_treatment
 
@@ -40,7 +39,17 @@ logger = get_logger(__name__)
 
 class CepsVectorAssemblerStep(p_f_va.StandardVectorAssemblerStep):
     """Step final: features a nivel numcliente + VectorAssembler sobre un pivote.
+
+    Acepta `variant` ("rfc" por defecto): las fuentes de features a nivel
+    nodo se derivan de la variante (`cvas.build_feature_sources`), de modo
+    que cada grafo ensambla sus propios parquets namespaced.
     """
+    def __init__(self, *args, variant: str = "rfc", **kwargs) -> None:
+        self.variant = variant
+        super().__init__(*args, **kwargs)
+        if variant != "rfc":
+            self.step_name = f"{self.step_name}_{variant}"
+        #
     def step_action(self) -> Dict[str, Any]:
         """Ejecuta la sub-etapa de ensamblado Lovelace-CEPS y recoge su salida."""
         return ppf.run_substep_and_collect(self, self.lovelace_ceps_assembler_step, "lovelace_ceps_assembler_step")
@@ -107,7 +116,16 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
         # Dedupe: la primera fuente que aporta una columna gana (evita
         # referencias ambiguas al unir tablas con columnas homónimas).
         seen_columns = set(self.nodes.columns)
-        for name, source in cvas.FEATURE_SOURCES.items():
+        # La variante puede vivir en el step padre o en el propio substep
+        # (los tests instancian el substep sin padre -> "rfc" por defecto).
+        # Para la variante por defecto se usa el atributo de módulo
+        # `FEATURE_SOURCES` (monkeypatch-able en tests); el resto deriva las
+        # rutas namespaced con `build_feature_sources`.
+        variant = getattr(self, "variant", None) \
+            or getattr(getattr(self, "parent", None), "variant", "rfc")
+        feature_sources = cvas.FEATURE_SOURCES if variant == "rfc" \
+            else cvas.build_feature_sources(variant)
+        for name, source in feature_sources.items():
             if source.get("enabled", True) is False:
                 logger.info("Fuente de features %s desactivada (enabled=False)", name)
                 continue

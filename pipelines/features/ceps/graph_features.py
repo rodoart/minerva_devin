@@ -69,7 +69,7 @@ class CepsGraphFeaturesUnWeightedStep(p_f_cgf.StandardGraphFeaturesUnWeightedSte
         return self.run_selected_features(  # <- método base (no la property)
             all_prefixes=cfgf.GRAPH_ALL_FEATURE_PREFIXES,
             features_to_run=cfgf.GRAPH_CENTRALITY_FEATURES,
-            output_config_dict=cfgf.output,
+            output_config_dict=self.output_hive,
             current_prefix="",
             column_renames=cfgf.GRAPH_RENAMES,
             edge_final_columns=["src", "dst"],
@@ -101,7 +101,7 @@ class CepsGraphFeaturesWeightedStep(p_f_cgf.StandardGraphFeaturesWeightedStep):
         return self.run_selected_features(
             all_prefixes=cfgf.GRAPH_ALL_FEATURE_PREFIXES,
             features_to_run=cfgf.GRAPH_CENTRALITY_FEATURES,
-            output_config_dict=cfgf.output,
+            output_config_dict=self.output_hive,
             current_prefix="weighted",
             column_renames=cfgf.GRAPH_RENAMES,
             edge_final_columns=["src", "dst", "weight"]

@@ -86,7 +86,7 @@ class TestMainFlow:
             monkeypatch.setenv(var, "x")
         fake_step = type("FakeStep", (), {"step_name": "fake_step"})()
         with patch.object(main, "build_spark", return_value="SPARK"), \
-             patch.object(main, "build_pipeline", return_value=fake_step) as bp, \
+             patch.object(main, "build_pipeline", return_value=[fake_step]) as bp, \
              patch.object(sys, "argv", ["main.py", "--build-only"]), \
              caplog.at_level(logging.INFO):
             exit_code = main.main()
@@ -100,10 +100,31 @@ class TestMainFlow:
         calls = []
         fake_step = type("FakeStep", (), {
             "step_name": "fake_step",
-            "execute": lambda self: calls.append(1)})()
+            "execute": lambda self: calls.append(1),
+            "delete_tmp_paths": lambda self: []})()
         with patch.object(main, "build_spark", return_value="SPARK"), \
-             patch.object(main, "build_pipeline", return_value=fake_step), \
+             patch.object(main, "build_pipeline", return_value=[fake_step]), \
              patch.object(sys, "argv", ["main.py"]):
             exit_code = main.main()
         assert exit_code == 0
         assert calls == [1]
+
+    def test_execute_called_on_each_terminal_step(self, monkeypatch):
+        """Con varias variantes de grafo hay varios steps terminales: todos se ejecutan."""
+        for var in main.REQUIRED_ENV_VARS:
+            monkeypatch.setenv(var, "x")
+        calls = []
+
+        def make_step(name):
+            return type("FakeStep", (), {
+                "step_name": name,
+                "execute": lambda self: calls.append(self.step_name),
+                "delete_tmp_paths": lambda self: []})()
+
+        with patch.object(main, "build_spark", return_value="SPARK"), \
+             patch.object(main, "build_pipeline",
+                 return_value=[make_step("va_rfc"), make_step("va_cta")]), \
+             patch.object(sys, "argv", ["main.py"]):
+            exit_code = main.main()
+        assert exit_code == 0
+        assert calls == ["va_rfc", "va_cta"]
