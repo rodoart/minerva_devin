@@ -81,21 +81,28 @@ def _mode_columns(mode: dict) -> dict:
     }}
 
 
-def propagation_node_columns(targets: dict = None) -> list:
-    """Columnas `target_lovelace*` combinadas que quedan en los nodos.
+def propagation_node_columns(targets: dict = None, synthetic_rules: list = None) -> list:
+    """Columnas `target_lovelace*` y `target_synthetic_*` que quedan en los nodos.
 
     "target" -> "target_lovelace"; cualquier otra columna (scores, etc.) ->
-    "target_lovelace_<columna>". Útil para `node_final_columns` del grafo.
+    "target_lovelace_<columna>"; las reglas sintéticas añaden
+    `target_synthetic_<name>`. Con `targets` explícito (modo custom) las
+    sintéticas solo entran si se piden vía `synthetic_rules`; con la config
+    global (targets=None) se incluyen las de SYNTHETIC_TARGETS por defecto.
+    Útil para `node_final_columns` del grafo.
     """
     if targets is None:
         targets = TARGETS
+        if synthetic_rules is None:
+            synthetic_rules = SYNTHETIC_TARGETS
     columns = set()
     for target in targets.values():
         for mode in target["modes"].values():
             columns.update(_mode_columns(mode).keys())
-    return sorted(
+    lovelace_columns = sorted(
         "target_lovelace" if column == "target" else f"target_lovelace_{column}"
         for column in columns)
+    return lovelace_columns + synthetic_node_columns(synthetic_rules)
 
 
 # --------------------------------------------------------------------------------------
@@ -107,6 +114,33 @@ def propagation_node_columns(targets: dict = None) -> list:
 # mean_oper_mto, count_txn, composed.
 WEIGHT_TYPES = list(ctp_en_st.WEIGHT_COLUMNS.keys())
 
+# --------------------------------------------------------------------------------------
+# SYNTHETIC TARGETS (Minerva es genérico: fraude, crédito, ...)
+# --------------------------------------------------------------------------------------
+# Cuando no hay etiqueta real (o se quiere un proxy), una regla sintética marca
+# nodos a partir de una métrica de nodo ya calculada y produce la columna
+# `target_synthetic_<name>` en los nodos, que se propaga por el grafo como
+# cualquier otra semilla (genera `contagion_<name>_<weight>`).
+#
+# Regla: {"name", "source_key" (clave de output de graph_features, p.ej.
+# "pagerank"), "column" (None = primera no-id), "rule"
+# ("top_quantile"/"above_threshold"/"top_n"), "q"/"threshold"/"n",
+# "value": "binary"|"score"}.
+SYNTHETIC_TARGETS = [
+    {"name": "pagerank_top", "source_key": "pagerank", "column": "pagerank",
+     "rule": "top_quantile", "q": 0.99, "value": "binary"},
+]
+
+# Pesos con los que se propagan las semillas sintéticas (subset de
+# WEIGHT_TYPES): el target real usa todos; las sintéticas son exploratorias y
+# propagarlas por los 6 pesos multiplicaría el coste del step.
+SYNTHETIC_WEIGHT_TYPES = ["composed"]
+
+
+def synthetic_node_columns(rules: list = None) -> list:
+    """Columnas `target_synthetic_<name>` de las reglas dadas ([] si None)."""
+    return [f"target_synthetic_{rule['name']}" for rule in (rules or [])]
+
 # Hiperparámetros de la difusión de contagio (standard_propagate_target).
 PROPAGATION_MAX_ITER = 3              # iteraciones de paso de mensajes por el grafo
 PROPAGATION_ALPHA = 0.15              # amortiguación: peso del score entrante frente al propio (1-alpha)
@@ -117,26 +151,47 @@ PROPAGATION_KEEP_SEED_FLOOR = True    # el score de un nodo nunca cae por debajo
 # 0/None desactiva la sal.
 DEGREE_SALT_BUCKETS = 64
 
-# Features de contagio generadas: una por (columna de target propagada x
-# weight_type). La columna semilla `target_lovelace` produce `contagion_<weight>`;
-# el resto (`target_lovelace_<col>`: scores, etc.) produce
-# `contagion_<col>_<weight>`. Cada kwargs va a `propagate_target` y, al ser
-# escalares, parametriza el subdirectorio de salida
-# (weight_type=.../target_column=.../max_iter=.../alpha=.../keep_seed_floor=...).
-PROPAGATION_FEATURES = [
-    {(
-        f"contagion_{weight_type}"
-        if node_column == "target_lovelace"
-        else f"contagion_{node_column.replace('target_lovelace_', '')}_{weight_type}"
-    ): {
+def _contagion_feature_name(node_column: str, weight_type: str) -> str:
+    """Nombre de la feature de contagio: `contagion_[<semilla>_]<weight>`.
+
+    - `target_lovelace`          -> `contagion_<weight>` (histórico)
+    - `target_lovelace_<col>`    -> `contagion_<col>_<weight>` (histórico)
+    - `target_synthetic_<name>`  -> `contagion_synthetic_<name>_<weight>`
+    """
+    if node_column == "target_lovelace":
+        seed = ""
+    elif node_column.startswith("target_lovelace_"):
+        seed = node_column.replace("target_lovelace_", "") + "_"
+    elif node_column.startswith("target_synthetic_"):
+        seed = "synthetic_" + node_column.replace("target_synthetic_", "") + "_"
+    else:
+        seed = node_column + "_"
+    return f"contagion_{seed}{weight_type}"
+
+
+def _propagation_feature(node_column: str, weight_type: str) -> dict:
+    """Entrada de PROPAGATION_FEATURES para una (semilla, weight_type)."""
+    return {_contagion_feature_name(node_column, weight_type): {
         "weight_type": weight_type,                       # clave del mapa `weights` usada como peso de arista
         "target_column": node_column,                     # columna semilla en los nodos a propagar
         "max_iter": PROPAGATION_MAX_ITER,                 # iteraciones de difusión
         "alpha": PROPAGATION_ALPHA,                       # factor de amortiguación de la difusión
         "keep_seed_floor": PROPAGATION_KEEP_SEED_FLOOR,   # floor en la semilla del target
     }}
-    for node_column in propagation_node_columns()
-    for weight_type in WEIGHT_TYPES
+
+
+# Features de contagio generadas: una por (columna semilla x weight_type).
+# Las semillas Lovelace (reales) se propagan con TODOS los pesos; las
+# sintéticas solo con SYNTHETIC_WEIGHT_TYPES (son exploratorias). Cada kwargs
+# va a `propagate_target` y, al ser escalares, parametriza el subdirectorio
+# de salida (weight_type=.../target_column=.../max_iter=.../alpha=.../...).
+PROPAGATION_FEATURES = [
+    *[_propagation_feature(column, weight_type)
+      for column in propagation_node_columns(synthetic_rules=[])
+      for weight_type in WEIGHT_TYPES],
+    *[_propagation_feature(column, weight_type)
+      for column in synthetic_node_columns(SYNTHETIC_TARGETS)
+      for weight_type in SYNTHETIC_WEIGHT_TYPES],
 ]
 
 

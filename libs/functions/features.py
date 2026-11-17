@@ -724,3 +724,77 @@ GRAPH_FEATURE_FUNCTIONS = {
     "weighted_triangle_count": weighted_triangle_count,
     "target_propagation": propagate_target,
 }
+
+
+###############################################################################
+# SYNTHETIC TARGETS
+###############################################################################
+
+def synthetic_target_column_name(rule_name: str) -> str:
+    """Nombre de la columna target sintética de una regla: `target_synthetic_<name>`."""
+    return f"target_synthetic_{rule_name}"
+
+
+def add_synthetic_targets(
+    nodes: DataFrame,
+    sources: Dict[str, DataFrame],
+    rules: List[Dict],
+) -> DataFrame:
+    """Marca nodos con targets sintéticos derivados de features de nodo.
+
+    Minerva es un framework genérico (fraude, crédito, ...): cuando no hay
+    etiqueta real (o se quiere un proxy), una regla sintética selecciona
+    nodos "interesantes" a partir de una métrica de nodo ya calculada
+    (p.ej. pagerank) y produce una columna `target_synthetic_<name>` que
+    puede propagarse por el grafo como cualquier otra semilla
+    (`PROPAGATION_FEATURES`).
+
+    Cada regla es un dict:
+      - "name": sufijo de la columna de salida.
+      - "source": clave de `sources` con el DataFrame (id, <columna score>).
+      - "column": columna de score de la fuente (None = primera no-id).
+      - "rule": "top_quantile" (marca score >= cuantil `q`),
+                "above_threshold" (marca score >= `threshold`),
+                "top_n" (marca los `n` de mayor score).
+      - "value": "binary" (1.0 a los marcados, default) o "score" (su score).
+    Los nodos no marcados quedan a 0.0 (semilla nula) para que la
+    propagación los trate como no-semilla.
+    """
+    result = nodes
+    for rule in rules:
+        name = rule["name"]
+        target_column = synthetic_target_column_name(name)
+        source_key = rule.get("source", name)
+        if source_key not in sources:
+            raise KeyError(
+                f"Regla sintética {name!r}: fuente {source_key!r} ausente "
+                f"en sources ({sorted(sources)})")
+        frame = sources[source_key]
+        score_column = rule.get("column") or next(
+            c for c in frame.columns if c != "id")
+        scores = frame.select(
+            "id", col(score_column).cast("double").alias("_syn_score"))
+
+        rule_type = rule["rule"]
+        if rule_type == "top_quantile":
+            quantiles = scores.approxQuantile("_syn_score", [rule["q"]], 0.001)
+            marked = (scores.filter(col("_syn_score") >= lit(quantiles[0]))
+                if quantiles else scores.limit(0))
+        elif rule_type == "above_threshold":
+            marked = scores.filter(col("_syn_score") >= lit(rule["threshold"]))
+        elif rule_type == "top_n":
+            marked = scores.orderBy(col("_syn_score").desc()).limit(rule["n"])
+        else:
+            raise ValueError(
+                f"Regla sintética desconocida: {rule_type!r} "
+                "(top_quantile | above_threshold | top_n)")
+
+        value_expression = (lit(1.0) if rule.get("value", "binary") == "binary"
+            else col("_syn_score"))
+        marked = marked.select(
+            "id", value_expression.cast("double").alias(target_column))
+        result = (result
+            .join(marked, on="id", how="left")
+            .withColumn(target_column,
+                coalesce(col(target_column), lit(0.0))))
+    return result
