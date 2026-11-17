@@ -99,6 +99,8 @@ def build_pipeline(spark):
     import pipelines.features.ceps.graph_features as p_f_cgf
     import pipelines.target_propagation.lovelace.special_treatment as p_tp_l_st
     import pipelines.features.ceps.target_propagation_features as p_f_tp
+    import pipelines.features.ceps.risk_features as p_f_rf
+    import pipelines.features.ceps.temporal_features as p_f_tf
     import pipelines.features.ceps.cluster_features as p_f_clf
     import pipelines.features.ceps.vector_assembler as p_f_va
     # --- configs ---
@@ -111,6 +113,8 @@ def build_pipeline(spark):
     import config.features.ceps.graph_features as cfgf
     import config.target_propagation.lovelace.special_treatment as ctp_l_st
     import config.features.ceps.target_propagation_features as cfcf
+    import config.features.ceps.risk_features as crf
+    import config.features.ceps.temporal_features as ctf
     import config.features.ceps.cluster_features as cclf
     import config.features.ceps.vector_assembler as cvas
     from config.graph_making.ceps.variants import ENABLED_VARIANTS
@@ -147,6 +151,8 @@ def build_pipeline(spark):
         ean_input, ean_output = ccgen.build(variant)
         gf_input, gf_output = cfgf.build(variant)
         tpf_input, tpf_output = cfcf.build(variant)
+        rf_input, rf_output = crf.build(variant)
+        tf_input, tf_output = ctf.build(variant)
         clf_input, clf_output = cclf.build(variant)
         va_input, va_output = cvas.build(variant)
 
@@ -206,6 +212,27 @@ def build_pipeline(spark):
             cohort=cj.COHORT,
             sqlContext=spark,
             previous_step=[target_propagation_step],
+            variant=variant,
+        )
+        risk_features_step = p_f_rf.CepsRiskFeaturesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=rf_input,
+            output_hive=rf_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[target_propagation_features_step],
+            variant=variant,
+        )
+        temporal_features_step = p_f_tf.CepsTemporalFeaturesStep(
+            date_treatment=cj.date_treatment,
+            input_hive=tf_input,
+            output_hive=tf_output,
+            is_dynamic=True,
+            cohort=cj.COHORT,
+            sqlContext=spark,
+            previous_step=[risk_features_step],
+            variant=variant,
         )
         cluster_features_step = p_f_clf.CepsClusterFeaturesStep(
             date_treatment=cj.date_treatment,
@@ -214,7 +241,7 @@ def build_pipeline(spark):
             is_dynamic=True,
             cohort=cj.COHORT,
             sqlContext=spark,
-            previous_step=[target_propagation_features_step],
+            previous_step=[temporal_features_step],
             variant=variant,
         )
         vector_assembler_step = p_f_va.CepsVectorAssemblerStep(

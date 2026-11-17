@@ -20,6 +20,8 @@ import config.job as c_j
 import config.graph_making.ceps.edges_and_nodes as ccen
 import config.features.ceps.graph_features as cfgf
 import config.features.ceps.target_propagation_features as cfcf
+import config.features.ceps.risk_features as crf
+import config.features.ceps.temporal_features as ctf
 
 ##########################################################################################
 # CONFIGURATION
@@ -137,8 +139,17 @@ def build_graph_feature_sources(variant: str = "rfc") -> dict:
     """
     _gf_input, gf_output = cfgf.build(variant)
     _tp_input, tp_output = cfcf.build(variant)
+    _rf_input, rf_output = crf.build(variant)
+    _tf_input, tf_output = ctf.build(variant)
     sources = {key: gf_output[key]["table_or_hdfs"] for key in GRAPH_FEATURE_KEYS}
     sources["contagion"] = tp_output["target_propagation"]["table_or_hdfs"]
+    # Risk features de nodo y de par (agregadas a X): entran en los stats de
+    # grupo para perfilar la exposición al fraude de cada componente.
+    sources["risk_node_features"] = rf_output["risk_node_features"]["table_or_hdfs"]
+    sources["pair_features_node"] = rf_output["pair_features_node"]["table_or_hdfs"]
+    # Features temporales de nodo y de par (agregadas a X).
+    sources["temporal_node_features"] = tf_output["temporal_node_features"]["table_or_hdfs"]
+    sources["temporal_pair_node"] = tf_output["temporal_pair_node"]["table_or_hdfs"]
     return sources
 
 

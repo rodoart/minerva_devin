@@ -363,7 +363,18 @@ class StandardTargetPropagationSubStep(SubStep, p_f_fg.SubStep):
 
 
 class CepsTargetPropagationFeaturesStep(StandardTargetPropagationFeaturesStep):
-    """Step concreto: join del target Lovelace a los nodos CEPS + features de contagio."""
+    """Step concreto: join del target Lovelace a los nodos CEPS + features de contagio.
+
+    Acepta `variant` ("rfc" por defecto): los targets sintéticos
+    (`SYNTHETIC_TARGETS`) se calculan sobre las fuentes de graph_features de
+    la MISMA variante; el sufijo de step_name distingue las cadenas.
+    """
+    def __init__(self, *args, variant: str = "rfc", **kwargs) -> None:
+        self.variant = variant
+        super().__init__(*args, **kwargs)
+        if variant != "rfc":
+            self.step_name = f"{self.step_name}_{variant}"
+        #
     def step_action(self) -> Dict[str, Any]:
         """Ejecuta el join del target Lovelace y la propagación, recogiendo salidas."""
         ppf.run_substep_and_collect(self, self.lovelace_ceps_join_graph_step, "lovelace_ceps_join_graph_step")
@@ -458,6 +469,39 @@ class LovelaceCepsTargetPropagationSubStep(StandardTargetPropagationSubStep):
         return self.parent.lovelace_ceps_join_graph_step.nodes_join_target[0]
         #
     @ppf.cached_property
+    def nodes_with_synthetic(self) -> DataFrame:
+        """Nodos de propagación enriquecidos con los targets sintéticos.
+
+        Para cada regla de `cfcf.SYNTHETIC_TARGETS` lee la fuente
+        (`source_key` = clave del output de graph_features de la variante del
+        step) y añade `target_synthetic_<name>` (ver
+        `lff.add_synthetic_targets`). Sin reglas: los nodos pasan intactos.
+        """
+        nodes = self.nodes_join_target
+        rules = getattr(cfcf, "SYNTHETIC_TARGETS", [])
+        if not rules:
+            return nodes
+        variant = getattr(self, "variant", None) \
+            or getattr(getattr(self, "parent", None), "variant", "rfc")
+        _gf_input, gf_output = cfgf.build(variant)
+        sources = {}
+        for rule in rules:
+            source_key = rule["source_key"]
+            if source_key not in gf_output:
+                raise KeyError(
+                    f"Regla sintética {rule['name']!r}: source_key "
+                    f"{source_key!r} no existe en graph_features "
+                    f"({sorted(gf_output)})")
+            if source_key not in sources:
+                sources[source_key] = self.sqlContext.read.parquet(
+                    str(gf_output[source_key]["table_or_hdfs"]))
+        # Las reglas del pipeline usan "source_key" (clave del output de
+        # graph_features); `add_synthetic_targets` las busca en `sources`
+        # con la clave "source".
+        rules = [{**rule, "source": rule["source_key"]} for rule in rules]
+        return lff.add_synthetic_targets(nodes, sources, rules)
+        #
+    @ppf.cached_property
     def edges(self) -> DataFrame:
         """Aristas del grafo (parquet plano)."""
         return self.standard_join_graph_substep.get_input("edges")
@@ -479,7 +523,7 @@ class LovelaceCepsTargetPropagationSubStep(StandardTargetPropagationSubStep):
                 target_column=target_column,
                 output_column_name=feature_name,
                 edges_df=self.edges,
-                nodes_df=self.nodes_join_target,
+                nodes_df=self.nodes_with_synthetic,
                 checkpoint_hdfs=checkpoint_hdfs,
                 column_renames=cfgf.GRAPH_RENAMES,
                 edge_final_columns=["src", "dst", "weight"],

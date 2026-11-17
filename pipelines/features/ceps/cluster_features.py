@@ -54,6 +54,8 @@ class SubStep(ppf.Step):
 class StandardClusterFeaturesStep(ppf.Step):
     """Etapa estándar de features de clustering: stats intra-grupo por nodo.
     """
+    STEP_NAME_PREFIX = "Standard_Cluster_Features_Step"
+
     def __init__(self,
         date_treatment: Dict[str,str],
         input_hive:Dict[str, HivePath],
@@ -69,7 +71,7 @@ class StandardClusterFeaturesStep(ppf.Step):
             date_treatment=date_treatment,
             input_hive=input_hive,
             output_hive=output_hive,
-            step_name_prefix="Standard_Cluster_Features_Step",
+            step_name_prefix=self.STEP_NAME_PREFIX,
             extra_kwargs=kwargs,
         )
         super().__init__(*args, **super_class_kwargs)

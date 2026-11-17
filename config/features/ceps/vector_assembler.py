@@ -20,6 +20,8 @@ import config.graph_making.ceps.edges_and_nodes as ccen
 import config.features.ceps.graph_features as cfgf
 import config.features.ceps.target_propagation_features as cfcf
 import config.features.ceps.cluster_features as cclf
+import config.features.ceps.risk_features as crf
+import config.features.ceps.temporal_features as ctf
 import config.target_propagation.lovelace.special_treatment as ctp_l_st
 
 ##########################################################################################
@@ -230,6 +232,8 @@ def build_feature_sources(variant: str = "rfc") -> dict:
     _gf_input, gf_output = cfgf.build(variant)
     _tp_input, tp_output = cfcf.build(variant)
     _cl_input, cl_output = cclf.build(variant)
+    _rf_input, rf_output = crf.build(variant)
+    _tf_input, tf_output = ctf.build(variant)
     sources = {
         key: {"mode": "merge_schema", "path": gf_output[key]["table_or_hdfs"]}
         for key in _GRAPH_FEATURE_KEYS
@@ -250,6 +254,25 @@ def build_feature_sources(variant: str = "rfc") -> dict:
     sources["cluster_stats"] = {
         "mode": "simple",
         "path": cl_output["cluster_stats"]["table_or_hdfs"],
+    }
+    # Features de riesgo por nodo (risk_*_<semilla>) y features de par (A, X)
+    # agregadas al lado X (pair_<f>_<stat>) — una fila por `id` cada una.
+    sources["risk_node_features"] = {
+        "mode": "simple",
+        "path": rf_output["risk_node_features"]["table_or_hdfs"],
+    }
+    sources["pair_features_node"] = {
+        "mode": "simple",
+        "path": rf_output["pair_features_node"]["table_or_hdfs"],
+    }
+    # Features temporales por nodo (tmp_*) y de par agregadas al lado X.
+    sources["temporal_node_features"] = {
+        "mode": "simple",
+        "path": tf_output["temporal_node_features"]["table_or_hdfs"],
+    }
+    sources["temporal_pair_node"] = {
+        "mode": "simple",
+        "path": tf_output["temporal_pair_node"]["table_or_hdfs"],
     }
     return sources
 
