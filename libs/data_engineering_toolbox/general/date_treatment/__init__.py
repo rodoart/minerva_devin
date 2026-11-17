@@ -95,3 +95,14 @@ def make_date_interval_with_lag_months(current_date:date, history:int, lag:int) 
     """
     current_date = current_date - relativedelta(months=lag)
     return make_date_interval_months(current_date, history)
+
+
+def month_range_bounds(start_month:str, end_month:str) -> Tuple[str, str]:
+    """Límites de día ("YYYY-MM-DD") del rango de meses "YYYY-MM" [start, end].
+
+    (primer día de start_month, último día de end_month) — para predicados
+    `between` sobre columnas de fecha con partition pruning.
+    """
+    first = datetime.strptime(start_month, '%Y-%m').date()
+    last = get_last_day_of_the_month(datetime.strptime(end_month, '%Y-%m').date())
+    return first.strftime('%Y-%m-%d'), last.strftime('%Y-%m-%d')

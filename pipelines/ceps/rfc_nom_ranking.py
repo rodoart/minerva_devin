@@ -5,8 +5,9 @@
 # ----------------------------------------------------------------------------------------------------------------------
 # General
 # ----------------------------------------------------------------------------------------------------------------------
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, List, Optional
 from threading import Lock
+from dateutil.relativedelta import relativedelta
 
 write_lock = Lock()
 
@@ -18,6 +19,7 @@ from pyspark.sql import DataFrame, Window, Column
 from pyspark.sql.functions import (col, regexp_replace, to_date, trim,
     when, lit, concat_ws, coalesce,
     sum as spark_sum, row_number, create_map, count as spark_count, max as spark_max,
+    min as spark_min,
     upper, date_format, split, translate
 )
 from pyspark.sql.types import StringType
@@ -25,6 +27,10 @@ from pyspark.sql.types import StringType
 # Custom
 # ----------------------------------------------------------------------------------------------------------------------
 from libs.data_engineering_toolbox.path import HivePath
+from libs.data_engineering_toolbox.pyspark.tools.partition_lags import (
+    get_partitions_from_hive_table, get_partitions_from_parquet_path)
+from libs.data_engineering_toolbox.pyspark.tools.parquet_treatment import (
+    SparkLoadTableOrParquet)
 
 import libs.framework as ppf
 
@@ -310,6 +316,168 @@ def prepare_bxico_catalog(
         lit(BXICO_SOURCE).alias("source"),
     )
 
+def rename_ceps_columns(s264_ceps:DataFrame) -> DataFrame:
+    """Renombra las columnas del emisor a `_ord` y las del receptor a `_ben`."""
+    return (s264_ceps
+        .withColumnRenamed("nom_emisor", "nom_ord")
+        .withColumnRenamed("id_ban_emi", "id_ban_ord")
+        .withColumnRenamed("nom_ban_emi", "nom_ban_ord")
+        .withColumnRenamed("id_ban_rec", "id_ban_ben")
+        .withColumnRenamed("nom_ban_rec", "nom_ban_ben")
+        .drop("tfrom")
+    )
+
+
+def clean_ceps_dataframe(s264_ceps:DataFrame) -> DataFrame:
+    """Limpieza y normalización de campos de texto del historial CEP.
+
+    Cadena (en orden): `norm` básico, null-synonyms -> None, reordenamiento de
+    nombres Banamex, limpieza de acentos y normalización de espacios. Es la
+    misma transformación que aplicaba `CepsExtractStep.s264_ceps_cleaned`,
+    extraída a función para reutilizarla en el aplanado incremental mensual.
+    """
+    return (s264_ceps
+        # normalización básica: trim + upper + eliminar sufijo de un solo carácter (Banamex)
+        .withColumn("nom_ord", norm("nom_ord"))
+        .withColumn("nom_ben", norm("nom_ben"))
+        .withColumn("rfc_curp_ord", norm("rfc_curp_ord"))
+        .withColumn("rfc_curp_ben", norm("rfc_curp_ben"))
+        .withColumn("cta_ord", trim(col("cta_ord")))
+        .withColumn("cta_ben", trim(col("cta_ben")))
+        #
+        # Null sinónimos para nombres: "", "ND"
+        .withColumn("nom_ord", when(col("nom_ord").isin(NOM_NULL_SYNONYMS), None).otherwise(col("nom_ord")))
+        .withColumn("nom_ben", when(col("nom_ben").isin(NOM_NULL_SYNONYMS), None).otherwise(col("nom_ben")))
+        #
+        # Null sinónimos para RFC/CURP: "", "ND", "RFC NO DISPONIBLE"
+        .withColumn("rfc_curp_ord", when(col("rfc_curp_ord").isin(RFC_NULL_SYNONYMS), None).otherwise(col("rfc_curp_ord")))
+        .withColumn("rfc_curp_ben", when(col("rfc_curp_ben").isin(RFC_NULL_SYNONYMS), None).otherwise(col("rfc_curp_ben")))
+        .withColumn("cta_ord", when(col("cta_ord")=="", None).otherwise(col("cta_ord")))
+        .withColumn("cta_ben", when(col("cta_ben")=="", None).otherwise(col("cta_ben")))
+        #
+        # Limpieza específica de Banamex: reordenar los nombres que vienen en
+        # formato "APELLIDO,NOMBRE" o "NOMBRE/APELLIDO" y eliminar caracteres
+        # problemáticos para el análisis como ",", "/", "-", "_", ";", ":"
+        .transform(banamex_nom_reorder("nom_ord"))
+        .transform(limpiar_acentos("nom_ord"))
+        .transform(normalizar_espacios("nom_ord"))
+        # Lo mismo para nom_ben
+        .transform(banamex_nom_reorder("nom_ben"))
+        .transform(limpiar_acentos("nom_ben"))
+        .transform(normalizar_espacios("nom_ben"))
+    )
+
+
+def add_ceps_id_flags(s264_ceps_cleaned:DataFrame) -> DataFrame:
+    """Clasifica el tipo de identificador de ordenante y beneficiario."""
+    return (s264_ceps_cleaned
+        .transform(lambda df: add_id_validation_flags(df, "rfc_curp_ord", "ord"))
+        .transform(lambda df: add_id_validation_flags(df, "rfc_curp_ben", "ben"))
+    )
+
+
+def flatten_ceps_analysis(rfc_curp_analysis_s264_ceps:DataFrame) -> DataFrame:
+    """Aplana ordenante/beneficiario a formato largo (una entidad por fila).
+
+    Proyección común `nom`, `cta`, `id_ban`, `tipo_cta`, `rfc_curp`,
+    `rfc_curp_kind`, `is_rfc_curp_valid`, `fec_informacion`, `oper_mto`,
+    `hora_oper` + `source` = s264_ceps. Sin columnas de partición (las añade
+    el llamador según el modo de persistencia).
+    """
+    flattened_ord = (rfc_curp_analysis_s264_ceps
+        .select(
+            col("nom_ord").alias("nom"),
+            col("cta_ord").alias("cta"),
+            col("id_ban_ord").alias("id_ban"),
+            col("tipo_cta_ord").alias("tipo_cta"),
+            col("rfc_curp_ord").alias("rfc_curp"),
+            col("id_kind_ord").alias("rfc_curp_kind"),
+            col("is_any_valid_ord").alias("is_rfc_curp_valid"),
+            "fec_informacion",
+            "oper_mto",
+            "hora_oper"
+        )
+    )
+    flattened_ben = (rfc_curp_analysis_s264_ceps
+        .select(
+            col("nom_ben").alias("nom"),
+            col("cta_ben").alias("cta"),
+            col("id_ban_ben").alias("id_ban"),
+            col("tipo_cta_ben").alias("tipo_cta"),
+            col("rfc_curp_ben").alias("rfc_curp"),
+            col("id_kind_ben").alias("rfc_curp_kind"),
+            col("is_any_valid_ben").alias("is_rfc_curp_valid"),
+            "fec_informacion",
+            "oper_mto",
+            "hora_oper"
+        )
+    )
+    return (flattened_ord.unionByName(flattened_ben)
+        .withColumn("source", lit(S264_SOURCE))   # origen: transacciones CEP (vs catálogo Banxico)
+    )
+
+
+# Llaves del agregado entidad-identificador del ranking RFC/CURP.
+CEPS_GROUPBY_KEYS = ["cta", "nom", "id_ban", "tipo_cta", "rfc_curp",
+    "rfc_curp_kind", "source"]
+
+
+def prepare_flattened_for_groupby(s264_ceps_flattened:DataFrame) -> DataFrame:
+    """Prepara el aplanado para el groupby: fecha-hora combinada y flags de ranking."""
+    return (s264_ceps_flattened
+        .withColumn("fec_informacion_hora_oper", concat_ws("#", col("fec_informacion"), col("hora_oper")))
+        .drop("fec_informacion", "hora_oper")
+        .withColumn("rfc_curp_ends_with_xxx", when(col("rfc_curp").endswith("XX"), 1).otherwise(0))
+        .withColumn("RFC_CURP_KIND_PRIORITY", mapping_RFC_CURP_KIND_PRIORITY[col("rfc_curp_kind")])
+        .withColumn("SOURCE_PRIORITY", mapping_SOURCE_PRIORITY[col("source")])
+    )
+
+
+def group_ceps_flattened(prepared:DataFrame, extra_keys:Optional[List[str]] = None) -> DataFrame:
+    """Groupby base del aplanado preparado: agregados crudos por llave (+ extras).
+
+    Produce exactamente las columnas que `combine_ceps_groupby` sabe combinar:
+    con `extra_keys=["mis_date"]` genera los parciales mensuales acumulables.
+    """
+    return (prepared
+        .groupBy(*(CEPS_GROUPBY_KEYS + list(extra_keys or [])))
+        .agg(
+            spark_count("*").alias("cnt"),
+            spark_sum("oper_mto").alias("tot_oper_mto"),
+            spark_max("fec_informacion_hora_oper").alias("lst_fec_informacion_hora_oper"),
+            spark_min("fec_informacion_hora_oper").alias("fst_fec_informacion_hora_oper"),
+            spark_sum("is_rfc_curp_valid").alias("is_rfc_curp_valid"),
+            spark_max("rfc_curp_ends_with_xxx").alias("rfc_curp_ends_with_xxx"),
+            spark_max("RFC_CURP_KIND_PRIORITY").alias("RFC_CURP_KIND_PRIORITY"),
+            spark_max("SOURCE_PRIORITY").alias("SOURCE_PRIORITY")
+        )
+    )
+
+
+def combine_ceps_groupby(df:DataFrame, extra_keys:Optional[List[str]] = None) -> DataFrame:
+    """Combina parciales del groupby entidad-identificador (combinadores exactos).
+
+    Agrega por `CEPS_GROUPBY_KEYS` (+ `extra_keys`, p.ej. ["mis_date"] en los
+    parciales mensuales): `cnt`/`tot_oper_mto`/`is_rfc_curp_valid` suman,
+    `lst_fec_informacion_hora_oper` toma el máximo, `fst_...` el mínimo
+    (antigüedad del tag) y los flags/prioridades el máximo. Es la operación
+    que permite acumular la historia mes a mes sin recomputar meses viejos.
+    """
+    return (df
+        .groupBy(*(CEPS_GROUPBY_KEYS + list(extra_keys or [])))
+        .agg(
+            spark_sum("cnt").alias("cnt"),
+            spark_sum("tot_oper_mto").alias("tot_oper_mto"),
+            spark_max("lst_fec_informacion_hora_oper").alias("lst_fec_informacion_hora_oper"),
+            spark_min("fst_fec_informacion_hora_oper").alias("fst_fec_informacion_hora_oper"),
+            spark_sum("is_rfc_curp_valid").alias("is_rfc_curp_valid"),
+            spark_max("rfc_curp_ends_with_xxx").alias("rfc_curp_ends_with_xxx"),
+            spark_max("RFC_CURP_KIND_PRIORITY").alias("RFC_CURP_KIND_PRIORITY"),
+            spark_max("SOURCE_PRIORITY").alias("SOURCE_PRIORITY")
+        )
+    )
+
+
 ########################################################################################################################
 # Process
 ########################################################################################################################
@@ -441,16 +609,7 @@ class CepsExtractStep(SubStep):
         Renombra las columnas del emisor con el sufijo `_ord` (ordenante) y las
         del receptor con `_ben` (beneficiario), y elimina la columna `tfrom`.
         """
-        result:DataFrame = (
-            self.standard_load_parquet_or_table("s264_ceps")
-            .withColumnRenamed("nom_emisor", "nom_ord")
-            .withColumnRenamed("id_ban_emi", "id_ban_ord")
-            .withColumnRenamed("nom_ban_emi", "nom_ban_ord")
-            .withColumnRenamed("id_ban_rec", "id_ban_ben")
-            .withColumnRenamed("nom_ban_rec", "nom_ban_ben")
-            .drop("tfrom")
-        )
-        return result
+        return rename_ceps_columns(self.standard_load_parquet_or_table("s264_ceps"))
 
     @ppf.cached_property
     def s264_ceps_cleaned(self) -> DataFrame:
@@ -537,37 +696,7 @@ class CepsExtractStep(SubStep):
         +--------------+------------+---------------------------+---------------------------+---------------+---------------+-------------------+-------------------+----------+
         ```
         """
-        s264_ceps:DataFrame = self.s264_ceps
-        return (s264_ceps
-            # normalización básica: trim + upper + eliminar sufijo de un solo carácter (Banamex)
-            .withColumn("nom_ord", norm("nom_ord"))
-            .withColumn("nom_ben", norm("nom_ben"))
-            .withColumn("rfc_curp_ord", norm("rfc_curp_ord"))
-            .withColumn("rfc_curp_ben", norm("rfc_curp_ben"))
-            .withColumn("cta_ord", trim(col("cta_ord")))
-            .withColumn("cta_ben", trim(col("cta_ben")))
-            #
-            # Null sinónimos para nombres: "", "ND"
-            .withColumn("nom_ord", when(col("nom_ord").isin(NOM_NULL_SYNONYMS), None).otherwise(col("nom_ord")))
-            .withColumn("nom_ben", when(col("nom_ben").isin(NOM_NULL_SYNONYMS), None).otherwise(col("nom_ben")))
-            #
-            # Null sinónimos para RFC/CURP: "", "ND", "RFC NO DISPONIBLE"
-            .withColumn("rfc_curp_ord", when(col("rfc_curp_ord").isin(RFC_NULL_SYNONYMS), None).otherwise(col("rfc_curp_ord")))
-            .withColumn("rfc_curp_ben", when(col("rfc_curp_ben").isin(RFC_NULL_SYNONYMS), None).otherwise(col("rfc_curp_ben")))
-            .withColumn("cta_ord", when(col("cta_ord")=="", None).otherwise(col("cta_ord")))
-            .withColumn("cta_ben", when(col("cta_ben")=="", None).otherwise(col("cta_ben")))
-            #
-            # Limpieza específica de Banamex: reordenar los nombres que vienen en
-            # formato "APELLIDO,NOMBRE" o "NOMBRE/APELLIDO" y eliminar caracteres
-            # problemáticos para el análisis como ",", "/", "-", "_", ";", ":"
-            .transform(banamex_nom_reorder("nom_ord"))
-            .transform(limpiar_acentos("nom_ord"))
-            .transform(normalizar_espacios("nom_ord"))
-            # Lo mismo para nom_ben
-            .transform(banamex_nom_reorder("nom_ben"))
-            .transform(limpiar_acentos("nom_ben"))
-            .transform(normalizar_espacios("nom_ben"))
-        )
+        return clean_ceps_dataframe(self.s264_ceps)
 
     @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="rfc_curp_analysis_s264_ceps")
@@ -578,10 +707,7 @@ class CepsExtractStep(SubStep):
         añade las columnas de particionado `process_date`, `mis_date`,
         `vintage` y `cohort`.
         """
-        s264_ceps_cleaned:DataFrame = self.s264_ceps_cleaned
-        return (s264_ceps_cleaned
-            .transform(lambda df: add_id_validation_flags(df, "rfc_curp_ord", "ord"))
-            .transform(lambda df: add_id_validation_flags(df, "rfc_curp_ben", "ben"))
+        return (add_ceps_id_flags(self.s264_ceps_cleaned)
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
             .withColumn("mis_date", date_format(to_date(col("fec_oper"), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
             .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
@@ -589,55 +715,90 @@ class CepsExtractStep(SubStep):
         )
     #
     @ppf.cached_property
-    @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened")
-    def s264_ceps_flattened(self) -> DataFrame:
-        """Aplana la estructura ordenante/beneficiario a formato largo (una entidad por fila).
+    def s264_available_months(self) -> List[str]:
+        """Meses "YYYY-MM" con partición en la fuente s264, hasta el mes vintage.
 
-        Proyecta ordenante y beneficiario al esquema común `nom`, `cta`,
-        `id_ban`, `tipo_cta`, `rfc_curp`, `rfc_curp_kind`, `is_rfc_curp_valid`,
-        `fec_informacion`, `oper_mto`, `hora_oper`; los une con `unionByName` y
-        añade las columnas de particionado.
+        La lista de particiones es una operación de metadatos (Hive metastore o
+        listado de directorios), mucho más barata que leer los datos: es lo que
+        permite construir la imputación "desde el principio del tiempo" de
+        forma incremental, computando solo los meses aún no aplanados.
         """
-        rfc_curp_analysis_s264_ceps:DataFrame = self.rfc_curp_analysis_s264_ceps[0]
-        #
-        s264_ceps_flattened_ord = (rfc_curp_analysis_s264_ceps
-            .select(
-                col("nom_ord").alias("nom"),
-                col("cta_ord").alias("cta"),
-                col("id_ban_ord").alias("id_ban"),
-                col("tipo_cta_ord").alias("tipo_cta"),
-                col("rfc_curp_ord").alias("rfc_curp"),
-                col("id_kind_ord").alias("rfc_curp_kind"),
-                col("is_any_valid_ord").alias("is_rfc_curp_valid"),
-                "fec_informacion",
-                "oper_mto",
-                "hora_oper"
+        cfg = self.input_hive["s264_ceps"]
+        src = str(cfg["table_or_hdfs"])
+        if "." in src:      # tabla Hive (db.tabla); si no, path parquet
+            partitions = get_partitions_from_hive_table(src, self.sqlContext)
+        else:
+            partitions = get_partitions_from_parquet_path(src)
+        vintage = self.input_parameters["vintage_date"]
+        lag = cfg.get("lag", 0)
+        max_month = (vintage - relativedelta(months=lag)).strftime("%Y-%m")
+        months = set()
+        for partition in partitions:
+            value = partition.get(cfg["information_date_column"])
+            if not value:
+                continue
+            month = str(value)[:7]               # "yyyy-mm-dd" -> "yyyy-mm"
+            if month <= max_month:
+                months.add(month)
+        return sorted(months)
+    #
+    def _read_s264_months(self, months: List[str]) -> DataFrame:
+        """Lee la fuente s264 SOLO de los meses dados (partition pruning).
+
+        El filtro se construye como rangos contiguos de días sobre la
+        columna-partición `fec_informacion` para que Spark pode particiones en
+        el scan en lugar de leer toda la tabla.
+        """
+        cfg = self.input_hive["s264_ceps"]
+        date_column = cfg["information_date_column"]
+        ranges = ppf.months_to_date_ranges(months)
+        predicate = " OR ".join(
+            f"({date_column} BETWEEN '{start}' AND '{end}')"
+            for start, end in ranges)
+        loader = SparkLoadTableOrParquet(
+            cfg["table_or_hdfs"], session=self.sqlContext, filter=predicate)
+        return loader.df
+    #
+    @ppf.cached_property
+    def s264_ceps_flattened_monthly(self) -> DataFrame:
+        """Aplanado incremental por mes de dato: solo se computan los meses nuevos.
+
+        Cada partición `mis_date=yyyyMM` contiene el aplanado (limpieza +
+        flags + formato largo) de las transacciones CEP de ese mes. Los meses
+        esperados son los que tiene la fuente s264; los ya persistidos se
+        recargan sin recomputar (ver `ppf.ensure_monthly_partitions` con
+        `expected_months`).
+        """
+        def compute_missing_months(missing_months: List[str]) -> DataFrame:
+            raw = self._read_s264_months(missing_months)
+            flattened = flatten_ceps_analysis(
+                add_ceps_id_flags(clean_ceps_dataframe(rename_ceps_columns(raw))))
+            return (flattened
+                .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
+                # mis_date como fecha completa (1er día del mes): el framework
+                # parsea los valores de partición con "%Y-%m-%d"
+                .withColumn("mis_date", date_format(to_date(col("fec_informacion"), DATE_STANDARD_SPARK_FORMAT), "yyyy-MM-01"))
+                .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
+                .withColumn("cohort", lit(self.cohort).cast(StringType()))
             )
-        )
-        #
-        s264_ceps_flattened_ben = (rfc_curp_analysis_s264_ceps
-            .select(
-                col("nom_ben").alias("nom"),
-                col("cta_ben").alias("cta"),
-                col("id_ban_ben").alias("id_ban"),
-                col("tipo_cta_ben").alias("tipo_cta"),
-                col("rfc_curp_ben").alias("rfc_curp"),
-                col("id_kind_ben").alias("rfc_curp_kind"),
-                col("is_any_valid_ben").alias("is_rfc_curp_valid"),
-                "fec_informacion",
-                "oper_mto",
-                "hora_oper"
-            )
-        )
-        #
-        return (
-            s264_ceps_flattened_ord.unionByName(s264_ceps_flattened_ben)
-            .withColumn("source", lit(S264_SOURCE))   # origen: transacciones CEP (vs catálogo Banxico)
-            .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
-            .withColumn("mis_date", date_format(to_date(col("fec_informacion"), DATE_STANDARD_SPARK_FORMAT), DATE_MONTH_SPARK_FORMAT))
-            .withColumn("vintage", lit(self.parent.date_treatment["vintage"]).cast(StringType()))
-            .withColumn("cohort", lit(self.cohort).cast(StringType()))
-        )
+        return ppf.ensure_monthly_partitions(
+            step=self,
+            path_key="s264_ceps_flattened_monthly",
+            compute_missing_months=compute_missing_months,
+            expected_months=self.s264_available_months)
+    #
+    @ppf.cached_property
+    def s264_ceps_flattened(self) -> tuple:
+        """Historial aplanado COMPLETO: lectura de todas las particiones mensuales.
+
+        Ya no se recomputa la ventana entera en cada corrida: lee
+        `s264_ceps_flattened_monthly` (acumulado incremental). Devuelve
+        `(df, load_kwargs)` como las propiedades decoradas.
+        """
+        df = self.standard_load_parquet_or_table(
+            "s264_ceps_flattened_monthly", input_or_output="output")
+        return df, {"table_or_hdfs":
+            self.output_hive["s264_ceps_flattened_monthly"]["table_or_hdfs"]}
 
 
 class CepsRankStep(SubStep):
@@ -653,16 +814,14 @@ class CepsRankStep(SubStep):
         return ppf.collect_step_output(self, self.s264_ceps_flattened_rank_rfc_by_nom_cases_replace, "s264_ceps_flattened_rank_rfc_by_nom_cases_replace")
     #
     @ppf.cached_property
-    @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened")
     def s264_ceps_flattened(self) -> DataFrame:
-        """Recarga el DataFrame aplanado persistido por `CepsExtractStep`.
+        """Historial aplanado completo (particiones mensuales acumuladas).
 
-        Returns
-        -------
-        DataFrame
-            `s264_ceps_flattened` sin la columna `tfrom`.
+        Lee `s264_ceps_flattened_monthly` con historia all-time; los filtros
+        posteriores por `mis_date` podan particiones en el scan.
         """
-        return (self.standard_load_parquet_or_table("s264_ceps_flattened")
+        return (self.standard_load_parquet_or_table(
+            "s264_ceps_flattened_monthly", input_or_output="output")
             .drop("tfrom")
         )
         #   #
@@ -688,48 +847,60 @@ class CepsRankStep(SubStep):
         return prepare_bxico_catalog(self.bxico_rfc_curp_cat, self.ban_catalog)
         #
     @ppf.cached_property
+    def s264_ceps_flattened_groupby_monthly(self) -> DataFrame:
+        """Groupby parcial por mes de dato: solo se computan los meses nuevos.
+
+        Cada partición `mis_date=yyyy-MM-01` contiene el agregado
+        entidad-identificador (cnt/tot/lst/fst/flags) de las transacciones
+        aplanadas de ese mes. Los parciales mensuales son combinables
+        (`combine_ceps_groupby`), de modo que el agregado all-time se obtiene
+        recombinando parciales en lugar de releer toda la historia cruda.
+        """
+        def compute_missing_months(missing_months: List[str]) -> DataFrame:
+            monthly = self.s264_ceps_flattened.where(
+                col("mis_date").substr(1, 7).isin(*missing_months))
+            return group_ceps_flattened(
+                prepare_flattened_for_groupby(monthly),
+                extra_keys=["mis_date"])
+        return ppf.ensure_monthly_partitions(
+            step=self,
+            path_key="s264_ceps_flattened_groupby_monthly",
+            compute_missing_months=compute_missing_months,
+            expected_months=self.parent.ceps_extract_step.s264_available_months)
+        #
+    @ppf.cached_property
     @ppf.dynamic_partitioned_table_or_parquet(path_key="s264_ceps_flattened_groupby")
     def s264_ceps_flattened_groupby(self) -> DataFrame:
         """Agrega el histórico aplanado por combinación única entidad-identificador.
 
-        Agrupa por `cta`, `nom`, `id_ban`, `tipo_cta`, `rfc_curp` y
-        `rfc_curp_kind` calculando el conteo de operaciones (`cnt`), el monto
-        total (`tot_oper_mto`), la última fecha-hora de operación, la suma de
-        validez del RFC, el flag de terminación "XXX" y la prioridad del tipo
-        de identificador (`RFC_CURP_KIND_PRIORITY`).
+        Recombina los parciales mensuales acumulados
+        (`s264_ceps_flattened_groupby_monthly`, historia all-time incremental)
+        y —si está disponible— el catálogo Banxico como un candidato más.
+        Produce por llave: conteo de operaciones (`cnt`), monto total
+        (`tot_oper_mto`), última fecha-hora de operación, la PRIMERA fecha-hora
+        de observación del tag (`fst_fec_informacion_hora_oper` — antigüedad
+        del candidato, usada por las ventanas de ranking con
+        `PREFER_OLDEST_VALID_TAG`), la suma de validez del RFC, el flag de
+        terminación "XXX" y la prioridad del tipo de identificador
+        (`RFC_CURP_KIND_PRIORITY`).
         """
-        s264_ceps_flattened:DataFrame = self.parent.ceps_extract_step.s264_ceps_flattened[0]
-        #
-        # `source` puede faltar en parquets escritos antes de integrar el catálogo.
-        if "source" not in s264_ceps_flattened.columns:
-            s264_ceps_flattened = s264_ceps_flattened.withColumn("source", lit(S264_SOURCE))
+        combined = combine_ceps_groupby(self.s264_ceps_flattened_groupby_monthly)
         #
         # Integración del catálogo Banxico (opcional): compite como un candidato
         # más dentro del groupby/ranking con `source` = bxico_rfc_curp_cat.
         bxico_flattened = self.bxico_flattened
         if bxico_flattened is not None:
-            s264_ceps_flattened = s264_ceps_flattened.unionByName(
-                bxico_flattened, allowMissingColumns=True)
+            # El catálogo no trae tipo_cta/hora_oper: nulls para el esquema común
+            # (antes lo resolvía el unionByName(allowMissingColumns) previo al groupby).
+            for optional_col in ("tipo_cta", "hora_oper"):
+                if optional_col not in bxico_flattened.columns:
+                    bxico_flattened = bxico_flattened.withColumn(optional_col, lit(None))
+            bxico_groupby = group_ceps_flattened(
+                prepare_flattened_for_groupby(bxico_flattened))
+            combined = combine_ceps_groupby(
+                combined.unionByName(bxico_groupby, allowMissingColumns=True))
         #
-        s264_ceps_flattened_prepared = (s264_ceps_flattened
-            .withColumn("fec_informacion_hora_oper", concat_ws("#", col("fec_informacion"), col("hora_oper")))
-            .drop("fec_informacion", "hora_oper")
-            .withColumn("rfc_curp_ends_with_xxx", when(col("rfc_curp").endswith("XX"), 1).otherwise(0))
-            .withColumn("RFC_CURP_KIND_PRIORITY", mapping_RFC_CURP_KIND_PRIORITY[col("rfc_curp_kind")])
-            .withColumn("SOURCE_PRIORITY", mapping_SOURCE_PRIORITY[col("source")])
-        )
-        #
-        return (s264_ceps_flattened_prepared
-            .groupBy("cta", "nom", "id_ban", "tipo_cta", "rfc_curp", "rfc_curp_kind", "source")
-            .agg(
-                spark_count("*").alias("cnt"),
-                spark_sum("oper_mto").alias("tot_oper_mto"),
-                spark_max("fec_informacion_hora_oper").alias("lst_fec_informacion_hora_oper"),
-                spark_sum("is_rfc_curp_valid").alias("is_rfc_curp_valid"),
-                spark_max("rfc_curp_ends_with_xxx").alias("rfc_curp_ends_with_xxx"),
-                spark_max("RFC_CURP_KIND_PRIORITY").alias("RFC_CURP_KIND_PRIORITY"),
-                spark_max("SOURCE_PRIORITY").alias("SOURCE_PRIORITY")
-            )
+        return (combined
             .withColumn("fec_informacion", split(col("lst_fec_informacion_hora_oper"), "#").getItem(0))
             .withColumn("hora_oper", split(col("lst_fec_informacion_hora_oper"), "#").getItem(1))
             .withColumn("process_date", lit(self.parent.date_treatment["process_date_str"]))
@@ -801,6 +972,7 @@ class CepsRankStep(SubStep):
             )
             .drop("tipo_cta", "hora_oper","cnt_rfc_by_nom", "rank_rfc_by_nom",
                 "cnt", "tot_oper_mto", "lst_fec_informacion_hora_oper",
+                "fst_fec_informacion_hora_oper",
                 "is_rfc_curp_valid", "rfc_curp_ends_with_xxx",
                 "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY",
                 "cnt_rfc_by_cta", "process_date",
@@ -848,6 +1020,7 @@ class CepsRankStep(SubStep):
             )
             .drop("tipo_cta", "hora_oper","cnt_rfc_by_nom", "rank_rfc_by_cta",
                 "cnt", "tot_oper_mto", "lst_fec_informacion_hora_oper",
+                "fst_fec_informacion_hora_oper",
                 "is_rfc_curp_valid", "rfc_curp_ends_with_xxx",
                 "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY",
                 "cnt_rfc_by_cta", "process_date",

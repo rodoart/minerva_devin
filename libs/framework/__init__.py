@@ -484,10 +484,37 @@ def _window_months(vintage_date: date, history: int, lag: int) -> List[str]:
     return months
 
 
+def months_to_date_ranges(months: List[str]) -> List[Tuple[str, str]]:
+    """Convierte meses "YYYY-MM" en rangos contiguos de días "YYYY-MM-DD".
+
+    Meses consecutivos se fusionan en un solo rango [primer día, último día]:
+    pensado para construir predicados `col.between(a, b)` con partition
+    pruning sobre columnas-partición de fecha (p.ej. fec_informacion).
+    """
+    if not months:
+        return []
+    from libs.data_engineering_toolbox.general.date_treatment import (
+        month_range_bounds)
+    from datetime import datetime as _dt
+    sorted_months = sorted(months)
+    ranges: List[Tuple[str, str]] = []
+    start = prev = sorted_months[0]
+    for month in sorted_months[1:]:
+        expected_next = (_dt.strptime(prev, "%Y-%m") + relativedelta(months=1)
+            ).strftime("%Y-%m")
+        if month != expected_next:          # hueco: cierra el rango anterior
+            ranges.append(month_range_bounds(start, prev))
+            start = month
+        prev = month
+    ranges.append(month_range_bounds(start, prev))
+    return ranges
+
+
 def ensure_monthly_partitions(
     step: "Step",
     path_key: str,
     compute_missing_months: Callable[[List[str]], DataFrame],
+    expected_months: Optional[List[str]] = None,
 ) -> DataFrame:
     """Materialización incremental de una salida particionada por mes.
 
@@ -512,6 +539,9 @@ def ensure_monthly_partitions(
         compute_missing_months: callable que recibe la lista ordenada de
             meses "YYYY-MM" faltantes y devuelve el DataFrame de esas
             particiones.
+        expected_months: meses esperados explícitos (p.ej. derivados de las
+            particiones de la fuente, para historia "desde el principio del
+            tiempo"); None -> se derivan de `lag`/`history` del config.
 
     Returns:
         DataFrame con todas las particiones mensuales de la ventana.
@@ -524,10 +554,13 @@ def ensure_monthly_partitions(
     table_or_hdfs = load_kwargs["table_or_hdfs"]
     information_date_column = load_kwargs["information_date_column"]
     process_date_column = load_kwargs["process_date_column"]
-    expected_months = _window_months(
-        vintage_date=step.input_parameters["vintage_date"],
-        history=load_kwargs["history"],
-        lag=load_kwargs["lag"])
+    if expected_months is None:
+        expected_months = _window_months(
+            vintage_date=step.input_parameters["vintage_date"],
+            history=load_kwargs["history"],
+            lag=load_kwargs["lag"])
+    else:
+        expected_months = sorted(expected_months)
     present_months = set()
     load_object = None
     if step.is_dynamic:

@@ -22,6 +22,13 @@ from pyspark.sql.functions import col
 CEPS_MAXIMUM_HISTORY_IN_MONTHS = 3
 CEPS_RANKING_HISTORY_IN_MONTHS = 24
 
+# Historia "desde el principio del tiempo" para las tablas mensuales
+# acumulativas (s264_ceps_flattened_monthly y s264_ceps_flattened_groupby_monthly):
+# 1200 meses = 100 años, ventana efectivamente all-time. La incrementalidad
+# viene de ensure_monthly_partitions: cada corrida solo computa y escribe los
+# meses de la fuente que aún no tienen partición; los meses viejos se releen.
+CEPS_ALL_TIME_HISTORY_MONTHS = 1200
+
 # Meses de historia del catálogo Banxico `bxico_rfc_curp_cat`: ventana más
 # amplia que la de CEP porque el catálogo se sube con poca frecuencia y el
 # dedup por `cta` ya se queda con la `fecha_de_subida` más reciente.
@@ -85,39 +92,57 @@ S264_SOURCE: 1                   # lo observado en transacciones CEP
 # `cta`; con row_number()=1 se elige el "mejor" identificador observado para la
 # cuenta (ver s264_ceps_flattened_ranks en el pipeline). Los criterios primero
 # empujan al final los candidatos "malos" (nulos, enmascarados, tipo de id
-# débil) y luego premian frecuencia/monto.
+# débil), luego —si PREFER_OLDEST_VALID_TAG— premian la ANTIGÜEDAD del tag a
+# igualdad de validez (un RFC/CURP válido observado desde hace años es más
+# confiable que uno igual de válido pero recién aparecido), y por último
+# premian frecuencia/monto.
+PREFER_OLDEST_VALID_TAG = True
+
+_RFC_BY_CTA_ORDER = [
+    col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final (isNull()=False ordena primero)
+    col("nom").isNull().asc(), # bad: candidatos con nombre conocido primero
+    col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
+    col("rfc_curp_ends_with_xxx").isNull().asc(), # bad: flag "termina en XX" nulo al final
+    col("RFC_CURP_KIND_PRIORITY").isNull().asc(), # bad: sin tipo de id clasificado (prioridad nula) al final
+    col("rfc_curp_ends_with_xxx").asc(), # bad: prefiera RFC que NO termina en "XX" (0 antes que 1; sufijo XX = RFC genérico/enmascarado)
+    col("RFC_CURP_KIND_PRIORITY").asc(), # bad: mejor tipo de identificador primero (rfc_moral=0 ... invalid=6)
+]
+if PREFER_OLDEST_VALID_TAG:
+    # good: a igual validez, el tag observado desde hace más tiempo primero
+    _RFC_BY_CTA_ORDER.append(col("fst_fec_informacion_hora_oper").asc_nulls_last())
+_RFC_BY_CTA_ORDER += [
+    col("cnt_rfc_by_cta").desc(), # candidato observado en más operaciones dentro de la cuenta primero
+    col("tot_oper_mto").desc(),        # good: mayor monto total operado primero
+    col("lst_fec_informacion_hora_oper").asc(), # good: desempate por fecha-hora de la última operación (ascendente)
+    col("rfc_curp").asc()              # desempate final determinista (orden alfabético del RFC)
+]
 RFC_BY_CTA_PRIORITY_WINDOW = (Window.partitionBy("cta")  # un ranking independiente por cada cuenta
-.orderBy(
-col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final (isNull()=False ordena primero)
-col("nom").isNull().asc(), # bad: candidatos con nombre conocido primero
-col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
-col("rfc_curp_ends_with_xxx").isNull().asc(), # bad: flag "termina en XX" nulo al final
-col("RFC_CURP_KIND_PRIORITY").isNull().asc(), # bad: sin tipo de id clasificado (prioridad nula) al final
-col("rfc_curp_ends_with_xxx").asc(), # bad: prefiera RFC que NO termina en "XX" (0 antes que 1; sufijo XX = RFC genérico/enmascarado)
-col("RFC_CURP_KIND_PRIORITY").asc(), # bad: mejor tipo de identificador primero (rfc_moral=0 ... invalid=6)
-col("cnt_rfc_by_cta").desc(), # candidato observado en más operaciones dentro de la cuenta primero
-col("tot_oper_mto").desc(),        # good: mayor monto total operado primero
-col("lst_fec_informacion_hora_oper").asc(), # good: desempate por fecha-hora de la última operación (ascendente)
-col("rfc_curp").asc()              # desempate final determinista (orden alfabético del RFC)
-)
+.orderBy(*_RFC_BY_CTA_ORDER)
 )
 
 # Priority for RFC and CURP by nom, prioritizing the following criteria:
 # Análoga a la anterior pero particionada por `nom`: elige el RFC/CURP canónico
 # de cada nombre (vía alternativa cuando la cuenta falta o no discrimina).
+# Con PREFER_OLDEST_VALID_TAG, a igual validez gana el tag más antiguo.
+_RFC_BY_NOM_ORDER = [
+    col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final
+    col("nom").isNull().asc(), # bad: nombre nulo al final
+    col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
+    col("rfc_curp_ends_with_xxx").asc(),  # bad: prefiera RFC que NO termina en "XX"
+    col("RFC_CURP_KIND_PRIORITY").asc(),  # bad: mejor tipo de identificador primero
+]
+if PREFER_OLDEST_VALID_TAG:
+    # good: a igual validez, el tag observado desde hace más tiempo primero
+    _RFC_BY_NOM_ORDER.append(col("fst_fec_informacion_hora_oper").asc_nulls_last())
+_RFC_BY_NOM_ORDER += [
+    col("cnt_rfc_by_cta").desc(), # candidato visto en más operaciones de su cuenta primero
+    col("cnt_rfc_by_nom").desc(),         # good: candidato visto en más operaciones del nombre primero
+    col("tot_oper_mto").desc(),           # good: mayor monto total operado primero
+    col("lst_fec_informacion_hora_oper").asc(), # good: desempate por fecha-hora de la última operación
+    col("rfc_curp").asc()                 # desempate final determinista
+]
 RFC_BY_NOM_PRIORITY_WINDOW = (Window.partitionBy("nom")  # un ranking independiente por cada nombre
-.orderBy(
-col("rfc_curp").isNull().asc(), # bad: RFC/CURP nulo al final
-col("nom").isNull().asc(), # bad: nombre nulo al final
-col("SOURCE_PRIORITY").asc_nulls_last(), # bad: catálogo Banxico (0) antes que s264_ceps (1); null (parquets antiguos) al final
-col("rfc_curp_ends_with_xxx").asc(),  # bad: prefiera RFC que NO termina en "XX"
-col("RFC_CURP_KIND_PRIORITY").asc(),  # bad: mejor tipo de identificador primero
-col("cnt_rfc_by_cta").desc(), # candidato visto en más operaciones de su cuenta primero
-col("cnt_rfc_by_nom").desc(),         # good: candidato visto en más operaciones del nombre primero
-col("tot_oper_mto").desc(),           # good: mayor monto total operado primero
-col("lst_fec_informacion_hora_oper").asc(), # good: desempate por fecha-hora de la última operación
-col("rfc_curp").asc()                 # desempate final determinista
-)
+.orderBy(*_RFC_BY_NOM_ORDER)
 )
 
 
@@ -187,13 +212,30 @@ output = {
 "information_date_mode":"each",             # todos los meses del intervalo
 "process_date_mode":"last"                  # por cada mes, solo la carga (process_date) más reciente
 },
-# Historial aplanado a formato largo: una fila por entidad (ordenante o
-# beneficiario) con esquema común nom/cta/id_ban/tipo_cta/rfc_curp/...
-"s264_ceps_flattened": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened"),
-"information_date_column": "mis_date",      # columna-partición de fecha de información (yyyyMM)
+# Historial aplanado a formato largo, ACUMULATIVO por mes de dato: una fila
+# por entidad (ordenante o beneficiario) con esquema común
+# nom/cta/id_ban/tipo_cta/rfc_curp/... Particionado por mis_date (yyyy-MM-01,
+# primer día del mes de fec_informacion); cada corrida solo computa los meses
+# de la fuente que aún no tienen partición (ensure_monthly_partitions).
+# Reemplaza a la antigua salida "s264_ceps_flattened" (ventana de 3 meses
+# recomputada en cada corrida), que ya no se materializa.
+"s264_ceps_flattened_monthly": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_monthly"),
+"information_date_column": "mis_date",      # columna-partición de fecha de información (yyyy-MM-01)
 "process_date_column": "process_date",      # columna-partición de fecha de carga
 "lag": 0,                                   # sin desfase sobre vintage
-"history": CEPS_MAXIMUM_HISTORY_IN_MONTHS,  # al releer, cubre los 3 meses de historia
+"history": CEPS_ALL_TIME_HISTORY_MONTHS,    # al releer, cubre toda la historia disponible
+"information_date_mode":"each",             # todos los meses del intervalo
+"process_date_mode":"last"                  # por cada mes, solo la carga más reciente
+},
+# Agregado entidad-identificador PARCIAL por mes de dato (cnt/tot/lst/fst y
+# flags). Los parciales son combinables (combine_ceps_groupby): el agregado
+# all-time de s264_ceps_flattened_groupby se obtiene recombinando parciales
+# sin releer la historia cruda.
+"s264_ceps_flattened_groupby_monthly": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_groupby_monthly"),
+"information_date_column": "mis_date",      # columna-partición de fecha de información (yyyy-MM-01)
+"process_date_column": "process_date",      # columna-partición de fecha de carga
+"lag": 0,                                   # sin desfase sobre vintage
+"history": CEPS_ALL_TIME_HISTORY_MONTHS,    # al releer, cubre toda la historia disponible
 "information_date_mode":"each",             # todos los meses del intervalo
 "process_date_mode":"last"                  # por cada mes, solo la carga más reciente
 },

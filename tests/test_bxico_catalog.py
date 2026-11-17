@@ -264,6 +264,9 @@ class TestSourcePriorityWindow:
             "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY", "cnt_rfc_by_cta",
             "tot_oper_mto", "lst_fec_informacion_hora_oper"]
         df = spark.createDataFrame(rows, cols)
+        if "fst_fec_informacion_hora_oper" not in df.columns:
+            df = df.withColumn(
+                "fst_fec_informacion_hora_oper", lit(None).cast("string"))
         return (df
             .withColumn("rank",
                 row_number().over(bxico_config.RFC_BY_CTA_PRIORITY_WINDOW))
@@ -304,3 +307,64 @@ class TestSourcePriorityWindow:
             for r in self._rank(spark, bxico_config, rows)}
         assert ranked["AAPL900615AB1"] == 1
         assert ranked["AAPL900615MDFLRN08"] == 2
+
+
+class TestOldestValidTag:
+    """PREFER_OLDEST_VALID_TAG: a igualdad de validez (mismo kind, mismo
+    source, mismo flag XX), gana el tag observado desde hace más tiempo
+    (`fst_fec_informacion_hora_oper` ascendente); la validez sigue mandando
+    sobre la antigüedad."""
+
+    COLS = ["cta", "nom", "rfc_curp", "rfc_curp_ends_with_xxx",
+        "RFC_CURP_KIND_PRIORITY", "SOURCE_PRIORITY", "cnt_rfc_by_cta",
+        "cnt_rfc_by_nom", "tot_oper_mto", "lst_fec_informacion_hora_oper",
+        "fst_fec_informacion_hora_oper"]
+
+    def _rank(self, spark, window, rows):
+        df = spark.createDataFrame(rows, self.COLS)
+        return {r["rfc_curp"]: r["rank"] for r in df
+            .withColumn("rank", row_number().over(window)).collect()}
+
+    def test_older_tag_wins_at_equal_validity(self, spark, bxico_config):
+        """Dos RFC física igual de válidos: gana el más antiguo aunque el
+        reciente tenga más operaciones y monto."""
+        rows = [
+            ("c1", "ANA", "AAPL900615AB1", 0, 1, 1, 100, 100, 9e6,
+             "2025-08-01#10", "2024-01-01#08"),   # candidato reciente, más cnt
+            ("c1", "ANA", "BBLP850320XY2", 0, 1, 1, 5, 5, 100.0,
+             "2020-05-01#09", "2019-01-01#07"),   # candidato viejo
+        ]
+        ranked = self._rank(spark, bxico_config.RFC_BY_CTA_PRIORITY_WINDOW, rows)
+        assert ranked["BBLP850320XY2"] == 1   # el viejo gana
+        assert ranked["AAPL900615AB1"] == 2
+
+    def test_validity_still_dominates_age(self, spark, bxico_config):
+        """Un tag viejo pero inválido NO gana a uno válido reciente."""
+        rows = [
+            ("c1", "ANA", "AAPL900615AB1", 0, 1, 1, 1, 1, 10.0,
+             "2025-08-01#10", "2025-01-01#08"),   # válido, reciente
+            ("c1", "ANA", "XXXX000000XX0", 1, 6, 1, 500, 500, 9e6,
+             "2020-05-01#09", "2018-01-01#07"),   # inválido (kind 6) y viejo
+        ]
+        ranked = self._rank(spark, bxico_config.RFC_BY_CTA_PRIORITY_WINDOW, rows)
+        assert ranked["AAPL900615AB1"] == 1
+        assert ranked["XXXX000000XX0"] == 2
+
+    def test_older_tag_wins_by_nom_window(self, spark, bxico_config):
+        """La ventana por nombre aplica la misma regla de antigüedad."""
+        rows = [
+            ("c1", "ANA", "AAPL900615AB1", 0, 1, 1, 100, 100, 9e6,
+             "2025-08-01#10", "2024-01-01#08"),
+            ("c2", "ANA", "BBLP850320XY2", 0, 1, 1, 5, 5, 100.0,
+             "2020-05-01#09", "2019-01-01#07"),
+        ]
+        ranked = self._rank(spark, bxico_config.RFC_BY_NOM_PRIORITY_WINDOW, rows)
+        assert ranked["BBLP850320XY2"] == 1
+
+    def test_flag_controls_the_ordering(self, bxico_config):
+        """Con el flag activo la ventana incluye fst_fec; sin él, no."""
+        assert bxico_config.PREFER_OLDEST_VALID_TAG is True
+        assert any("fst_fec_informacion_hora_oper" in str(e)
+            for e in bxico_config._RFC_BY_CTA_ORDER)
+        assert any("fst_fec_informacion_hora_oper" in str(e)
+            for e in bxico_config._RFC_BY_NOM_ORDER)
