@@ -638,7 +638,7 @@ def plain_group_stats(
     if size_column is not None:
         aggregations.append(count(lit(1)).alias(size_column))
     aggregations += [
-        func(col(value_column)).alias(f"{column_prefix}{stat}_{value_column}")
+        func(value_column).alias(f"{column_prefix}{stat}_{value_column}")
         for value_column in value_columns
         for stat, func in stats.items()
     ]

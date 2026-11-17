@@ -31,24 +31,34 @@ job_config = c_j.sbx  # config del job (raíz HDFS, fechas, cohortes)
 # PARAMETERS
 # --------------------------------------------------------------------------------------
 
+# Algoritmo de sub-partición dentro de cada componente conexa.
+#   "scc"               -> stronglyConnectedComponents (dirigido, determinista):
+#                          dos nodos comparten grupo solo con camino de ida Y vuelta
+#   "label_propagation" -> labelPropagation (NO determinista: los grupos pueden
+#                          cambiar entre ejecuciones con los mismos datos)
+#   "cc"                -> connectedComponents NO dirigido (modo LIGERO): todo lo
+#                          conectado por cualquier camino cae en el mismo grupo;
+#                          sin conexión real, el grupo se corta. El más barato.
+SUBCLUSTER_METHOD = "scc"
+SUBCLUSTER_MAX_ITER = 10
+
+# Columna de grupo que produce la sub-partición: lleva la abreviatura del
+# método para que los features finales (`cluster_grp_<m>_*`) identifiquen la
+# agrupación de la que salieron y los métodos puedan coexistir sin colisionar.
+_SUBCLUSTER_METHOD_SHORT = {"scc": "scc", "label_propagation": "lp", "cc": "cc"}
+SUBCLUSTER_GROUP_COLUMN = f"grp_{_SUBCLUSTER_METHOD_SHORT[SUBCLUSTER_METHOD]}"
+
 # Columnas de agrupación de cada nodo:
 #   - "component_id": componente conexa (determinista; parquet `components` ya existente)
-#   - "scc":          componente fuertemente conexa (determinista; sub-partición dirigida)
-#                   SOLO disponible si SUBCLUSTER_ENABLED=True; si está
-#                   desactivado, cluster_stats la ignora con un warning.
-GROUP_COLUMNS = ["component_id", "scc"]
+#   - SUBCLUSTER_GROUP_COLUMN ("grp_scc"/"grp_lp"/"grp_cc" según SUBCLUSTER_METHOD):
+#                   sub-partición elegida; SOLO disponible si SUBCLUSTER_ENABLED=True;
+#                   si está desactivado, cluster_stats la ignora con un warning.
+GROUP_COLUMNS = ["component_id", SUBCLUSTER_GROUP_COLUMN]
 
 # Si es False no se ejecuta ningún algoritmo de sub-partición: el step solo
 # agrupa por "component_id" (parquet `components` ya existente) y sigue.
 # Desactivarlo salta la parte más pesada del step (SCC de GraphFrames).
 SUBCLUSTER_ENABLED = True
-
-# Algoritmo de sub-partición dentro de cada componente conexa.
-#   "scc"               -> stronglyConnectedComponents (determinista)
-#   "label_propagation" -> labelPropagation (NO determinista: los grupos pueden
-#                          cambiar entre ejecuciones con los mismos datos)
-SUBCLUSTER_METHOD = "scc"
-SUBCLUSTER_MAX_ITER = 10
 
 # Estadísticos calculados por grupo y columna agregada. Las funciones reciben el
 # nombre de la columna y devuelven la expresión de agregación.
@@ -65,7 +75,7 @@ CLUSTER_STATS = {
 # Columnas excluidas de la agregación (ids, columnas de grupo y metadatos de
 # partición-param de los parquets de features leídos con mergeSchema).
 AGGREGATE_EXCLUDE_COLUMNS = [
-    "id", "numcliente", "component_id", "scc",
+    "id", "numcliente", "component_id", SUBCLUSTER_GROUP_COLUMN,
     "mis_date", "process_date", "information_date",
     "weight_type", "target_column",
     "max_iter", "alpha", "keep_seed_floor", "reset_prob",

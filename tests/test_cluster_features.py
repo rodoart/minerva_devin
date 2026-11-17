@@ -124,18 +124,31 @@ class TestSubcluster:
     def test_scc_groups(self, substep, nodes_edges, checkpoint_dir):
         nodes, edges = nodes_edges
         df = substep.subcluster(nodes, edges, method="scc", max_iter=5)
-        assert set(df.columns) == {"id", "scc"}
-        rows = {r["id"]: r["scc"] for r in df.collect()}
+        assert set(df.columns) == {"id", "grp_scc"}
+        rows = {r["id"]: r["grp_scc"] for r in df.collect()}
         assert rows["a"] == rows["b"]          # ciclo a<->b: mismo scc
         assert rows["a"] != rows["c"]          # c solo recibe: scc distinto
         assert len({rows["a"], rows["c"], rows["d"]}) == 3
+
+    def test_cc_groups(self, substep, graphframes, checkpoint_dir):
+        """Modo ligero `cc`: todo lo conectado por un camino (sin importar
+        dirección) comparte grupo; sin conexión real, el grupo se corta."""
+        nodes = graphframes.createDataFrame(
+            [("a",), ("b",), ("c",), ("d",)], ["id"])
+        edges = graphframes.createDataFrame(
+            [("a", "b"), ("b", "c")], ["src", "dst"])   # cadena sin ciclo
+        df = substep.subcluster(nodes, edges, method="cc")
+        assert set(df.columns) == {"id", "grp_cc"}
+        rows = {r["id"]: r["grp_cc"] for r in df.collect()}
+        assert rows["a"] == rows["b"] == rows["c"]   # a-b-c conectados (scc los separaría)
+        assert rows["a"] != rows["d"]                # d no conectado: grupo cortado
 
     def test_label_propagation_warns(self, substep, nodes_edges,
             checkpoint_dir, caplog):
         nodes, edges = nodes_edges
         df = substep.subcluster(
             nodes, edges, method="label_propagation", max_iter=5)
-        assert set(df.columns) == {"id", "scc"}
+        assert set(df.columns) == {"id", "grp_lp"}
         assert any("NO es determinista" in r.message for r in caplog.records)
 
     def test_unknown_method_raises(self, substep, nodes_edges):
@@ -178,18 +191,45 @@ class TestConfig:
     def test_vector_assembler_source_registered(self):
         import config.features.ceps.vector_assembler as cvas
         assert cvas.FEATURE_SOURCES["cluster_stats"]["mode"] == "simple"
-        for group_column in ("component_id", "scc"):
+        for group_column in ("component_id", "grp_scc", "grp_lp", "grp_cc"):
             assert group_column in cvas.EXCLUDE_COLUMNS
+
+    def test_subcluster_group_column_matches_method(self):
+        """La columna de grupo de la sub-partición lleva el método elegido y
+        participa en GROUP_COLUMNS / AGGREGATE_EXCLUDE_COLUMNS."""
+        import config.features.ceps.cluster_features as cclf
+        short = {"scc": "scc", "label_propagation": "lp", "cc": "cc"}
+        expected = f"grp_{short[cclf.SUBCLUSTER_METHOD]}"
+        assert cclf.SUBCLUSTER_GROUP_COLUMN == expected
+        assert expected in cclf.GROUP_COLUMNS
+        assert expected in cclf.AGGREGATE_EXCLUDE_COLUMNS
 
 
 # ----------------------------------------------------------------------------
 # REQUIRED_STATS_PREFIXES: targets propagadas y pesos deben entrar en los stats
 # ----------------------------------------------------------------------------
 
-def _cluster_substep(nodes_enriched):
+def _bare_substep(spark, tmp_dir):
+    """Substep mínimo con output_hive apuntando a rutas temporales locales."""
+    from pipelines.features.ceps.cluster_features import (
+        CepsClusterFeaturesSubStep)
+    step = object.__new__(CepsClusterFeaturesSubStep)
+    step.sqlContext = spark
+    step.is_dynamic = True
+    step.tmp_paths = []
+    step._decorated_cache = {}
+    step.output_hive = {
+        key: {"table_or_hdfs": str(tmp_dir / key), "keep_or_delete": "delete"}
+        for key in ("subcluster_df", "nodes_enriched", "cluster_stats",
+                    "cluster_stats_parts", "checkpoint")
+    }
+    return step
+
+
+def _cluster_substep(spark, tmp_path, nodes_enriched):
     """Substep mínimo con `nodes_enriched` precargado en caché."""
     from pipelines.features.ceps.cluster_features import CepsClusterFeaturesSubStep
-    step = object.__new__(CepsClusterFeaturesSubStep)
+    step = _bare_substep(spark, tmp_path)
     step.__dict__["_nodes_enriched_cache"] = nodes_enriched
     return step
 
@@ -209,22 +249,22 @@ class TestRequiredStatsPrefixes:
         monkeypatch.setattr(cclf, "REQUIRED_STATS_PREFIXES",
             ["target_", "contagion_", "oper_mto", "weight", "_strength"])
 
-    def test_warns_when_no_required_column_present(self, spark, caplog):
+    def test_warns_when_no_required_column_present(self, spark, tmp_path, caplog):
         df = spark.createDataFrame(
             [("a", 1, 10.0)], ["id", "component_id", "feat"])
-        step = _cluster_substep(df)
+        step = _cluster_substep(spark, tmp_path, df)
         step.cluster_stats
         warnings = [r.message for r in caplog.records
             if "prefijo obligatorio" in r.message]
         assert len(warnings) == 5   # un warning por prefijo sin match
 
-    def test_no_warning_with_target_contagion_and_weights(self, spark, caplog):
+    def test_no_warning_with_target_contagion_and_weights(self, spark, tmp_path, caplog):
         df = spark.createDataFrame(
             [("a", 1, 1.0, 0.4, 100.0, 2.0, 5.0),
              ("b", 1, 0.0, 0.1, 200.0, 3.0, 6.0)],
             ["id", "component_id", "target_lovelace", "contagion_composed",
              "oper_mto", "weight_x", "total_strength"])
-        step = _cluster_substep(df)
+        step = _cluster_substep(spark, tmp_path, df)
         result = step.cluster_stats
         assert not any("prefijo obligatorio" in r.message
             for r in caplog.records)
@@ -236,13 +276,13 @@ class TestRequiredStatsPrefixes:
         assert rows["a"]["cluster_component_id_mean_total_strength"] == \
             pytest.approx(5.5)
 
-    def test_endswith_prefixes_count_too(self, spark, caplog):
+    def test_endswith_prefixes_count_too(self, spark, tmp_path, caplog):
         """`_strength` se busca también como sufijo (in_strength, ...)."""
         df = spark.createDataFrame(
             [("a", 1, 1.0, 0.4, 100.0, 5.0)],
             ["id", "component_id", "target_lovelace", "contagion_x",
              "oper_mto", "in_strength"])
-        step = _cluster_substep(df)
+        step = _cluster_substep(spark, tmp_path, df)
         step.cluster_stats
         remaining = [r.message for r in caplog.records
             if "prefijo obligatorio" in r.message]
@@ -254,23 +294,6 @@ class TestRequiredStatsPrefixes:
 # ----------------------------------------------------------------------------
 # Persistencia de intermedios (reload-or-recompute)
 # ----------------------------------------------------------------------------
-
-def _bare_substep(spark, tmp_dir):
-    """Substep mínimo con output_hive apuntando a rutas temporales locales."""
-    from pipelines.features.ceps.cluster_features import (
-        CepsClusterFeaturesSubStep)
-    step = object.__new__(CepsClusterFeaturesSubStep)
-    step.sqlContext = spark
-    step.is_dynamic = True
-    step.tmp_paths = []
-    step._decorated_cache = {}
-    step.output_hive = {
-        key: {"table_or_hdfs": str(tmp_dir / key), "keep_or_delete": "delete"}
-        for key in ("subcluster_df", "nodes_enriched", "cluster_stats",
-                    "cluster_stats_parts")
-    }
-    return step
-
 
 class TestIntermediatePersistence:
     """Los parquets intermedios hacen reanudable el step: en una segunda

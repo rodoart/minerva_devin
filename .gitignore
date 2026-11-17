@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Entorno local de tests y winutils (Windows)
+.venv-tests/
+opt/winutils/

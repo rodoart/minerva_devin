@@ -92,6 +92,18 @@ class StandardClusterFeaturesStep(ppf.Step):
         return StandardClusterFeaturesSubStep(self)
 
 
+# Métodos de sub-partición soportados: columna de etiqueta cruda del algoritmo
+# y abreviatura usada en la columna de salida `grp_<short>`. El nombre de la
+# columna lleva el método para que los stats finales (`cluster_grp_cc_*` vs
+# `cluster_grp_scc_*`) identifiquen por qué agrupación pasaron y varios métodos
+# puedan coexistir en config sin colisionar.
+SUBCLUSTER_METHODS = {
+    "scc": {"label_column": "component", "short": "scc"},
+    "label_propagation": {"label_column": "label", "short": "lp"},
+    "cc": {"label_column": "component", "short": "cc"},
+}
+
+
 class StandardClusterFeaturesSubStep(SubStep):
     """Sub-etapa base de clustering: enriquecimiento de nodos + stats por grupo.
     """
@@ -128,25 +140,40 @@ class StandardClusterFeaturesSubStep(SubStep):
         method:str = "scc",
         max_iter:int = 10
     ) -> DataFrame:
-        """Sub-partición del grafo en grupos dirigidos: una fila por `id`.
+        """Sub-partición del grafo en grupos: una fila por `id`.
 
-        - `"scc"`: `stronglyConnectedComponents` (determinista).
+        Métodos soportados (`SUBCLUSTER_METHODS`):
+
+        - `"scc"`: `stronglyConnectedComponents` (dirigido, determinista).
+          Dos nodos comparten grupo solo si hay camino dirigido de ida Y vuelta.
         - `"label_propagation"`: `labelPropagation` (NO determinista).
+        - `"cc"`: `connectedComponents` NO dirigido (el modo ligero): todo lo
+          conectado por cualquier camino —sin importar dirección— cae en el
+          mismo grupo; sin conexión real, el grupo se corta. Es la operación
+          de agrupación más barata de GraphFrames.
+
+        La columna de salida es `grp_<short>` (`grp_scc` / `grp_lp` / `grp_cc`):
+        el nombre del método viaja hasta los features finales
+        (`cluster_grp_<m>_*`).
 
         Requiere que el llamador haya fijado `sparkContext.setCheckpointDir`.
         """
-        if method not in ("scc", "label_propagation"):
+        if method not in SUBCLUSTER_METHODS:
             raise ValueError(f"Método de subcluster desconocido: {method!r}")
         if method == "label_propagation":
             logger.warning(
                 "label_propagation NO es determinista: los subclusters pueden "
                 "cambiar entre ejecuciones con los mismos datos")
         graph = GraphFrame(nodes_df.select("id"), edges_df.select("src", "dst"))
-        result = (graph.stronglyConnectedComponents(maxIter=max_iter)
-            if method == "scc"
-            else graph.labelPropagation(maxIter=max_iter))
-        label_col = "component" if method == "scc" else "label"
-        return result.select("id", col(label_col).alias("scc"))
+        if method == "scc":
+            result = graph.stronglyConnectedComponents(maxIter=max_iter)
+        elif method == "cc":
+            result = graph.connectedComponents()
+        else:
+            result = graph.labelPropagation(maxIter=max_iter)
+        spec = SUBCLUSTER_METHODS[method]
+        return result.select(
+            "id", col(spec["label_column"]).alias(f"grp_{spec['short']}"))
         #
     @staticmethod
     def standard_cluster_group_stats(
@@ -257,8 +284,11 @@ class StandardClusterFeaturesSubStep(SubStep):
         max_groups = getattr(cclf, "STATS_BROADCAST_MAX_GROUPS", 200000)
         if grouped.limit(max_groups + 1).count() <= max_groups:
             grouped = broadcast(grouped)
+        # La columna de grupo NO viaja a la salida: solo stats (los identificadores
+        # de grupo no son features; ver AGGREGATE_EXCLUDE_COLUMNS).
         return (df.select("id", group_column)
-            .join(grouped, on=group_column, how="left"))
+            .join(grouped, on=group_column, how="left")
+            .drop(group_column))
         #
 
 
@@ -325,8 +355,11 @@ class CepsClusterFeaturesSubStep(StandardClusterFeaturesSubStep):
         """
         base = HivePath(str(
             self.output_hive["subcluster_df"]["table_or_hdfs"]))
+        # La columna de salida (grp_<método>) entra en la variante: un parquet
+        # cacheado con el esquema viejo ("scc") no se recarga tras el rename.
         variant = (f"method={cclf.SUBCLUSTER_METHOD}"
-            f"_max_iter={cclf.SUBCLUSTER_MAX_ITER}")
+            f"_max_iter={cclf.SUBCLUSTER_MAX_ITER}"
+            f"_out={cclf.SUBCLUSTER_GROUP_COLUMN}")
         return self.get_cached_decorated_table_or_parquet_property(
             method=self._compute_subcluster_df,
             path=base.joinpath(variant),

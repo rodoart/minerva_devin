@@ -28,6 +28,28 @@ if TEST_MODE == "local":
     # PYTHON_VERSION_MISMATCH cuando `python3` del PATH es otra versión).
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    # PySpark de PyPI exige una SparkSession activa para construir
+    # Window/Column en tiempo de import (los módulos de config definen ventanas
+    # a nivel de módulo). Se arranca la sesión al importar el conftest para que
+    # la recolección de tests no falle; la fixture `spark` la reutiliza.
+    try:
+        from pyspark.sql import SparkSession as _SS
+        _builder = (_SS.builder
+            .master("local[2]")
+            .appName("minerva-tests")
+            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.ui.enabled", "false")
+            .config("spark.driver.host", "localhost"))
+        _jars_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+            "..", ".local_jars")
+        if os.path.isdir(_jars_dir):
+            _jars = [os.path.join(_jars_dir, f)
+                for f in sorted(os.listdir(_jars_dir)) if f.endswith(".jar")]
+            if _jars:
+                _builder = _builder.config("spark.jars", ",".join(_jars))
+        _builder.getOrCreate()
+    except ImportError:
+        pass  # sin pyspark: los tests que lo requieren se saltan solos
 
 
 def pytest_configure(config):
@@ -40,13 +62,22 @@ def spark():
     if TEST_MODE == "local":
         pytest.importorskip("pyspark")
         from pyspark.sql import SparkSession
-        session = (SparkSession.builder
+        builder = (SparkSession.builder
             .master("local[2]")
             .appName("minerva-tests")
             .config("spark.sql.shuffle.partitions", "4")
             .config("spark.ui.enabled", "false")
-            .config("spark.driver.host", "localhost")
-            .getOrCreate())
+            .config("spark.driver.host", "localhost"))
+        # Jars locales (graphframes + deps) si existen: habilitan los tests
+        # marcados `graphframes` en modo local en vez de saltarlos.
+        jars_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+            "..", ".local_jars")
+        if os.path.isdir(jars_dir):
+            jars = [os.path.join(jars_dir, f)
+                for f in sorted(os.listdir(jars_dir)) if f.endswith(".jar")]
+            if jars:
+                builder = builder.config("spark.jars", ",".join(jars))
+        session = builder.getOrCreate()
     else:
         from libs.data_engineering_toolbox.context import SparkSessionBuilder
         session = SparkSessionBuilder().build()
