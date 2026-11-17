@@ -55,7 +55,7 @@ produce cada función están entre paréntesis.
 | ¿A qué componente conexa pertenece? | `components` | `component_id` |
 | ¿Cuál es el monto total de su componente? | `weighted_components` | `component`, `component_weight` |
 | ¿En cuántos triángulos participa (densidad local)? | `triangle_count` / `weighted_triangle_count` | `triangle_count`, `total_strength` |
-| ¿A qué sub-grupo dirigido (SCC) pertenece? | `subcluster` (cluster_features) | `scc` |
+| ¿A qué sub-grupo dirigido pertenece? | `subcluster` (cluster_features, `SUBCLUSTER_METHOD`) | `grp_scc` / `grp_lp` / `grp_cc` |
 
 ## 5. Estadísticos intra-grupo (cluster features)
 
@@ -92,6 +92,51 @@ produce cada función están entre paréntesis.
 | ¿Features por cliente y por cuenta? | vector assembler multi-nivel | `numcliente_features_vector`, `cta_features_vector` |
 | ¿Media/mediana/std ponderadas por monto x antigüedad? | `FEATURE_AGGREGATION` multi-función | `<func>_<feature>_ceps` |
 
+## 8. Exposición al fraude / riesgo de nodo
+
+> ¿Qué tan contaminado está el nodo por fraude conocido, directa o
+> indirectamente?
+
+| Pregunta | Feature | Columnas |
+|---|---|---|
+| ¿Cuántos de sus vecinos directos son fraude? | `risk_features` (semillas duras/blandas) | `risk_in_sum_<s>`, `risk_out_sum_<s>`, `risk_in_frac_<s>`, `risk_out_frac_<s>` |
+| ¿Cuánto dinero mueve hacia / desde fraude? | `risk_features` | `risk_outflow_<s>`, `risk_inflow_<s>` |
+| ¿Cuántos nodos fraudulentos hay a 2 saltos? | `risk_features` | `risk_2hop_<s>` |
+| ¿A qué distancia está el fraude conocido más cercano? | `shortestPaths` a semillas | `risk_dist_to_<s>`, `risk_dist_from_<s>` |
+| ¿Cuánta reputación le llega desde semillas fraudulentas? | personalized PageRank | `risk_ppr_max_<s>`, `risk_ppr_mean_<s>` |
+| ¿Y si no hay etiqueta real? | targets sintéticos | `target_synthetic_<name>`, `contagion_synthetic_<name>_<peso>` |
+
+## 9. Proximidad de par (A, X)
+
+> A es un nodo con target (p.ej. 1.0); X es un candidato cercano. ¿Qué tan
+> relacionados están?
+
+| Pregunta | Feature | Columnas |
+|---|---|---|
+| ¿Cuántos vecinos comparten A y X? | `pair_features` | `pair_common_neighbors` |
+| ¿Qué tan similares son sus vecindarios? | `pair_features` | `pair_jaccard` |
+| ¿Y ponderando vecinos raros? | `pair_features` | `pair_adamic_adar` |
+| ¿Se envían dinero en ambas direcciones? | `pair_features` | `pair_reciprocity` |
+| ¿Producto de grados (preferential attachment)? | `pair_features` | `pair_preferential_attachment` (`deg_out(A)·deg_in(X)`) |
+| ¿Cuántos caminos de longitud 2 los unen? | `pair_features` | `pair_paths_len2` |
+| ¿A qué distancia mínima están? | `pair_features` | `pair_min_distance` |
+
+## 10. Temporalidad
+
+> ¿Cómo cambia el comportamiento en el tiempo? ¿Hay ráfagas, pass-through,
+> montos esquivando umbrales de reporte?
+
+| Pregunta | Feature | Columnas |
+|---|---|---|
+| ¿Cuántas txns en 1/7/30 días? ¿Acelerando? | `temporal_features` | `tmp_txn_count_<w>d`, `tmp_velocity_7d_30d` |
+| ¿Qué tan vieja es la cuenta y cuándo fue su última txn? | `temporal_features` | `tmp_account_age_days`, `tmp_days_since_last_txn` |
+| ¿Opera de noche / en fin de semana? | `temporal_features` | `tmp_pct_night`, `tmp_pct_weekend` |
+| ¿Montos justo bajo umbrales de reporte? | `temporal_features` | `tmp_pct_below_threshold` |
+| ¿Llegadas en ráfagas? | `temporal_features` | `tmp_burstiness` |
+| ¿A cuántos receptores únicos envía en 7 días? | `temporal_features` | `tmp_unique_receivers_7d` |
+| ¿Pass-through (entra y sale rápido)? | `temporal_features` | `tmp_pass_through_24h`, `tmp_flow_out_in_ratio` |
+| ¿El monto A→X es atípico para ese par / ese emisor? | `temporal_features` (par) | `tmp_amt_zscore_ax`, `tmp_last_amt_over_median_ax`, `tmp_mean_amt_over_median_a` |
+
 ---
 
 ## Preguntas frecuentes todavía no implementadas (backlog)
@@ -100,6 +145,5 @@ produce cada función están entre paréntesis.
 |---|---|
 | ¿Qué tan agrupado está el vecindario del nodo? (clustering coefficient) | `triangle_count / (k(k-1)/2)` — ya hay `triangle_count` |
 | ¿El nodo es un cuello de botella entre grupos? | betweenness centrality (costoso) |
-| ¿Distancia al fraude conocido más cercano? | shortest path a semillas |
 | ¿El nodo está en el núcleo denso k del grafo? | `k_core` (ya hay output reservado en config) |
 | ¿Variación temporal de su grado/monto? | features de serie temporal por mes (`*_monthly` ya disponible) |

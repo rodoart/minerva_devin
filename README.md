@@ -13,31 +13,50 @@ conda env create -f environment.yaml && conda activate minerva_devin
 # env vars requeridas (ver notebook/uso.md §1)
 export MINERVA_TODAY=2025-08-31  # ... y el resto
 
-python main.py                   # ejecuta el flujo completo (10 steps)
+python main.py                   # ejecuta el flujo completo (12 steps × variante)
 python main.py --build-only      # smoke test de la cadena sin ejecutar
 python -m pytest tests/          # tests unitarios
 ```
 
-## Flujo (10 steps)
+## Flujo (12 steps × variante de grafo)
 
 ```
 rfc_nom_ranking ──► txn_replacement ──► special_treatment ──► group_by
   ──► edges_and_nodes ──► graph_features ──► target_propagation (lovelace)
-  ──► target_propagation_features ──► cluster_features ──► vector_assembler
+  ──► target_propagation_features ──► risk_features ──► temporal_features
+  ──► cluster_features ──► vector_assembler
 ```
 
+La cadena se construye **una vez por variante de grafo**
+(`config/graph_making/ceps/variants.py`): `rfc` (grafo RFC-RFC histórico,
+rutas intactas) y `cta` (grafo cta-cta con imputación de `numcliente` vía la
+tabla `mapeo_cta_numcliente`); ambas coexisten y comparten los steps previos
+al grafo y el special treatment del target.
+
+- **Catálogo de imputación all-time incremental**: el ranking RFC/nom se
+  construye desde el principio de los tiempos con parciales mensuales
+  combinables (`s264_ceps_flattened_monthly` / `..._groupby_monthly`,
+  `CEPS_ALL_TIME_HISTORY_MONTHS`); cada corrida solo escribe el incremento
+  del mes. Con `PREFER_OLDEST_VALID_TAG`, a igual validez gana el tag más
+  antiguo.
 - **Historia incremental mensual** en `group_by`: los agregados parciales se
   guardan por mes (`month_partition`) y solo se computan los meses que falten
   (`ensure_monthly_partitions`).
-- **Historias independientes**: los catálogos de reemplazo usan
-  `CEPS_RANKING_HISTORY_IN_MONTHS` (24) y la tabla `txn_replaced` conserva
-  solo `TXN_REPLACED_HISTORY_IN_MONTHS` (3).
-- **Propagación multi-columna**: target + scores viajan juntos por el grafo
-  (`contagion_<col>_<weight>`).
-- **Assembler multi-nivel**: `numcliente_features_vector` y
-  `cta_features_vector` (solo llave + vector), sufijo `_ceps` en variables,
-  multi-agregación (mean/median/std/weighted_mean), centinela `-99999` y
-  fuentes de features opcionales/desactivables.
+- **Propagación multi-columna + targets sintéticos**: target + scores viajan
+  juntos por el grafo (`contagion_<col>_<weight>`); `SYNTHETIC_TARGETS` deriva
+  semillas sintéticas de métricas de nodo (p.ej. top-1% pagerank) y las
+  propaga igual (`contagion_synthetic_<name>_<weight>`).
+- **Features de riesgo de nodo** (`risk_*_<semilla>`: vecinos semilla, 2
+  saltos, ratio de flujo, distancia al fraude, Personalized PageRank) y
+  **de par (A, X)** (`pair_*`: vecinos comunes, Jaccard, Adamic-Adar,
+  preferential attachment, reciprocidad, caminos de longitud 2, distancia
+  mínima), más **features temporales** (`tmp_*`: ráfagas, pass-through 24h,
+  velocidad, bajo-umbral, ...).
+- **Assembler multi-nivel y multi-transformación**: `numcliente_features_vector`
+  y `cta_features_vector` (solo llave + vector), sufijo `_ceps`,
+  `AGGREGATION_SPECS` (lista de agregaciones con peso propio) y
+  `NODE_TRANSFORMS` (transformaciones a nivel nodo pre-agregación), centinela
+  `-99999` y fuentes de features opcionales/desactivables.
 
 ## Estructura
 
@@ -51,8 +70,9 @@ rfc_nom_ranking ──► txn_replacement ──► special_treatment ──► 
   `dynamic_*`, `cached_property`, `ensure_monthly_partitions`, helpers de
   substep).
 - `libs/functions` — librerías importables: `missing_treatment`, `features`
-  (grafo + propagación), `weights`, `assembly`, `aggregations` (parciales
-  mensuales combinables).
+  (grafo + propagación + targets sintéticos), `pair_features` (riesgo de nodo
+  y proximidad de par), `temporal_features` (`tmp_*` desde transacciones),
+  `weights`, `assembly`, `aggregations` (parciales mensuales combinables).
 - `libs/data_engineering_toolbox` — toolbox: paths HDFS (`HivePath`), contexto
   Spark, IO de particiones (`SparkLoad*`/`SparkTwoPartition*`), history,
   compare/dynamic/testing.
@@ -73,4 +93,5 @@ rfc_nom_ranking ──► txn_replacement ──► special_treatment ──► 
 
 Variables de entorno requeridas: `MINERVA_WORKSPACE_DIR_LINUX`, `PYSPARK_QUEUE`,
 `PYSPARK_PORT`, `MINERVA_NAME`, `MINERVA_TODAY`, `MINERVA_VENV_TAR_GZ_LINUX`,
-`MINERVA_VENV_TAR_GZ_HDFS`, `GRAPHFRAMES_JAR` (+ `HADOOP_CONF_DIR` para operaciones HDFS).
+`MINERVA_VENV_TAR_GZ_HDFS`, `MINERVA_GRAPHFRAMES_JAR_HDFS` (+ `HADOOP_CONF_DIR`
+para operaciones HDFS).

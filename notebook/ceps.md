@@ -12,13 +12,23 @@ Step: `CepsRfcNomRankingStep` (`pipelines/ceps/rfc_nom_ranking.py`), config en
 | `CepsExtractStep` | `s264_ceps` | Historial crudo CEP: renombra emisor->`_ord`, receptor->`_ben` |
 | | `s264_ceps_cleaned` | Limpieza de texto: `norm` (trim+upper+recorta última letra), null synonyms (`""`, `"ND"`, `"RFC NO DISPONIBLE"`), `banamex_nom_reorder` (`,`,`/` -> espacio), `limpiar_acentos`, `normalizar_espacios` (`-_/.,;:` -> espacio) |
 | | `rfc_curp_analysis_s264_ceps` | `add_id_validation_flags` clasifica `rfc_curp_*`: curp / rfc_fisica / rfc_moral / rfc_fisica_siinvalid |n_homoclave / tc (16 díg) / clabe (18 díg) / 
-| | `s264_ceps_flattened` | Aplana ord+ben a formato largo: `nom, cta, id_ban, tipo_cta, rfc_curp, rfc_curp_kind, is_rfc_curp_valid, fec_informacion, oper_mto, hora_oper, source` |
-| `CepsRankStep` | `s264_ceps_flattened_groupby` | Agrupa por (cta, nom, id_ban, tipo_cta, rfc_curp, rfc_curp_kind, source): cnt, tot_oper_mto, lst_fec_informacion_hora_oper, RFC_CURP_KIND_PRIORITY, SOURCE_PRIORITY |
+| | `s264_ceps_flattened_monthly` | Aplana ord+ben a formato largo: `nom, cta, id_ban, tipo_cta, rfc_curp, rfc_curp_kind, is_rfc_curp_valid, fec_informacion, fst_fec_informacion_hora_oper, oper_mto, hora_oper, source` — **all-time incremental** por `month_partition` (reemplaza a la antigua salida `s264_ceps_flattened` de ventana corta) |
+| `CepsRankStep` | `s264_ceps_flattened_groupby_monthly` | Parciales mensuales combinables del group-by (misma maquinaria incremental de `group_by`) |
+| | `s264_ceps_flattened_groupby` | Agrupa recombinando TODAS las parciales mensuales por (cta, nom, id_ban, tipo_cta, rfc_curp, rfc_curp_kind, source): cnt, tot_oper_mto, lst_fec_informacion_hora_oper, RFC_CURP_KIND_PRIORITY, SOURCE_PRIORITY |
 | | `s264_ceps_flattened_ranks` | + `cnt_rfc_by_cta/nom`, `rank_rfc_by_cta/nom` (row_number sobre ventanas de config) |
 | | `s264_ceps_flattened_rank_rfc_by_{cta,nom}_cases_replace` | Mejor RFC por (cta, nom, id_ban) / (nom, id_ban); parquet simple que consume `txn_replacement` |
 
 Prioridad de tipo de id (`RFC_CURP_KIND_PRIORITY`): rfc_moral=0 < rfc_fisica=1 <
 curp=2 < rfc_fisica_sin_homoclave=3 < clabe=4 < tc=5 < invalid=6.
+
+### Prioridad al tag viejo válido (`PREFER_OLDEST_VALID_TAG = True`)
+
+Las ventanas `RFC_BY_{CTA,NOM}_PRIORITY_WINDOW` primero descartan nulos y
+ordenan por validez (un RFC/CURP válido siempre gana a uno inválido o débil)
+y luego —con `PREFER_OLDEST_VALID_TAG`— premian la **antigüedad** del tag: a
+igual validez gana el `fst_fec_informacion_hora_oper` (primera fecha de
+información del tag) más antiguo. Un RFC viejo y válido tiene prioridad sobre
+uno recién aparecido.
 
 ## Catálogo Banxico `bxico_rfc_curp_cat`
 
@@ -77,6 +87,33 @@ Dos ventanas de historia **independientes**:
 - Como la partición de salida lleva solo 3 meses, el grafo sigue viendo la
   ventana completa acumulando las particiones de los últimos vintages (como
   hace `history` en los loaders de `edges_and_nodes`).
+
+### Catálogo de imputación all-time e incremental
+
+La ventana de 24 meses (`CEPS_RANKING_HISTORY_IN_MONTHS`) controla solo la
+**lectura cruda**; los parciales aplanados/agrupados son **all-time**:
+
+- `s264_ceps_flattened_monthly` y `s264_ceps_flattened_groupby_monthly` se
+  guardan por `month_partition` con `CEPS_ALL_TIME_HISTORY_MONTHS = 1200` al
+  releer. Cada corrida calcula **solo los meses faltantes** del vintage
+  (`ensure_monthly_partitions`) y recombinan los parciales ya guardados
+  (`combine_ceps_groupby`): mes a mes solo se escribe el incremento, no se
+  recalcula la historia.
+- `s264_ceps_flattened_groupby` (el catálogo que rankea) se obtiene
+  recombinando todas las parciales, así la imputación se construye con
+  información desde el principio de los tiempos.
+- La antigua salida `s264_ceps_flattened` (ventana corta) ya no se
+  materializa.
+
+### Salida `mapeo_cta_numcliente`
+
+Además de `rfc_curp_analysis_s264_ceps_replaced`, el step materializa
+`mapeo_cta_numcliente` (una fila por cta → numcliente, construida con
+`build_mapeo_cta_numcliente` sobre las txns reemplazadas). Es el mapeo que usa
+la **variante `cta`** del grafo para imputar el numcliente al final; si algún
+día existe otra tabla oficial de mapeo basta reapuntar la clave
+`mapeo_cta_numcliente` del input de esa variante — el resto del flujo no
+cambia.
 
 Tests: `tests/test_txn_history_window.py`.
 

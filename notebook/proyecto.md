@@ -107,18 +107,27 @@ historia mínima (`minimum_required_history`).
 
 ## 3. Cadena de steps (main.py)
 
+Doce steps por cada **variante de grafo** (`ENABLED_VARIANTS` en
+`config/graph_making/ceps/variants.py`): `rfc` (grafo histórico id→id) y
+`cta` (grafo cta→cta con imputación de numcliente vía
+`mapeo_cta_numcliente`). Los dos primeros steps son compartidos; cada
+variante cuelga su propia rama desde `special_treatment` (la `cta` escribe
+bajo `*/ceps/cta/*`).
+
 | # | Step | Qué hace |
 |---|------|----------|
-| 1 | `CepsRfcNomRankingStep` | Ranking RFC/nombre a partir de CEPs crudos |
-| 2 | `CepsTxnReplacementStep` | `rfc_curp_analysis_s264_ceps` + `..._replaced`: normaliza/reemplaza ids de contraparte |
+| 1 | `CepsRfcNomRankingStep` | Ranking RFC/nombre a partir de CEPs crudos; catálogo de imputación **all-time incremental** (`s264_ceps_flattened_groupby_monthly`) |
+| 2 | `CepsTxnReplacementStep` | `rfc_curp_analysis_s264_ceps` + `..._replaced`: normaliza/reemplaza ids de contraparte; materializa `mapeo_cta_numcliente` |
 | 3 | `CepsSpecialTreatment` | `missing_treatment`: tratamiento de nulos, imputación de `numcliente`, resolución de `id_src`/`id_dst`, cálculo de `tfrom_days`/`tfrom_months` |
-| 4 | `CepsGroupByStep` | **Agregado por arista (`group_by_txn`) y por nodo (`group_by_id`)** — ahora incremental mensual (§5) |
+| 4 | `CepsGroupByStep` | **Agregado por arista (`group_by_txn`) y por nodo (`group_by_id`)** — incremental mensual (§5) |
 | 5 | `CepsEdgesAndNodesStep` | Aristas con pesos compuestos + nodos del grafo |
 | 6 | `CepsGraphFeaturesStep` | Features GraphFrames (pagerank, degrees, componentes, triángulos, versiones weighted, propagación) |
-| 7 | `LovelaceTargetPropagationSpecialTreatmentStep` | Prepara el target Lovelace |
-| 8 | `CepsTargetPropagationFeaturesStep` | Propagación del target a `numcliente` |
-| 9 | `CepsClusterFeaturesStep` | Features de cluster |
-| 10 | `CepsVectorAssemblerStep` | Ensamblado final de vectores por `numcliente` |
+| 7 | `LovelaceTargetPropagationSpecialTreatmentStep` | Prepara el target Lovelace (compartido entre variantes) |
+| 8 | `CepsTargetPropagationFeaturesStep` | Propagación del target a `numcliente` + targets sintéticos (`SYNTHETIC_TARGETS`) |
+| 9 | `CepsRiskFeaturesStep` | Features de riesgo de nodo (`risk_*`: exposición a semillas de fraude) y de par (`pair_*`: métricas topológicas A–X) |
+| 10 | `CepsTemporalFeaturesStep` | Features temporales (`tmp_*`: ventanas, velocidad, antigüedad, burstiness, pass-through) |
+| 11 | `CepsClusterFeaturesStep` | Features de cluster (`SUBCLUSTER_METHOD`: scc / label_propagation / cc) |
+| 12 | `CepsVectorAssemblerStep` | Ensamblado final de vectores por `numcliente` y `cta` (`AGGREGATION_SPECS` + `NODE_TRANSFORMS`) |
 
 `is_dynamic=True` en todos: cada etapa recarga su parquet si ya existe
 (patrón reanudable). `cohort = cj.COHORT`.
@@ -421,3 +430,91 @@ Inventario completo de preguntas/features: `notebook/preguntas_grafo.md`.
   dedup de columnas entre fuentes.
 - `tests/conftest.py`: el shim `local_hdfs` (HDFS -> fs local) se movió
   desde `test_monthly_group_by.py` para reutilizarlo.
+
+---
+
+## 10. Mejoras de la tercera iteración
+
+### 10.1 Modo de agrupación ligero `cc` (connected components)
+
+- `SUBCLUSTER_METHOD = "cc"` (además de `"scc"` y `"label_propagation"`):
+  agrupa todo lo que está conectado por un camino dentro del grupo; si no hay
+  conexión real, corta. Barato y determinista.
+- La columna de subgrupo se llama `grp_<short>` (`grp_scc`, `grp_lp`,
+  `grp_cc`): los métodos conviven sin colisionar y los features finales
+  llevan el prefijo del método (`cluster_grp_cc_*`).
+
+### 10.2 Catálogo de imputación all-time + prioridad al tag viejo válido
+
+- `s264_ceps_flattened_monthly` / `s264_ceps_flattened_groupby_monthly`:
+  parciales **all-time** (`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`);
+  `ensure_monthly_partitions` solo computa los meses faltantes y
+  `combine_ceps_groupby` recombina — mes a mes solo se escribe el incremento.
+- `PREFER_OLDEST_VALID_TAG = True` + columna `fst_fec_informacion_hora_oper`:
+  a igual validez, las ventanas de ranking premian el RFC/CURP más antiguo.
+
+### 10.3 Agregación final como lista de transformaciones
+
+- `AGGREGATION_SPECS` (config del assembler): lista de specs
+  `{"name", "weight", "aggregation", "include_prefixes"}` en lugar de una
+  única transformación; todas se guardan en `{nivel}_features`.
+- `NODE_TRANSFORMS` (`{"name", "expression"}`): transformaciones a nivel nodo
+  previas a la agregación.
+
+### 10.4 Variantes de grafo: `rfc` y `cta` coexisten
+
+- `config/graph_making/ceps/variants.py`: `GRAPH_VARIANTS`,
+  `ENABLED_VARIANTS`, `DEFAULT_VARIANT`, `variant_subpath()`. La variante
+  `rfc` conserva las rutas históricas; `cta` escribe bajo `*/ceps/cta/*`.
+- El flujo histórico CEPS→RFC (grafo id→id) se mantiene intacto; la variante
+  `cta` construye el grafo cuenta→cuenta e imputa el `numcliente` al final
+  usando la tabla `mapeo_cta_numcliente` (reemplazable por otra tabla de
+  mapeo reapuntando el input).
+- Clases compartidas: los `Standard*` aceptan el kwarg `variant` y las
+  subclases Ceps solo difieren en config.
+
+### 10.5 Features de riesgo de nodo y de par (A, X)
+
+`config/features/ceps/risk_features.py` + `libs/functions/pair_features.py`:
+
+- **Riesgo de nodo** (`risk_*`): exposición a semillas duras
+  (`RISK_HARD_SEED_COLUMNS`, umbral `RISK_HARD_SEED_THRESHOLD`) y blandas
+  (contagio, `RISK_CONTAGION_WEIGHTS` / `RISK_CONTAGION_SEED_THRESHOLD`) —
+  sumas y fracciones de vecinos fraudulentos, nodos fraudulentos a 2 saltos,
+  montos hacia/desde fraude, distancia mínima al fraude más cercano
+  (`shortestPaths`, direcciones `to`/`from`) y Personalized PageRank desde
+  semillas fraudulentas (`PPR_MAX_ITER`/`PPR_RESET_PROB`/`PPR_MAX_SEEDS`).
+- **Features de par** (`pair_*`, agregadas como `pair_<f>_<stat>`):
+  vecinos comunes, Jaccard de vecindarios, Adamic-Adar, reciprocidad del
+  par, preferential attachment (`deg_out(A)·deg_in(X)`), nº de caminos de
+  longitud 2 y distancia mínima (A, X). Los pares candidatos son nodos con
+  target y sus vecinos hasta `PAIR_MAX_HOPS = 2` saltos. Se calculan antes y
+  pueden combinarse con la propagación de target.
+
+### 10.6 Features temporales
+
+`config/features/ceps/temporal_features.py` +
+`libs/functions/temporal_features.py` (`tmp_*`): conteos por ventana
+(`WINDOW_DAYS`), velocidad 7d/30d, antigüedad de la cuenta y de la última
+transacción, proporción nocturna/fin de semana/bajo umbrales de reporte
+(`REPORT_THRESHOLDS`, banda `BELOW_THRESHOLD_BAND`), burstiness
+(`MIN_TXN_FOR_BURSTINESS`), receptores únicos en 7d, pass-through 24h,
+ratio flujo out/in; y de par: z-score de monto A→X, último monto / mediana
+histórica del par y del emisor.
+
+### 10.7 Targets sintéticos
+
+`SYNTHETIC_TARGETS` / `SYNTHETIC_WEIGHT_TYPES` +
+`lff.add_synthetic_targets`: generan etiquetas desde las propias features
+del grafo (p.ej. `pagerank_top` = 1 al 1% con mayor PageRank, regla
+`top_quantile`) y su contagio `contagion_synthetic_<name>_<peso>`. Como
+Minerva es un framework genérico, sirven para dominios sin etiqueta real
+(crédito, etc.) cambiando `source_key`/`column`/`rule`.
+
+### Tests añadidos (3ª iteración)
+
+- `test_ceps_all_time_catalog.py`, `test_ceps_cta_variant.py`,
+  `test_risk_features.py`, `test_pair_features.py`,
+  `test_temporal_features.py`, `test_temporal_features_step.py`,
+  `test_synthetic_targets.py` — ~70 tests nuevos, todos verdes (615 passed
+  de la suite completa; los 28 fallos restantes son baseline preexistente).

@@ -28,7 +28,7 @@ El acceso a HDFS/YARN se configura por env vars (las valida `main.py`):
 | `MINERVA_NAME` | Nombre de la aplicación Spark |
 | `MINERVA_TODAY` | Fecha del proceso `YYYY-MM-DD` (validada por `config/__init__.py`; define `process_date` y el vintage mensual) |
 | `MINERVA_VENV_TAR_GZ_LINUX` / `MINERVA_VENV_TAR_GZ_HDFS` | Zip del venv (local y su ruta HDFS `hdfs://...` para `archive`) |
-| `GRAPHFRAMES_JAR` | Path del jar `graphframes-0.81-spark3.0-s2.12.jar` |
+| `MINERVA_GRAPHFRAMES_JAR_HDFS` | Path del jar `graphframes-0.81-spark3.0-s2.12.jar` |
 | `HADOOP_CONF_DIR` | Config de Hadoop para comandos HDFS (`HivePath.*`) |
 | `PYLIB` | Opcional: zips pyspark/py4j del cluster |
 
@@ -39,7 +39,7 @@ El vintage se deriva de `MINERVA_TODAY` en `config/job.py` (`vintage`, `vintage_
 ### Flujo completo (producción)
 
 ```bash
-python main.py                      # ejecuta los 10 steps encadenados
+python main.py                      # ejecuta los 12 steps encadenados por variante
 python main.py --level DEBUG        # más logs
 python main.py --log-file run.log   # también a fichero
 python main.py --build-only         # solo construye la cadena (smoke test)
@@ -47,14 +47,19 @@ python main.py --cleanup            # ejecuta y luego borra parquets intermedios
 python main.py --cleanup-only       # solo borra los parquets intermedios
 ```
 
-`main.py` construye la cadena y llama a `vector_assembler_step.execute()`.
+`main.py` construye **una cadena por variante habilitada**
+(`ENABLED_VARIANTS`, en `config/graph_making/ceps/variants.py`) y ejecuta
+cada step terminal de la lista — los prefijos `rfc` y `txn_replacement` son
+compartidos; cada variante cuelga su propia cadena desde `special_treatment`.
 Como `Step.execute()` ejecuta recursivamente los `previous_step`, esto lanza
-todo el flujo:
+todo el flujo por variante (`rfc` conserva las rutas históricas; `cta` escribe
+bajo `*/ceps/cta/*`):
 
 ```
-rfc_nom_ranking → txn_replacement → special_treatment → group_by
-  → edges_and_nodes → graph_features → target_propagation (lovelace)
-  → target_propagation_features → cluster_features → vector_assembler
+rfc_nom_ranking → txn_replacement → [por variante: special_treatment → group_by
+  → edges_and_nodes → graph_features → target_propagation (lovelace, compartido)
+  → target_propagation_features → risk_features → temporal_features
+  → cluster_features → vector_assembler]
 ```
 
 ### Desarrollo interactivo (`run_order.py`)
@@ -156,21 +161,24 @@ ver `config/target_propagation/lovelace/special_treatment.py`).
 
 | Step | Lee | Produce |
 |---|---|---|
-| `CepsRfcNomRankingStep` | CEPS crudo (24m) + catálogo Banxico opcional | CEPS con `id_src`/`id_dst` (ranking rfc/nom) |
-| `CepsTxnReplacementStep` | ranking + CEPS | `rfc_curp_analysis_s264_ceps_replaced` (solo últimos 3 meses de txns) |
-| `CepsSpecialTreatment` | txn_replacement | `raw_flattened` (tfrom_days, hora, monto) |
+| `CepsRfcNomRankingStep` | CEPS crudo (24m) + catálogo Banxico opcional | CEPS con `id_src`/`id_dst` (ranking rfc/nom); catálogo all-time incremental `s264_ceps_flattened_groupby_monthly` |
+| `CepsTxnReplacementStep` | ranking + CEPS | `rfc_curp_analysis_s264_ceps_replaced` (solo últimos 3 meses de txns) + `mapeo_cta_numcliente` (una fila por cta → numcliente; alimenta el nivel cta y es reemplazable por otra tabla apuntando el input) |
+| `CepsSpecialTreatment` | txn_replacement | `raw_flattened` (tfrom_days, hora, monto) — una por variante (`rfc`: grafo id→id; `cta`: grafo cta→cta) |
 | `CepsGroupByStep` | flattened | `group_by_id` (métricas + arrays id por nodo), `group_by_txn` + parciales `*_monthly` (incremental por `month_partition`) |
 | `CepsEdgesAndNodesStep` | group_by | `edges` (con mapa `weights`), `nodes` |
 | `CepsGraphFeaturesStep` | edges/nodes | parquets por feature (`pagerank`, `degrees`, `degree_balance`, `reciprocity`, `self_loops`, `weighted_*`...) |
 | `LovelaceTargetPropagationSpecialTreatmentStep` | lovelace crudo | `target_cta`/`target_numcliente` con TODAS las columnas de `TARGET_AGGREGATIONS` (target + scores) |
-| `CepsTargetPropagationFeaturesStep` | nodes/edges + target | `edges_norm`, `target_propagation` (`contagion_<weight>` y `contagion_<col>_<weight>`), `nodes_join_target_lovelace` |
-| `CepsClusterFeaturesStep` | nodos enriquecidos + features | `cluster_stats` (stats intra-grupo por `component_id`/`scc`) |
+| `CepsTargetPropagationFeaturesStep` | nodes/edges + target | `edges_norm`, `target_propagation` (`contagion_<weight>` y `contagion_<col>_<weight>`), `nodes_join_target_lovelace` (+ targets sintéticos si `SYNTHETIC_TARGETS`) |
+| `CepsRiskFeaturesStep` | nodos+target, edges, features | `risk_features` (risk_*: exposición a semillas de fraude) y `pair_features` (pair_*: métricas topológicas del par (A, X)) |
+| `CepsTemporalFeaturesStep` | txn reemplazadas + nodos | `temporal_features` (tmp_*: ventanas, velocidad, antigüedad, burstiness...) |
+| `CepsClusterFeaturesStep` | nodos enriquecidos + features | `cluster_stats` (stats intra-grupo por `component_id`/`grp_scc`/`grp_lp`/`grp_cc`) |
 | `CepsVectorAssemblerStep` | todas las features + pivotes | `{numcliente,cta}_features` y `{numcliente,cta}_features_vector` |
 
 **Salida final**: `{nivel}_features_vector` = SOLO llave + columna vector
 `features` (lista para `pyspark.ml`); `{nivel}_features` = llave + variables
-agregadas `{func}_{feat}_ceps` (con `target_*` como etiquetas fuera del
-vector).
+agregadas — una por cada especificación de `AGGREGATION_SPECS`
+(`{func}_{feat}_ceps` del spec histórico `""` más las de specs extra
+`<nombre>/`), con `target_*` como etiquetas fuera del vector.
 
 ## 6. Cómo extender
 
@@ -262,7 +270,16 @@ Editar `config/features/ceps/target_propagation_features.py`:
 - `AGGREGATION_WEIGHT` — Column de peso (defecto `oper_mto/(tfrom_days+1)`).
 - `FEATURE_AGGREGATION` — string, lista (`{func}_{feat}` por función) o dict
   `{"default": ..., "<col>": ...}`; funciones: mean/median/std/min/max/sum/
-  first/distinct_count/weighted_mean.
+  first/distinct_count/weighted_mean. Es el spec histórico de
+  `AGGREGATION_SPECS` (nombre `""`); las agregaciones extra se definen allí.
+- `AGGREGATION_SPECS` — **lista** de specs de agregación
+  `{"name", "weight", "aggregation", "include_prefixes"}`: cada una aplica
+  sus transformaciones y agregaciones con su propio peso/subconjunto de
+  columnas y guarda todo en `{nivel}_features` (prefijo `<name>/` cuando el
+  nombre no es vacío).
+- `NODE_TRANSFORMS` — transformaciones pre-agregación `{"name", "expression"}`
+  aplicadas a nivel nodo antes del groupBy (p.ej. ratios entre columnas); la
+  columna resultante se agrega como cualquier otra feature.
 - `VARIABLE_SUFFIX` — sufijo de todas las variables (`"_ceps"`).
 - `FILL_NULLS_VALUE` — centinela de nulos del vector (`-99999`).
 - `HANDLE_INVALID`, `VECTOR_OUTPUT_COLUMN`, `EXCLUDE_COLUMNS`,
@@ -286,13 +303,68 @@ controla cuánta historia CEP alimenta los catálogos;
 cuánta historia transaccional conserva `rfc_curp_analysis_s264_ceps_replaced`.
 Son independientes.
 
+El **catálogo de imputación es all-time incremental**
+(`s264_ceps_flattened_monthly` + `s264_ceps_flattened_groupby_monthly`,
+`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`): cada corrida solo calcula los meses
+faltantes del vintage y los combina con los parciales ya guardados
+(`ensure_monthly_partitions` + `combine_ceps_groupby`), de modo que el mes a
+mes solo escribe el incremento. Dentro de una misma llave de imputación, a
+igual validez gana el tag **más antiguo** (`PREFER_OLDEST_VALID_TAG = True`,
+ventana por `fst_fec_informacion_hora_oper`): un RFC/CURP viejo y válido tiene
+prioridad sobre uno nuevo.
+
+### Variantes de grafo (`config/graph_making/ceps/variants.py`)
+
+`GRAPH_VARIANTS = ["rfc", "cta"]` y `ENABLED_VARIANTS` deciden qué grafos se
+construyen sobre el mismo catálogo de reemplazo:
+
+- `rfc` — grafo histórico `id→id` (par rfc/nom); conserva las rutas de
+  siempre (`variant_subpath` no inserta segmento).
+- `cta` — grafo `cta→cta`; imputa `numcliente` al final vía
+  `mapeo_cta_numcliente`. Escribe bajo `*/ceps/cta/*`.
+
+Los steps aceptan el kwarg `variant` y sufijan su `step_name` en las variantes
+no-`rfc` para no chocar en logs ni en rutas. `mapeo_cta_numcliente` es una
+tabla propia (una fila por cta): si algún día existe otra tabla de mapeo, basta
+apuntar el input de la variante `cta` a ella.
+
+### Targets sintéticos (`config/features/ceps/target_propagation_features.py`)
+
+Además de las etiquetas reales, se pueden generar etiquetas sintéticas desde
+las propias features del grafo (`SYNTHETIC_TARGETS`):
+
+```python
+SYNTHETIC_TARGETS = [{"name": "pagerank_top", "source_key": "pagerank",
+                      "column": "pagerank", "rule": "top_quantile",
+                      "q": 0.99, "value": "binary"}]
+```
+
+Cada entrada produce la columna `target_synthetic_<name>` (aquí: 1 al 1% con
+mayor PageRank) y su propagación `contagion_synthetic_<name>_<peso>` según
+`SYNTHETIC_WEIGHT_TYPES`. Sirve como etiqueta de entrenamiento cuando no hay
+target real (o como ejercicio de validación); para otros dominios (crédito,
+etc.) basta cambiar `source_key`/`column`/`rule`.
+
+### Features de riesgo, par y temporales
+
+- `config/features/ceps/risk_features.py` — semillas duras
+  (`RISK_HARD_SEED_COLUMNS = ["target_lovelace"]`) y blandas
+  (`RISK_CONTAGION_WEIGHTS`), umbrales, `PAIR_MAX_HOPS` y parámetros de
+  Personalized PageRank. Produce `risk_features` (exposición del nodo al
+  fraude) y `pair_features` (métricas topológicas del par (A, X)).
+- `config/features/ceps/temporal_features.py` — ventanas (`WINDOW_DAYS`),
+  umbrales de reporte (`REPORT_THRESHOLDS`, banda `BELOW_THRESHOLD_BAND`),
+  definición de horario nocturno y mínimos para burstiness. Produce
+  `temporal_features` (`tmp_*`).
+
 ### Aligerar `cluster_features` (config/features/ceps/cluster_features.py)
 
 El step escala por perilla, de más barato a más completo:
 
 | Perilla | Efecto |
 |---|---|
-| `SUBCLUSTER_ENABLED = False` | No corre SCC/label_propagation: solo `component_id` |
+| `SUBCLUSTER_ENABLED = False` | No corre el subcluster: solo `component_id` |
+| `SUBCLUSTER_METHOD` | Algoritmo de subgrupo: `"scc"` (determinista), `"label_propagation"` (no determinista) o `"cc"` (componente conexa — barato: agrupa todo lo conectado por un camino y corta si no hay conexión real). La columna de grupo es `grp_<short>` (`grp_scc`/`grp_lp`/`grp_cc`), así los métodos pueden coexistir en corridas distintas sin colisionar y los features finales quedan prefijados (`cluster_grp_cc_*`) |
 | `CLUSTER_LIGHT_MODE = True` | Stats solo `LIGHT_STATS` sobre prefijos `LIGHT_AGGREGATE_PREFIXES` y solo une `LIGHT_FEATURE_SOURCES` (salta los joins pesados de features de grafo) |
 | `AGGREGATE_INCLUDE_PREFIXES` | Lista propia de prefijos/sufijos de columnas a agregar (afinado manual) |
 | `SALT_BUCKETS` | Buckets de sal del groupBy en dos etapas (64 default; `<=1` = groupBy directo) |
@@ -341,5 +413,5 @@ dir.
 | `Not enough history in <key> data` | `minimum_required_history` > meses reales de la tabla |
 | `Warning: <key> data has less history` | La tabla tiene menos meses que `history` (no fatal) |
 | Feature no se ejecuta | Falta en `GRAPH_CENTRALITY_FEATURES`, en `output`, o el método `{name}_ft` |
-| `GraphFrames` falla al instanciar | Falta `--jars`/env `GRAPHFRAMES_JAR` o el zip del venv en executors |
+| `GraphFrames` falla al instanciar | Falta `--jars`/env `MINERVA_GRAPHFRAMES_JAR_HDFS` o el zip del venv en executors |
 | Columnas `contagion_*` ausentes en el vector | Revisar `WEIGHT_TYPES` y que el subdir de `target_propagation/` exista para ese vintage |

@@ -16,8 +16,10 @@ minerva_devin/
 │   ├── __init__.py           # sys.path root + validación de MINERVA_TODAY/pyspark
 │   ├── job.py                # fechas, vintage, cohort=SBX, root HDFS
 │   ├── ceps/                 # rfc_nom_ranking, txn_replacement
-│   ├── graph_making/ceps/    # special_treatment, group_by (+ mensual), edges_and_nodes
+│   ├── graph_making/ceps/    # variants, special_treatment, group_by (+ mensual),
+│   │                         # edges_and_nodes
 │   ├── features/ceps/        # graph_features, target_propagation_features,
+│   │                         # risk_features, temporal_features,
 │   │                         # cluster_features, vector_assembler
 │   └── target_propagation/lovelace/special_treatment.py
 ├── libs/
@@ -29,7 +31,12 @@ minerva_devin/
 │   │   │                         # + apply_missing_treatment (dispatcher)
 │   │   ├── features.py           # features de grafo + propagación de target
 │   │   │                         # + STANDARD_WEIGHT_STATS + GRAPH_FEATURE_FUNCTIONS
+│   │   ├── pair_features.py      # métricas de par (A, X): vecinos comunes,
+│   │   │                         # jaccard, adamic-adar, paths, distancia...
+│   │   ├── temporal_features.py  # features temporales (ventanas, velocidad,
+│   │   │                         # antigüedad, burstiness, pass-through...)
 │   │   ├── assembly.py           # agregación multi-nivel + VectorAssembler
+│   │   │                         # (+ AGGREGATION_SPECS / NODE_TRANSFORMS)
 │   │   ├── aggregations.py       # parciales mensuales combinables + merge
 │   │   └── weights.py            # column/composed/ratio weight, build_weights_map
 │   └── data_engineering_toolbox/
@@ -50,6 +57,7 @@ minerva_devin/
     │   └── ceps/             # wrappers delgados sobre los genéricos
     ├── features/             # graph_features, vector_assembler (genéricos)
     │   └── ceps/             # graph_features, target_propagation_features,
+    │                         # risk_features, temporal_features,
     │                         # cluster_features, vector_assembler
     └── target_propagation/   # special_treatment (genérico)
         └── lovelace/         # special_treatment (concreto)
@@ -255,9 +263,11 @@ pipelines; los `standard_*` / `*_ft` de los steps son ahora delegates delgados:
 `config/features/ceps/cluster_features.py`: step intermedio entre
 propagación y assembler (`CepsClusterFeaturesStep`). Enriquece los nodos con
 todas las features de grafo + contagio (`GRAPH_FEATURE_SOURCES`, merge_schema)
-y calcula, por cada columna de grupo (`GROUP_COLUMNS`: `component_id`, `scc`
-vía `stronglyConnectedComponents`), stats de TODAS las columnas numéricas del
-nodo (`CLUSTER_STATS`: count/sum/mean/median/std/min/max).
+y calcula, por cada columna de grupo (`GROUP_COLUMNS`: `component_id`,
+`grp_<short>` — `grp_scc`/`grp_lp`/`grp_cc` según `SUBCLUSTER_METHOD`:
+`stronglyConnectedComponents`, `labelPropagation` o `connectedComponents`),
+stats de TODAS las columnas numéricas del nodo (`CLUSTER_STATS`:
+count/sum/mean/median/std/min/max).
 
 `REQUIRED_STATS_PREFIXES` (`target_`, `contagion_`, `oper_mto`, `weight`,
 `_strength`) es una guarda: si ninguna columna agregable coincide con un
@@ -270,13 +280,18 @@ target, la target propagada y los pesos.
 
 - Configura `logging` (stdout + fichero opcional), valida las env vars
   requeridas, crea la SparkSession con `context.notebook` (mismos parámetros
-  que `run_order`) y construye la cadena de 10 steps:
-  `rfc_nom_ranking → txn_replacement → special_treatment → group_by →
-  edges_and_nodes → graph_features → target_propagation →
-  target_propagation_features → cluster_features → vector_assembler`.
-- `Step.execute()` ejecuta recursivamente los `previous_step`, así que
-  `vector_assembler_step.execute()` lanza todo el flujo; cada etapa recarga su
-  parquet/partición si existe (reanudable).
+  que `run_order`) y construye la cadena de 12 steps **por cada variante de
+  `ENABLED_VARIANTS`** (`config/graph_making/ceps/variants.py`: `rfc` grafo
+  id→id con rutas históricas, `cta` grafo cta→cta bajo `*/ceps/cta/*` con
+  imputación de numcliente vía `mapeo_cta_numcliente`):
+  `rfc_nom_ranking → txn_replacement → [por variante: special_treatment →
+  group_by → edges_and_nodes → graph_features → target_propagation
+  (compartido) → target_propagation_features → risk_features →
+  temporal_features → cluster_features → vector_assembler]`.
+- `build_pipeline` devuelve la lista de steps terminales (uno por variante) y
+  `main` los ejecuta en orden. `Step.execute()` ejecuta recursivamente los
+  `previous_step`, así que cada terminal lanza toda su rama; cada etapa
+  recarga su parquet/partición si existe (reanudable).
 - Logging: el framework (`libs.framework`) y los pipelines usan
   `logging.getLogger(__name__)` — ejecución de steps con duración, cargas
   reload/recompute de los decoradores y overwrite de particiones salen por el
@@ -286,7 +301,8 @@ target, la target propagada y los pesos.
 
 ## Tests (`tests/` + `pytest.ini`)
 
-Suite de pytest (~200 tests). Ejecución: `python -m pytest tests/`.
+Suite de pytest (~640 tests; 615 verdes, 28 fallos baseline preexistentes en
+módulos ajenos a las últimas iteraciones). Ejecución: `python -m pytest tests/`.
 
 - **`conftest.py`** — fixtures: `spark` (SparkSession local[2], salta si no hay
   pyspark), `graphframes` (salta si el jar no carga), `checkpoint_dir`,
@@ -308,13 +324,20 @@ Suite de pytest (~200 tests). Ejecución: `python -m pytest tests/`.
   `ensure_monthly_partitions` incremental con `local_hdfs`),
   `test_txn_history_window` (ventana de historia transaccional + config
   independiente), `test_vector_assembler_options` (sufijo `_ceps`, niveles,
-  fuentes opcionales/desactivadas, dedup), `test_cluster_features`
-  (`cluster_group_stats`, `REQUIRED_STATS_PREFIXES`, helpers de config de
-  propagación multi-columna).
+  fuentes opcionales/desactivadas, dedup, `AGGREGATION_SPECS`/
+  `NODE_TRANSFORMS`), `test_cluster_features`
+  (`cluster_group_stats`, `REQUIRED_STATS_PREFIXES`, `SUBCLUSTER_METHOD` —
+  scc/label_propagation/cc — helpers de config de propagación multi-columna),
+  `test_ceps_all_time_catalog` (catálogo all-time incremental,
+  `PREFER_OLDEST_VALID_TAG`), `test_ceps_cta_variant` (variantes rfc/cta,
+  `mapeo_cta_numcliente`), `test_risk_features` (risk_*, semillas duras/
+  blandas, distancias, PPR), `test_pair_features` (métricas de par),
+  `test_temporal_features` + `test_temporal_features_step` (tmp_*),
+  `test_synthetic_targets` (`SYNTHETIC_TARGETS`, contagio sintético).
 - **Marcados `graphframes`**: pagerank, degrees, components, triangle_count,
   degree_balance, reciprocity, self_loops, weighted_* (incl.
   weighted_degree_balance), get_degree, weight_normalization,
-  propagate_target, subcluster (scc/label_propagation).
+  propagate_target, subcluster (scc/label_propagation/cc).
 
 ### Bugs encontrados por la suite (ya corregidos)
 
@@ -359,5 +382,5 @@ Suite de pytest (~200 tests). Ejecución: `python -m pytest tests/`.
   `protobuf=4.23.4`, pandas<2, pyarrow<11); se añadió `inflection` y
   `python-dateutil` que el código importa.
 - `main.py` ejecuta el flujo completo con logging (`Step.execute` encadena
-  los `previous_step`).
-- Suite pytest en `tests/` (~200 tests, markers `spark`/`graphframes`).
+  los `previous_step`; un terminal por variante de grafo).
+- Suite pytest en `tests/` (~640 tests, markers `spark`/`graphframes`).

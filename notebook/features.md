@@ -16,6 +16,12 @@ de salida (los `GRAPH_RENAMES` ya aplicados: `id_src`→`src`, `id_dst`→`dst`)
 | `target_agg_<sufijo>` | Target agregado por `id` antes de unir a nodos (intermedio) |
 | `contagion_<peso>` | Score propagado usando el tipo de peso `<peso>` |
 | `contagion_<col>_<peso>` | Idem propagando otra columna (`target_lovelace_<col>`: scores, etc.) |
+| `target_synthetic_<name>` | Etiqueta sintética generada desde una feature del grafo (`SYNTHETIC_TARGETS`) |
+| `contagion_synthetic_<name>_<peso>` | Contagio de la etiqueta sintética con el peso `<peso>` |
+| `risk_*` | Exposición del nodo a semillas de fraude (`risk_features`) |
+| `pair_*` / `pair_<f>_<stat>` | Métrica del par (A, X) / agregada al nodo con el estadístico `<stat>` |
+| `tmp_*` | Feature temporal (`temporal_features`: ventanas, velocidad, antigüedad...) |
+| `cluster_grp_<m>_*` | Stats de grupo cuando el grupo es `grp_<m>` (`grp_scc`, `grp_lp`, `grp_cc` según `SUBCLUSTER_METHOD`) |
 | `weighted_*` | Feature de grafo calculada sobre el peso seleccionado |
 | `{stat}_weight` | Estadística `{stat}` del peso de aristas incidentes (de `STANDARD_WEIGHT_STATS`) |
 | `in_*`/`out_*`/`total_*` | Métrica entrante/saliente/suma de ambas |
@@ -115,6 +121,7 @@ parámetro puede ajustarse por feature desde `params` en
 | `target_lovelace_<modo>_<col>` | Columna extra propagada (score, ...) por cada modo |
 | `target_lovelace` | Etiqueta final: `TARGET_SELECTION_FUNCTION` (`greatest`) sobre los modos |
 | `target_lovelace_<col>` | Combinación de la columna extra entre modos (`greatest`) |
+| `target_synthetic_<name>` | Etiqueta sintética de `SYNTHETIC_TARGETS` (p.ej. `pagerank_top`: 1 al 1% con mayor PageRank); se une a nodos como cualquier target |
 
 ### `target_propagation` (nivel `id`, un subdir por combinación de parámetros)
 
@@ -122,6 +129,7 @@ parámetro puede ajustarse por feature desde `params` en
 |---|---|
 | `contagion_<peso>` | Score de contagio iterativo: `(1-alpha)*propio + alpha*media_ponderada_vecinos`, `max_iter` iteraciones, con suelo en la semilla si `keep_seed_floor` |
 | `contagion_<col>_<peso>` | Idem usando `target_lovelace_<col>` como semilla (scores propagados) |
+| `contagion_synthetic_<name>_<peso>` | Idem con la etiqueta sintética `target_synthetic_<name>` como semilla (`SYNTHETIC_WEIGHT_TYPES`) |
 | `target_lovelace*` | Semilla(s) (target original y columnas extra del nodo) |
 
 Una columna por cada (`weight_type` × columna propagada) — subdirs
@@ -143,17 +151,83 @@ Una columna por cada (`weight_type` × columna propagada) — subdirs
   hace GraphFrames con `AM.getCachedDataFrame` son volátiles y no truncan el
   plan — el checkpoint sí, y es durable en HDFS).
 
-## 4. Features de agrupación (nivel `id`, tabla `cluster_stats`)
+## 4. Riesgo de nodo (nivel `id`, tabla `risk_features`)
+
+Exposición de cada nodo a las semillas de fraude (duramente marcadas
+`RISK_HARD_SEED_COLUMNS = ["target_lovelace"]` con
+`RISK_HARD_SEED_THRESHOLD`, o blandas vía contagio
+`RISK_CONTAGION_WEIGHTS` con `RISK_CONTAGION_SEED_THRESHOLD`). `<semilla>`
+es el nombre de la semilla (p.ej. `lovelace`, `composed`).
 
 | Columna | Definición |
 |---|---|
-| `cluster_<grupo>_size` | Nº de miembros del grupo (`grupo` ∈ `GROUP_COLUMNS`: `component_id`, `scc`) |
+| `risk_in_sum_<semilla>` / `risk_out_sum_<semilla>` | Suma de la semilla en vecinos entrantes / salientes directos |
+| `risk_in_frac_<semilla>` / `risk_out_frac_<semilla>` | Fracción de vecinos entrantes / salientes marcados como fraude |
+| `risk_2hop_<semilla>` | Nº de nodos fraudulentos a 2 saltos del nodo |
+| `risk_outflow_<semilla>` / `risk_inflow_<semilla>` | Monto hacia / desde nodos fraudulentos directos |
+| `risk_dist_to_<semilla>` / `risk_dist_from_<semilla>` | Distancia mínima en aristas al fraude conocido más cercano, en dirección hacia él / desde él (`shortestPaths`; `from` invierte el grafo) |
+| `risk_ppr_max_<semilla>` / `risk_ppr_mean_<semilla>` | Personalized PageRank máximo / medio desde las semillas fraudulentas (`PPR_MAX_ITER`, `PPR_RESET_PROB`, `PPR_MAX_SEEDS`) |
+
+## 5. Features de par (A, X) (nivel `id`, tabla `pair_features`)
+
+Métricas topológicas del par (A = nodo con `target`, X = vecino candidato,
+máx. `PAIR_MAX_HOPS = 2` saltos de una semilla). Se calculan por par y se
+agregan al nodo con estadísticos (`pair_<f>_<stat>`).
+
+| Columna | Definición |
+|---|---|
+| `pair_common_neighbors` | Nº de vecinos comunes de A y X |
+| `pair_jaccard` | Similitud de Jaccard de los vecindarios de A y X |
+| `pair_adamic_adar` | Score Adamic-Adar del par |
+| `pair_preferential_attachment` | `deg_out(A) · deg_in(X)` |
+| `pair_reciprocity` | 1 si el par tiene aristas en ambas direcciones |
+| `pair_paths_len2` | Nº de caminos de longitud 2 entre A y X |
+| `pair_min_distance` | Distancia mínima (A, X) en el grafo |
+
+## 6. Features temporales (nivel `id` y par, tabla `temporal_features`)
+
+Calculadas desde las transacciones reemplazadas con timestamp. `<w>` ∈
+`WINDOW_DAYS` (1, 7, 30 días).
+
+### Nivel nodo
+
+| Columna | Definición |
+|---|---|
+| `tmp_txn_count_<w>d` | Nº de transacciones del nodo en los últimos `<w>` días |
+| `tmp_velocity_7d_30d` | Velocidad: txns 7d / txns 30d |
+| `tmp_account_age_days` | Antigüedad de la cuenta (días desde la primera interacción) |
+| `tmp_days_since_last_txn` | Días desde la última transacción del nodo |
+| `tmp_pct_night` / `tmp_pct_weekend` | Proporción de txns en horario nocturno (22–06 h) / fin de semana |
+| `tmp_pct_below_threshold` | Proporción de montos justo bajo umbrales de reporte (`REPORT_THRESHOLDS`, banda `BELOW_THRESHOLD_BAND`) |
+| `tmp_burstiness` | Burstiness de la serie de txns (mín. `MIN_TXN_FOR_BURSTINESS`) |
+| `tmp_unique_receivers_7d` | Nº de receptores únicos del emisor en 7 días |
+| `tmp_pass_through_24h` | Ratio entrada/salida en 24 h (pass-through: entra y sale rápido) |
+| `tmp_flow_out_in_ratio` | Ratio flujo saliente/entrante del nodo |
+
+### Nivel par (A → X)
+
+| Columna | Definición |
+|---|---|
+| `tmp_amt_zscore_ax` | Z-score del monto de la txn respecto al histórico del par A→X |
+| `tmp_last_amt_over_median_ax` | Último monto / mediana histórica del par A→X |
+| `tmp_mean_amt_over_median_a` | Monto medio / mediana histórica del emisor A |
+
+## 7. Features de agrupación (nivel `id`, tabla `cluster_stats`)
+
+| Columna | Definición |
+|---|---|
+| `cluster_<grupo>_size` | Nº de miembros del grupo (`grupo` ∈ `GROUP_COLUMNS`: `component_id`, `grp_<short>`) |
 | `cluster_<grupo>_<stat>_<col>` | Estadística `{stat}` (`CLUSTER_STATS`: count/sum/mean/median/std/min/max) de la columna `<col>` dentro del grupo del nodo — incluye targets (`target_*`), contagio (`contagion_*`) y pesos (`oper_mto`, `*_weight`, `*_strength`); guardado por `REQUIRED_STATS_PREFIXES` |
 
-`scc` = componente fuertemente conexa (determinista) o `label_propagation`
-(no determinista) según `SUBCLUSTER_METHOD`. Con `SUBCLUSTER_ENABLED = False`
-no se corre el algoritmo de grafo: el step solo agrupa por `component_id` y
-omite `scc` con un warning (aunque siga en `GROUP_COLUMNS`).
+La columna de subgrupo es `grp_<short>` según `SUBCLUSTER_METHOD`:
+`grp_scc` (componente fuertemente conexa, determinista), `grp_lp`
+(`label_propagation`, no determinista) o `grp_cc` (componente conexa — modo
+ligero: agrupa todo lo conectado por un camino y corta donde no hay conexión
+real; convive con los otros métodos eligiéndolo en config, y el prefijo
+`cluster_grp_cc_*` delata el método en los features finales). Con
+`SUBCLUSTER_ENABLED = False` no se corre el algoritmo de grafo: el step solo
+agrupa por `component_id` y omite el subgrupo con un warning (aunque siga en
+`GROUP_COLUMNS`).
 
 **GroupBy anti-skew en dos etapas** (`SALT_BUCKETS`, por
 defecto 64): un solo componente gigante concentraría todo el shuffle en un
@@ -174,7 +248,7 @@ combinables (`median` u otras custom en `CLUSTER_STATS`) van por la vía
 directa (`plain_group_stats`) con su propio parquet por chunk. Con
 `SALT_BUCKETS <= 1` todo el cálculo es la vía directa.
 
-**Modo ligero** (`LIGHT_CLUSTER_STATS = True`): las stats solo se calculan
+**Modo ligero** (`CLUSTER_LIGHT_MODE = True`): las stats solo se calculan
 sobre las columnas que ya trae `nodes_join_target` — no se unen las fuentes
 de `GRAPH_FEATURE_SOURCES` a `nodes_enriched` (el join multi-parquet es gran
 parte del coste del step).
@@ -184,7 +258,8 @@ parquets propios (`dynamic_unpartitioned_parquet`), porque los checkpoints
 orgánicos de GraphFrames no son reanudables. Los paths llevan subdirs de
 variante para que un cambio de config no recargue datos obsoletos:
 
-- `subcluster_df/method=<m>_max_iter=<i>/` — SCC/label-propagation (id, scc).
+- `subcluster_df/method=<m>_max_iter=<i>/` — SCC/label-propagation/CC
+  (id, `grp_<short>`).
 - `nodes_enriched/mode=<full|full_noscc|light|light_noscc>/` — join de nodos
   + targets + features de grafo activas.
 - `cluster_stats_parts/...` — chunks de stats (etapa 1 y 2).
@@ -193,7 +268,7 @@ variante para que un cambio de config no recargue datos obsoletos:
 Si el proceso muere, la siguiente ejecución recarga los parquets ya escritos
 y no vuelve a correr el algoritmo de grafo ni el join multi-fuente.
 
-## 5. Nivel `numcliente` y `cta` (VectorAssembler multi-nivel)
+## 8. Nivel `numcliente` y `cta` (VectorAssembler multi-nivel)
 
 Para cada nivel en `AGGREGATION_LEVELS` (`numcliente`, `cta`):
 
@@ -202,7 +277,8 @@ Para cada nivel en `AGGREGATION_LEVELS` (`numcliente`, `cta`):
 | Columna | Definición |
 |---|---|
 | `<nivel>` | Llave (explode del array del nivel en `nodes`) |
-| `{func}_<feature>_ceps` | Cada feature de nodo agregada al nivel con `FEATURE_AGGREGATION` (lista de funciones → una columna por función; `AGGREGATION_WEIGHT = oper_mto/(tfrom_days+1)` como peso). Todas las variables llevan `VARIABLE_SUFFIX` (`_ceps`) |
+| `{func}_<feature>_ceps` | Cada feature de nodo agregada al nivel con `FEATURE_AGGREGATION` (lista de funciones → una columna por función; `AGGREGATION_WEIGHT = oper_mto/(tfrom_days+1)` como peso). Es el spec histórico de `AGGREGATION_SPECS`; cada spec extra aporta sus propias columnas. Todas las variables llevan `VARIABLE_SUFFIX` (`_ceps`) |
+| `<spec>/<func>_<feature>_ceps` | Agregación de las specs adicionales de `AGGREGATION_SPECS` (nombre, peso, funciones y subconjunto de columnas propios), sobre las columnas ya transformadas por `NODE_TRANSFORMS` |
 | `target_lovelace*_ceps` | Etiquetas agregadas igual que las features (para entrenamiento) |
 | `node_count_ceps` | Nº de nodos (`id`) distintos que aportan a la llave |
 
@@ -223,7 +299,7 @@ se calcula por deduplicación `(llave, id)` → count.
 La tabla final contiene **únicamente** la llave y el vector: las variables
 agregadas quedan en `{nivel}_features` (penúltima tabla).
 
-## 6. Intermedios del pipeline (para depuración)
+## 9. Intermedios del pipeline (para depuración)
 
 | Tabla | Columnas clave |
 |---|---|
