@@ -118,6 +118,7 @@ def salted_assembly_groupby(
     weight:Column,
     salt_buckets:int,
     id_column:Optional[str] = "id",
+    include_node_count:bool = True,
 ) -> DataFrame:
     """`groupBy(group_column)` de features agregadas en dos etapas con sal.
 
@@ -233,12 +234,146 @@ def salted_assembly_groupby(
         frames.append(df.groupBy(group_column).agg(*plain_aggs))
     #
     # node_count: nº de ids distintos por llave, vía distinct en dos etapas.
-    if id_column is not None:
+    if id_column is not None and include_node_count:
         node_counts = (df.select(group_column, id_column).distinct()
             .groupBy(group_column)
             .agg(count(lit(1)).alias("node_count")))
         frames.append(node_counts)
     #
+    result = frames[0]
+    for frame in frames[1:]:
+        result = result.join(frame, on=group_column, how="outer")
+    return result
+
+
+def _spec_output_name(spec_name:str, agg_name:str, column:str,
+        agg_names_in_spec:List[str]) -> str:
+    """Nombre de salida de una agregación dentro de un spec.
+
+    Spec con `name` no vacío: `{name}_{funcion}_{columna}` (siempre con
+    función, para que specs distintos nunca colisionen). Spec por defecto
+    (`name == ""`): convención histórica — la columna desnuda si el spec
+    aplica una sola función, `{funcion}_{columna}` si aplica varias.
+    """
+    if spec_name:
+        return f"{spec_name}_{agg_name}_{column}"
+    return _assembly_output_name(agg_name, column, agg_names_in_spec)
+
+
+def _spec_columns(feature_columns:List[str], spec:Dict) -> List[str]:
+    """Columnas de un spec: todas o las que empiezan por `include_prefixes`."""
+    prefixes = spec.get("include_prefixes")
+    if not prefixes:
+        return list(feature_columns)
+    prefixes = tuple(prefixes)
+    return [c for c in feature_columns if c.startswith(prefixes)]
+
+
+def run_aggregation_specs(
+    df:DataFrame,
+    group_column:str,
+    feature_columns:List[str],
+    specs:List[Dict],
+    salt_buckets:int = 0,
+    id_column:Optional[str] = "id",
+) -> DataFrame:
+    """Agrega `feature_columns` por `group_column` siguiendo UNA LISTA de specs.
+
+    Cada spec es un dict con:
+      - `name` (str): prefijo de las columnas de salida; "" es el spec por
+        defecto con la convención histórica de nombres (back-compat).
+      - `weight` (Column|None): peso de las agregaciones ponderadas; None ->
+        peso 1. Las specs con EL MISMO peso comparten un solo `groupBy` en la
+        vía directa (una sola pasada de shuffle por peso distinto).
+      - `aggregation`: str | lista | dict {"default": ..., "<col>": ...},
+        misma sintaxis que `build_aggregation_expressions`.
+      - `include_prefixes` (lista, opcional): restringe las features del spec
+        a las que empiezan por alguno de los prefijos.
+
+    `node_count` (countDistinct de `id_column`) se emite UNA sola vez, en la
+    primera spec que produce columnas. Los resultados de cada spec se unen
+    por `group_column` (outer). Con `salt_buckets > 1` cada spec va por la vía
+    salteada (`salted_assembly_groupby`, una corrida por spec).
+    """
+    if not specs:
+        raise ValueError("run_aggregation_specs requiere al menos un spec")
+    #
+    frames:List[DataFrame] = []
+    node_count_emitted = False
+    #
+    # Agrupar specs por expresión de peso para compartir el groupBy.
+    weight_groups:Dict[str, List[Dict]] = {}
+    for spec in specs:
+        weight = spec.get("weight")
+        weight_key = "<uniform>" if weight is None else weight._jc.toString()
+        weight_groups.setdefault(weight_key, []).append(spec)
+    #
+    for group_specs in weight_groups.values():
+        weight = group_specs[0].get("weight")
+        resolved_weight = weight if weight is not None else lit(1.0)
+        #
+        if salt_buckets and salt_buckets > 1:
+            # Vía salteada: una corrida por spec (los nombres se generan dentro
+            # de salted_assembly_groupby siguiendo la convención del spec).
+            for spec in group_specs:
+                columns = _spec_columns(feature_columns, spec)
+                if not columns:
+                    continue
+                out = salted_assembly_groupby(
+                    df,
+                    group_column=group_column,
+                    feature_columns=columns,
+                    aggregation=spec.get("aggregation", "weighted_mean"),
+                    weight=resolved_weight,
+                    salt_buckets=salt_buckets,
+                    id_column=id_column,
+                    include_node_count=not node_count_emitted,
+                )
+                node_count_emitted = True
+                name = spec.get("name", "")
+                if name:
+                    resolved = _resolve_column_aggs(
+                        columns, spec.get("aggregation", "weighted_mean"))
+                    for column, names in resolved.items():
+                        for agg_name in names:
+                            out = out.withColumnRenamed(
+                                _assembly_output_name(agg_name, column, names),
+                                f"{name}_{agg_name}_{column}")
+                frames.append(out)
+        else:
+            # Vía directa: UN solo groupBy por grupo de peso, con alias
+            # explícitos por spec (la convención de nombres no depende de lo
+            # que computen las demás specs del grupo).
+            expressions:List[Column] = []
+            seen_aliases = set()
+            for spec in group_specs:
+                columns = _spec_columns(feature_columns, spec)
+                resolved = _resolve_column_aggs(
+                    columns, spec.get("aggregation", "weighted_mean"))
+                name = spec.get("name", "")
+                for column, names in resolved.items():
+                    for agg_name in names:
+                        if agg_name not in ASSEMBLY_AGGREGATION_FUNCTIONS:
+                            raise ValueError(
+                                f"Unsupported assembly aggregation "
+                                f"'{agg_name}' for column '{column}'.")
+                        alias = _spec_output_name(name, agg_name, column, names)
+                        if alias in seen_aliases:
+                            continue
+                        seen_aliases.add(alias)
+                        expressions.append(
+                            ASSEMBLY_AGGREGATION_FUNCTIONS[agg_name](
+                                column, resolved_weight).alias(alias))
+            if not node_count_emitted and id_column is not None:
+                expressions.append(
+                    countDistinct(col(id_column)).alias("node_count"))
+                node_count_emitted = True
+            if expressions:
+                frames.append(df.groupBy(group_column).agg(*expressions))
+    #
+    if not frames:
+        raise ValueError(
+            "Ningún spec produjo columnas (revisa include_prefixes)")
     result = frames[0]
     for frame in frames[1:]:
         result = result.join(frame, on=group_column, how="outer")

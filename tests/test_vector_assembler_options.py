@@ -155,6 +155,9 @@ class TestComputeLevelFeatures:
     def _fast_aggregation(self, monkeypatch):
         monkeypatch.setattr(cvas, "FEATURE_AGGREGATION", ["mean", "median", "std"])
         monkeypatch.setattr(cvas, "AGGREGATION_WEIGHT", None)
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None,
+             "aggregation": ["mean", "median", "std"]}])
         monkeypatch.setattr(cvas, "VARIABLE_SUFFIX", "_ceps")
 
     def test_cta_level(self, spark, nodes_df):
@@ -191,11 +194,130 @@ class TestComputeLevelFeatures:
     def test_single_function_keeps_base_name_plus_suffix(self, spark, nodes_df,
             monkeypatch):
         monkeypatch.setattr(cvas, "FEATURE_AGGREGATION", "mean")
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None, "aggregation": "mean"}])
         step = make_step(spark)
         set_cached(step, "nodes_with_features", nodes_df)
         set_cached(step, "feature_columns", ["feat"])
         df = step._compute_level_features("numcliente")
         assert {"feat_ceps", "node_count_ceps", "numcliente"} == set(df.columns)
+
+
+# ----------------------------------------------------------------------------
+# AGGREGATION_SPECS (lista de transformaciones de agregación final)
+# ----------------------------------------------------------------------------
+
+class TestAggregationSpecs:
+    @pytest.fixture(autouse=True)
+    def _base(self, monkeypatch):
+        monkeypatch.setattr(cvas, "VARIABLE_SUFFIX", "_ceps")
+
+    def test_named_spec_prefixes_columns(self, spark, nodes_df, monkeypatch):
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None, "aggregation": "mean"},
+            {"name": "mx", "weight": None, "aggregation": ["max"]},
+        ])
+        step = make_step(spark)
+        set_cached(step, "nodes_with_features", nodes_df)
+        set_cached(step, "feature_columns", ["feat"])
+        df = step._compute_level_features("numcliente")
+        assert {"feat_ceps", "mx_max_feat_ceps", "node_count_ceps",
+                "numcliente"} == set(df.columns)
+        result = {r["numcliente"]: r for r in df.collect()}
+        assert result["c1"]["mx_max_feat_ceps"] == pytest.approx(3.0)
+
+    def test_specs_with_same_weight_share_groupby(self, spark, nodes_df,
+            monkeypatch):
+        """Dos specs sin peso (mismo grupo) coexisten con nombres propios."""
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None, "aggregation": ["mean", "max"]},
+            {"name": "std_only", "weight": None, "aggregation": ["std"]},
+        ])
+        step = make_step(spark)
+        set_cached(step, "nodes_with_features", nodes_df)
+        set_cached(step, "feature_columns", ["feat"])
+        df = step._compute_level_features("numcliente")
+        assert {"mean_feat_ceps", "max_feat_ceps", "std_only_std_feat_ceps",
+                "node_count_ceps", "numcliente"} == set(df.columns)
+
+    def test_include_prefixes_restricts_features(self, spark, monkeypatch):
+        nodes = spark.createDataFrame(
+            [("n1", ["c1"], 1.0, 10.0), ("n2", ["c1"], 3.0, 20.0)],
+            ["id", "numcliente", "risk_x", "other_y"])
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None, "aggregation": "mean"},
+            {"name": "risk", "weight": None, "aggregation": ["max"],
+             "include_prefixes": ["risk_"]},
+        ])
+        step = make_step(spark)
+        set_cached(step, "nodes_with_features", nodes)
+        set_cached(step, "feature_columns", ["risk_x", "other_y"])
+        df = step._compute_level_features("numcliente")
+        # el spec "risk" solo agrega risk_*; el default agrega ambas
+        assert "risk_max_risk_x_ceps" in df.columns
+        assert "risk_max_other_y_ceps" not in df.columns
+        assert "risk_x_ceps" in df.columns and "other_y_ceps" in df.columns
+
+    def test_node_count_emitted_once(self, spark, nodes_df, monkeypatch):
+        monkeypatch.setattr(cvas, "AGGREGATION_SPECS", [
+            {"name": "", "weight": None, "aggregation": "mean"},
+            {"name": "mx", "weight": None, "aggregation": ["max"]},
+        ])
+        step = make_step(spark)
+        set_cached(step, "nodes_with_features", nodes_df)
+        set_cached(step, "feature_columns", ["feat"])
+        df = step._compute_level_features("numcliente")
+        assert df.columns.count("node_count_ceps") == 1
+
+    def test_empty_specs_raise(self, spark, nodes_df, monkeypatch):
+        from libs.functions.assembly import run_aggregation_specs
+        with pytest.raises(ValueError):
+            run_aggregation_specs(
+                nodes_df, group_column="id", feature_columns=["oper_mto"],
+                specs=[])
+
+
+# ----------------------------------------------------------------------------
+# NODE_TRANSFORMS (transformaciones a nivel nodo antes del agregado)
+# ----------------------------------------------------------------------------
+
+class TestNodeTransforms:
+    def _step_with_feature_source(self, spark, tmp_path, monkeypatch):
+        """Step con `nodes` base y una fuente de features `feat` por id."""
+        nodes = spark.createDataFrame(
+            [("n1", ["c1"], 10.0, "2025-08-01"),
+             ("n2", ["c1"], 30.0, "2025-08-01")],
+            ["id", "numcliente", "oper_mto", "information_date"])
+        feat_path = str(tmp_path / "feat_src")
+        spark.createDataFrame(
+            [("n1", 1.0), ("n2", 3.0)], ["id", "feat"]).write.parquet(feat_path)
+        monkeypatch.setattr(cvas, "FEATURE_SOURCES", {
+            "f": {"mode": "simple", "path": feat_path}})
+        monkeypatch.setattr(cvas, "NODE_WEIGHT_COLUMNS", ["oper_mto"])
+        monkeypatch.setattr(
+            cvas, "NODE_ID_ARRAY_COLUMNS", {"numcliente": "numcliente"})
+        monkeypatch.setattr(cvas, "AGGREGATION_LEVELS", ["numcliente"])
+        step = make_step(spark)
+        set_cached(step, "nodes", nodes)
+        return step
+
+    def test_sql_transform_adds_feature_column(self, spark, tmp_path,
+            monkeypatch):
+        monkeypatch.setattr(cvas, "NODE_TRANSFORMS", [
+            {"name": "double_feat", "expression": "feat * 2"}])
+        step = self._step_with_feature_source(spark, tmp_path, monkeypatch)
+        result = step.nodes_with_features
+        assert "double_feat" in result.columns
+        row = {r["id"]: r for r in result.collect()}["n2"]
+        assert row["double_feat"] == pytest.approx(6.0)
+        # la columna transformada entra sola a las features agregables
+        assert "double_feat" in step.feature_columns
+
+    def test_empty_transforms_is_noop(self, spark, tmp_path, monkeypatch):
+        monkeypatch.setattr(cvas, "NODE_TRANSFORMS", [])
+        step = self._step_with_feature_source(spark, tmp_path, monkeypatch)
+        assert "double_feat" not in step.nodes_with_features.columns
+        assert "tfrom_days" in step.nodes_with_features.columns
 
 
 # ----------------------------------------------------------------------------

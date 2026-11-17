@@ -77,6 +77,31 @@ FEATURE_AGGREGATION = {"default": ["weighted_mean", "median", "std", "mean"]}
 # por la vía directa. <= 1 -> groupBy directo de una etapa.
 ASSEMBLY_SALT_BUCKETS = 32
 
+# ---------------------------------------------------------------------------
+# Lista de transformaciones de agregación final (libs.functions.assembly
+# .run_aggregation_specs). Cada spec es un dict:
+#   - "name": prefijo de las columnas de salida; "" es el spec por defecto y
+#     conserva la convención histórica de nombres (back-compat). Con nombre,
+#     las columnas quedan `{name}_{funcion}_{feature}`.
+#   - "weight": Column de peso o None (peso uniforme). Las specs con el MISMO
+#     peso comparten un solo groupBy (una pasada de shuffle por peso).
+#   - "aggregation": str | lista | dict {"default", "<col>"} como
+#     FEATURE_AGGREGATION.
+#   - "include_prefixes" (opcional): limita las features del spec a las que
+#     empiezan por alguno de los prefijos.
+# TODAS las columnas de TODAS las specs se guardan en `{level}_features` y
+# entran al vector ensamblado. `node_count` se emite una sola vez.
+AGGREGATION_SPECS = [
+    # Spec por defecto: comportamiento histórico (columnas sin prefijo).
+    {"name": "", "weight": AGGREGATION_WEIGHT, "aggregation": FEATURE_AGGREGATION},
+]
+
+# Transformaciones extra a nivel nodo aplicadas sobre `nodes_with_features`
+# ANTES del agregado por nivel (libs: lista de {"name", "expression"}; la
+# expresión puede ser Column o SQL string evaluable con expr()). Vacío por
+# defecto. Ejemplo: {"name": "log_oper_mto", "expression": "log1p(oper_mto)"}.
+NODE_TRANSFORMS = []
+
 # Sufijo añadido a TODAS las variables de las tablas `{nivel}_features` (no a
 # la llave). "" lo desactiva.
 VARIABLE_SUFFIX = "_ceps"
@@ -86,7 +111,9 @@ EXCLUDE_COLUMNS = [
     "mis_date", "process_date", "vintage", "cohort",  # metadatos de partición/cohorte
     "seed_score",                                     # auxiliar de la propagación (semilla)
     # Columnas de grupo del step de clustering: identifican el grupo, no son features
-    "component_id", "scc",
+    # (grp_scc/grp_lp/grp_cc según SUBCLUSTER_METHOD; "scc" por back-compat con
+    # parquets antiguos)
+    "component_id", "scc", "grp_scc", "grp_lp", "grp_cc",
     # Nombres de partición-param del merge_schema de contagion: no son features
     "weight_type", "target_column", "max_iter", "alpha", "keep_seed_floor",
 ]

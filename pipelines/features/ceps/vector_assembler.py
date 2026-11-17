@@ -14,13 +14,13 @@ from typing import Dict, Any, List
 # ------------------------------------------------------------------------------
 from pyspark.sql import DataFrame
 
-from pyspark.sql.functions import col, countDistinct, max as spark_max
+from pyspark.sql.functions import col, countDistinct, max as spark_max, expr as spark_expr
 # ------------------------------------------------------------------------------
 # Custom
 # ------------------------------------------------------------------------------
 from libs.functions.assembly import (build_aggregation_expressions,
     explode_array_column, get_feature_columns, assemble_vector,
-    salted_assembly_groupby
+    salted_assembly_groupby, run_aggregation_specs
 )
 from libs.functions.missing_treatment import apply_missing_treatment
 
@@ -160,11 +160,21 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
         for table in self.feature_tables.values():
             nodes = nodes.join(table, on="id", how="left")
         #
-        return p_gm_sp.calculate_daily_tfrom(
+        nodes = p_gm_sp.calculate_daily_tfrom(
             df=nodes,
             current_date=str(self.input_parameters["vintage_date"]),
             date_column="information_date",
         )
+        #
+        # Transformaciones extra a nivel nodo (config NODE_TRANSFORMS): nuevas
+        # columnas derivadas ANTES del agregado por nivel; entran solas a
+        # `feature_columns`.
+        for transform in getattr(cvas, "NODE_TRANSFORMS", None) or []:
+            expression = transform["expression"]
+            if isinstance(expression, str):
+                expression = spark_expr(expression)
+            nodes = nodes.withColumn(transform["name"], expression)
+        return nodes
         #
     @ppf.cached_property
     def feature_columns(self) -> List[str]:
@@ -194,10 +204,13 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
     def _compute_level_features(self, level:str) -> DataFrame:
         """Agrega las features de nodo al nivel `level` (llave + variables).
 
-        Explode el array de ids del nivel sobre los nodos, aplica las
-        agregaciones de `FEATURE_AGGREGATION` (acepta varias funciones por
-        feature -> columnas `{funcion}_{feature}`) ponderadas por
-        `AGGREGATION_WEIGHT`, añade `node_count` y el `VARIABLE_SUFFIX`.
+        Explode el array de ids del nivel sobre los nodos y aplica la LISTA de
+        especificaciones de agregación `AGGREGATION_SPECS` (cada spec con su
+        nombre, peso y conjunto de funciones; las specs con el mismo peso
+        comparten un solo groupBy), añade `node_count` (una sola vez) y el
+        `VARIABLE_SUFFIX`. Sin `AGGREGATION_SPECS` en config se usa el spec por
+        defecto (`AGGREGATION_WEIGHT` + `FEATURE_AGGREGATION`), equivalente al
+        comportamiento histórico.
         """
         array_column = cvas.NODE_ID_ARRAY_COLUMNS[level]
         exploded = explode_array_column(
@@ -205,28 +218,18 @@ class LovelaceCepsAssemblerSubStep(p_f_va.StandardVectorAssemblerSubStep):
             column=array_column,
         ).withColumn(level, col(array_column).cast("string"))
         #
+        specs = getattr(cvas, "AGGREGATION_SPECS", None) or [
+            {"name": "", "weight": cvas.AGGREGATION_WEIGHT,
+             "aggregation": cvas.FEATURE_AGGREGATION}]
         salt_buckets = getattr(cvas, "ASSEMBLY_SALT_BUCKETS", 0)
-        if salt_buckets and salt_buckets > 1:
-            # Dos etapas con sal: una llave gigante (cliente/cuenta con miles
-            # de nodos) no concentra todo el shuffle en un reducer.
-            aggregated = salted_assembly_groupby(
-                exploded,
-                group_column=level,
-                feature_columns=self.feature_columns,
-                aggregation=cvas.FEATURE_AGGREGATION,
-                weight=cvas.AGGREGATION_WEIGHT,
-                salt_buckets=salt_buckets,
-                id_column="id",
-            )
-        else:
-            aggregations = build_aggregation_expressions(
-                self.feature_columns,
-                aggregation=cvas.FEATURE_AGGREGATION,
-                weight=cvas.AGGREGATION_WEIGHT,
-            )
-            aggregated = (exploded
-                .groupBy(level)
-                .agg(*(aggregations + [countDistinct("id").alias("node_count")])))
+        aggregated = run_aggregation_specs(
+            exploded,
+            group_column=level,
+            feature_columns=self.feature_columns,
+            specs=specs,
+            salt_buckets=salt_buckets,
+            id_column="id",
+        )
         return self._suffixed(aggregated, level)
         #
     def level_features_property(self, level:str):
