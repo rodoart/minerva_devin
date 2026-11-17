@@ -18,7 +18,7 @@ os.chdir(WORKSPACE)
 ven_zip_linux = os.environ['MINERVA_VENV_TAR_GZ_LINUX']
 ven_zip_hdfs = os.environ['MINERVA_VENV_TAR_GZ_HDFS']
 
-jar_linux = os.environ['GRAPHFRAMES_JAR']
+jar_linux = os.environ['MINERVA_GRAPHFRAMES_JAR_HDFS']
 
 # Custom libraries
 from libs.data_engineering_toolbox.context import SparkSessionBuilder
@@ -52,6 +52,9 @@ import pipelines.graph_making.ceps.edges_and_nodes as p_gm_en
 import pipelines.features.ceps.graph_features as p_f_cgf
 import pipelines.target_propagation.lovelace.special_treatment as p_tp_l_st
 import pipelines.features.ceps.target_propagation_features as p_f_tp
+import pipelines.features.ceps.risk_features as p_f_rf
+import pipelines.features.ceps.temporal_features as p_f_tf
+import pipelines.features.ceps.cluster_features as p_f_clf
 import pipelines.features.ceps.vector_assembler as p_f_va
 
 import libs.framework as fw
@@ -65,18 +68,33 @@ import config.graph_making.ceps.edges_and_nodes as ccgen
 import config.features.ceps.graph_features as cfgf
 import config.target_propagation.lovelace.special_treatment as ctp_l_st
 import config.features.ceps.target_propagation_features as cfcf
+import config.features.ceps.risk_features as crf
+import config.features.ceps.temporal_features as ctf
+import config.features.ceps.cluster_features as cclf
 import config.features.ceps.vector_assembler as cvas
+from config.graph_making.ceps.variants import DEFAULT_VARIANT
 
 
 for lib_ in [p_c_rnr, cj, ccrbr, fw, p_c_txn_rpl, cctr,
     p_gm_st, ccspt, p_gm_gb, ccgb, p_gm_gb_or, ccgen, p_gm_en, cfgf, p_f_cgf,
-    p_tp_l_st, ctp_l_st, cfcf, p_f_tp, p_f_va, cvas
+    p_tp_l_st, ctp_l_st, cfcf, p_f_tp, crf, p_f_rf, ctf, p_f_tf, cclf, p_f_clf,
+    p_f_va, cvas
 ]:
     reload(lib_)
 
 ##########################################################################
 # Pipeline Steps Initialization
 ##########################################################################
+
+# Este driver construye UNA cadena de la variante por defecto
+# (`DEFAULT_VARIANT = "rfc"`), usando los `input`/`output` module-level de
+# cada config (equivalentes a `build(DEFAULT_VARIANT)`). Para inspeccionar la
+# variante "cta" hay dos opciones:
+#   1. reconstruir los steps con `ccspt.build("cta")`, `ccgb.build("cta")`,
+#      ... y `variant="cta"` en cada step; o
+#   2. `from main import build_pipeline` → devuelve los steps terminales de
+#      TODAS las variantes de `ENABLED_VARIANTS` (comparten ranking,
+#      txn_replacement y el special treatment de Lovelace).
 
 ceps_rfs_nom_ranking_step = p_c_rnr.CepsRfcNomRankingStep(
     date_treatment=cj.date_treatment,
@@ -104,7 +122,9 @@ graph_special_treatment_step = p_gm_st.CepsSpecialTreatment(
     output_hive=ccspt.output,
     is_dynamic=True,
     cohort=cj.COHORT,
-    sqlContext=spark
+    sqlContext=spark,
+    previous_step=[ceps_txn_replacement_step],
+    variant=DEFAULT_VARIANT,
 )
 
 
@@ -115,7 +135,8 @@ graph_group_by_step = p_gm_gb.CepsGroupByStep(
     is_dynamic=True,
     cohort=cj.COHORT,
     sqlContext=spark,
-    previous_step=[graph_special_treatment_step]
+    previous_step=[graph_special_treatment_step],
+    variant=DEFAULT_VARIANT,
 )
 
 graph_edges_and_nodes_step = p_gm_en.CepsEdgesAndNodesStep(
@@ -155,7 +176,41 @@ target_propagation_features_step = p_f_tp.CepsTargetPropagationFeaturesStep(
     is_dynamic=True,
     cohort=cj.COHORT,
     sqlContext=spark,
-    previous_step=[target_propagation_step]
+    previous_step=[target_propagation_step],
+    variant=DEFAULT_VARIANT,
+)
+
+risk_features_step = p_f_rf.CepsRiskFeaturesStep(
+    date_treatment=cj.date_treatment,
+    input_hive=crf.input,
+    output_hive=crf.output,
+    is_dynamic=True,
+    cohort=cj.COHORT,
+    sqlContext=spark,
+    previous_step=[target_propagation_features_step],
+    variant=DEFAULT_VARIANT,
+)
+
+temporal_features_step = p_f_tf.CepsTemporalFeaturesStep(
+    date_treatment=cj.date_treatment,
+    input_hive=ctf.input,
+    output_hive=ctf.output,
+    is_dynamic=True,
+    cohort=cj.COHORT,
+    sqlContext=spark,
+    previous_step=[risk_features_step],
+    variant=DEFAULT_VARIANT,
+)
+
+cluster_features_step = p_f_clf.CepsClusterFeaturesStep(
+    date_treatment=cj.date_treatment,
+    input_hive=cclf.input,
+    output_hive=cclf.output,
+    is_dynamic=True,
+    cohort=cj.COHORT,
+    sqlContext=spark,
+    previous_step=[temporal_features_step],
+    variant=DEFAULT_VARIANT,
 )
 
 
@@ -190,7 +245,8 @@ vector_assembler_step = p_f_va.CepsVectorAssemblerStep(
     is_dynamic=True,
     cohort=cj.COHORT,
     sqlContext=spark,
-    previous_step=[target_propagation_features_step]
+    previous_step=[cluster_features_step],
+    variant=DEFAULT_VARIANT,
 )
 
 numcliente_features_vector = vector_assembler_step.lovelace_ceps_assembler_step.numcliente_features_vector[0]
@@ -201,8 +257,9 @@ numcliente_features_vector.show(10)
 # CLEANUP DE PARQUETS INTERMEDIOS
 #############################################################
 
-# Los outputs marcados "keep_or_delete": "delete" (edges_norm, checkpoint)
-# se pueden borrar una vez finalizado el flujo:
+# Los outputs marcados "keep_or_delete": "delete" (edges_norm, checkpoint,
+# subcluster_df, nodes_enriched...) se pueden borrar una vez finalizado el
+# flujo:
 #
 # deleted = vector_assembler_step.delete_tmp_paths()
 #

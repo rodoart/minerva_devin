@@ -2,11 +2,13 @@
 """main.py — Punto de entrada del pipeline Minerva.
 
 Ejecuta el flujo completo de extracción, features de grafo, propagación de
-target y VectorAssembler a nivel numcliente.
+target y VectorAssembler a nivel numcliente — una cadena por cada variante de
+grafo habilitada (`config.graph_making.ceps.variants.ENABLED_VARIANTS`).
 
 Requiere las variables de entorno:
     MINERVA_WORKSPACE_DIR_LINUX, PYSPARK_QUEUE, PYSPARK_PORT, MINERVA_NAME,
-    MINERVA_TODAY, MINERVA_VENV_TAR_GZ_LINUX, MINERVA_VENV_TAR_GZ_HDFS, GRAPHFRAMES_JAR
+    MINERVA_TODAY, MINERVA_VENV_TAR_GZ_LINUX, MINERVA_VENV_TAR_GZ_HDFS,
+    MINERVA_GRAPHFRAMES_JAR_HDFS
 
 Uso:
     python main.py [--level INFO] [--log-file run.log] [--build-only]
