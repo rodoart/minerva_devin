@@ -76,6 +76,14 @@ Todo está diseñado para reanudarse tras interrupciones del cluster:
 
 - `is_dynamic=True` en cada step → los decoradores `dynamic_*` **leen el
   parquet/partición existente si está** y solo recomputan si falta.
+- **Guardas anti-corrupción**: una escritura interrumpida deja datos
+  parciales; la recarga los detecta y recomputa en lugar de recargarlos:
+  - parquets simples: se exige el marcador `_SUCCESS` del job de escritura;
+  - tablas particionadas: cada partición escrita tiene un marcador vacío en
+    `<tabla>/_committed/<info>=<v>/<proc>=<v>`; las particiones sin marcador
+    se borran y recomputan. Las particiones escritas antes de esta guarda se
+    recomputan una vez (o se exceptúan con `"trust_legacy_partitions": True`
+    en el dict de config de esa tabla).
 - Los outputs **particionados** (`information_date_column`/`process_date_column`,
   típicamente `mis_date`/`process_date`) solo sobrescriben las particiones del
   vintage en curso; el resto de meses se conserva.
@@ -303,15 +311,20 @@ controla cuánta historia CEP alimenta los catálogos;
 cuánta historia transaccional conserva `rfc_curp_analysis_s264_ceps_replaced`.
 Son independientes.
 
-El **catálogo de imputación es all-time incremental**
-(`s264_ceps_flattened_monthly` + `s264_ceps_flattened_groupby_monthly`,
-`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`): cada corrida solo calcula los meses
-faltantes del vintage y los combina con los parciales ya guardados
+El **catálogo de imputación es all-time incremental** y vive en una **raíz
+fija compartida entre vintages** (`general_root_hdfs_fixed` en
+`config/job.py`): `s264_ceps_flattened_monthly` +
+`s264_ceps_flattened_groupby_monthly` (`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`).
+Cada corrida solo calcula los meses faltantes del vintage
 (`ensure_monthly_partitions` + `combine_ceps_groupby`), de modo que el mes a
-mes solo escribe el incremento. Dentro de una misma llave de imputación, a
-igual validez gana el tag **más antiguo** (`PREFER_OLDEST_VALID_TAG = True`,
-ventana por `fst_fec_informacion_hora_oper`): un RFC/CURP viejo y válido tiene
-prioridad sobre uno nuevo.
+mes solo escribe el incremento. Las lecturas están acotadas por la ventana
+del vintage, así que ejecutar un vintage viejo tras uno nuevo en la misma
+ubicación no toma información del futuro; las vistas por vintage (groupby,
+ranks, cases_replace) siguen bajo la raíz del vintage. Dentro de una misma
+llave de imputación, a igual validez gana el tag **más antiguo**
+(`PREFER_OLDEST_VALID_TAG = True`, ventana por
+`fst_fec_informacion_hora_oper`): un RFC/CURP viejo y válido tiene prioridad
+sobre uno nuevo.
 
 ### Variantes de grafo (`config/graph_making/ceps/variants.py`)
 

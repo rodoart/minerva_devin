@@ -91,7 +91,11 @@ Dos ventanas de historia **independientes**:
 ### Catálogo de imputación all-time e incremental
 
 La ventana de 24 meses (`CEPS_RANKING_HISTORY_IN_MONTHS`) controla solo la
-**lectura cruda**; los parciales aplanados/agrupados son **all-time**:
+**lectura cruda**; los parciales aplanados/agrupados son **all-time** y viven
+en una **raíz fija compartida entre vintages**
+(`config/job.py::general_root_hdfs_fixed` → `.../ceps_history/all_time/`,
+sin el segmento del vintage — si vivieran bajo la raíz del vintage no
+acumularían nada entre corridas):
 
 - `s264_ceps_flattened_monthly` y `s264_ceps_flattened_groupby_monthly` se
   guardan por `month_partition` con `CEPS_ALL_TIME_HISTORY_MONTHS = 1200` al
@@ -99,11 +103,31 @@ La ventana de 24 meses (`CEPS_RANKING_HISTORY_IN_MONTHS`) controla solo la
   (`ensure_monthly_partitions`) y recombinan los parciales ya guardados
   (`combine_ceps_groupby`): mes a mes solo se escribe el incremento, no se
   recalcula la historia.
-- `s264_ceps_flattened_groupby` (el catálogo que rankea) se obtiene
-  recombinando todas las parciales, así la imputación se construye con
-  información desde el principio de los tiempos.
+- Los meses esperados se derivan de las particiones de la fuente **acotadas
+  al vintage** (`s264_available_months` corta en `vintage - lag`) y las
+  lecturas usan la ventana del vintage: un vintage VIEJO ejecutado tras uno
+  nuevo en la misma ubicación no ve los meses de su futuro (testeado en
+  `tests/test_reload_resilience.py`).
+- Las **vistas por vintage** (`s264_ceps_flattened_groupby`, `_ranks`,
+  `cases_replace`, `rfc_curp_analysis_s264_ceps_replaced`) SIGUEN bajo la
+  raíz del vintage: codifican "el mundo conocido a ese vintage" y no deben
+  compartirse entre corridas de vintages distintos.
 - La antigua salida `s264_ceps_flattened` (ventana corta) ya no se
   materializa.
+
+### Marcadores de commit (anti-corrupción tras interrupciones)
+
+Si el proceso muere a mitad de una escritura, la partición queda con archivos
+parciales y un `_SUCCESS` raíz obsoleto de la escritura anterior: una recarga
+la leería corrupta sin error. Para evitarlo, toda escritura exitosa crea un
+marcador vacío `<tabla>/_committed/<info_col>=<v>/<process_date=<v>` y la
+recarga **solo confía en particiones con marcador** — las que no lo tienen se
+borran y recomputan (`libs/framework`: `write_commit_marker`,
+`is_pair_committed`, usados por `dynamic_partitioned_table_or_parquet` y
+`ensure_monthly_partitions`). Para parquets simples basta exigir `_SUCCESS`
+(`_reload_or_recompute_parquet`). Migración: las particiones preexistentes
+sin marcador se recomputan una vez; si una tabla no puede permitirse ese
+recomputo, su config acepta `"trust_legacy_partitions": True`.
 
 ### Salida `mapeo_cta_numcliente`
 

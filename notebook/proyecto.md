@@ -447,11 +447,30 @@ Inventario completo de preguntas/features: `notebook/preguntas_grafo.md`.
 ### 10.2 Catálogo de imputación all-time + prioridad al tag viejo válido
 
 - `s264_ceps_flattened_monthly` / `s264_ceps_flattened_groupby_monthly`:
-  parciales **all-time** (`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`);
+  parciales **all-time** (`CEPS_ALL_TIME_HISTORY_MONTHS = 1200`) en una
+  **raíz fija** (`general_root_hdfs_fixed`, sin el segmento del vintage);
   `ensure_monthly_partitions` solo computa los meses faltantes y
   `combine_ceps_groupby` recombina — mes a mes solo se escribe el incremento.
+  Las lecturas se acotan al vintage (un vintage viejo no ve su futuro); las
+  vistas por vintage siguen bajo la raíz del vintage.
 - `PREFER_OLDEST_VALID_TAG = True` + columna `fst_fec_informacion_hora_oper`:
   a igual validez, las ventanas de ranking premian el RFC/CURP más antiguo.
+
+### 10.2b Recargas a prueba de interrupciones (marcadores de commit)
+
+- `_reload_or_recompute_parquet` (parquets simples) exige el marcador
+  `_SUCCESS`: un parquet a medias se recomputa en vez de leerse corrupto.
+- Las salidas particionadas escriben un marcador vacío por partición en
+  `<tabla>/_committed/...` tras cada escritura exitosa
+  (`write_commit_marker`); la recarga solo confía en particiones con
+  marcador — las que no lo tienen se borran y recomputan
+  (`dynamic_partitioned_table_or_parquet` y `ensure_monthly_partitions`).
+  Escape hatch por tabla: `"trust_legacy_partitions": True`.
+- El discovery de particiones (`get_partitions_from_parquet_path`) ignora
+  directorios no-partición (`_committed`, `_temporary`, `.sparkStaging`).
+- Tests: `tests/test_reload_resilience.py` (escrituras a medias,
+  idempotencia de corridas repetidas en el mismo lugar, vintage viejo tras
+  vintage nuevo sin fuga de futuro).
 
 ### 10.3 Agregación final como lista de transformaciones
 

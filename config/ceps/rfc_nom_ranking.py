@@ -151,6 +151,17 @@ RFC_BY_NOM_PRIORITY_WINDOW = (Window.partitionBy("nom")  # un ranking independie
 _general_root_hdfs = HivePath(str(job_config["general_root_hdfs"]))
 current_hdfs = _general_root_hdfs.joinpath("ceps/rfc_nom_raking")
 
+# Raíz FIJA (sin vintage) para las tablas acumulativas all-time
+# (`s264_ceps_flattened_monthly` y `s264_ceps_flattened_groupby_monthly`): la
+# incrementalidad mes a mes exige que TODOS los vintages lean/escriban las
+# mismas particiones mensuales. Las lecturas están acotadas por la ventana del
+# vintage (history/lag), así que un vintage viejo nunca ve meses de su futuro
+# aunque comparta la ubicación con vintages más nuevos. El resto de salidas
+# (rfc_curp_analysis, groupby, ranks, cases_replace) son vistas del mundo a un
+# vintage y SIGUEN bajo la raíz del vintage.
+_fixed_hdfs = HivePath(str(job_config["general_root_hdfs_fixed"]))
+fixed_hdfs = _fixed_hdfs.joinpath("ceps/rfc_nom_raking")
+
 
 # ---------------------------------------------------------------------------
 # INPUTS: fuentes que lee el step. Cada entrada describe UNA fuente
@@ -219,7 +230,7 @@ output = {
 # de la fuente que aún no tienen partición (ensure_monthly_partitions).
 # Reemplaza a la antigua salida "s264_ceps_flattened" (ventana de 3 meses
 # recomputada en cada corrida), que ya no se materializa.
-"s264_ceps_flattened_monthly": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_monthly"),
+"s264_ceps_flattened_monthly": {"table_or_hdfs": fixed_hdfs.joinpath("s264_ceps_flattened_monthly"),  # raíz FIJA compartida entre vintages (all-time incremental)
 "information_date_column": "mis_date",      # columna-partición de fecha de información (yyyy-MM-01)
 "process_date_column": "process_date",      # columna-partición de fecha de carga
 "lag": 0,                                   # sin desfase sobre vintage
@@ -231,7 +242,7 @@ output = {
 # flags). Los parciales son combinables (combine_ceps_groupby): el agregado
 # all-time de s264_ceps_flattened_groupby se obtiene recombinando parciales
 # sin releer la historia cruda.
-"s264_ceps_flattened_groupby_monthly": {"table_or_hdfs": current_hdfs.joinpath("s264_ceps_flattened_groupby_monthly"),
+"s264_ceps_flattened_groupby_monthly": {"table_or_hdfs": fixed_hdfs.joinpath("s264_ceps_flattened_groupby_monthly"),  # raíz FIJA compartida entre vintages (all-time incremental)
 "information_date_column": "mis_date",      # columna-partición de fecha de información (yyyy-MM-01)
 "process_date_column": "process_date",      # columna-partición de fecha de carga
 "lag": 0,                                   # sin desfase sobre vintage

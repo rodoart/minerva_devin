@@ -39,6 +39,14 @@ date_treatment = {  # paquete de fechas que cada Step recibe como input_paramete
 
 sbx = {  # configuración del job para la cohorte SBX; los módulos config.* la importan como job_config
 "general_root_hdfs": HivePath(f"/data/gcprcmsbx/work/hive/gcprcmsbx_work/rg49392/minerva/ceps_history/{vintage}"),  # raíz HDFS de TODAS las salidas del pipeline para este vintage
+# Raíz FIJA (sin vintage) para las tablas acumulativas all-time: las
+# particiones mensuales deben compartirse entre vintages para que la
+# incrementalidad funcione mes a mes (cada corrida solo computa los meses
+# nuevos; ver ensure_monthly_partitions). Todo lo que sea una VISTA del
+# mundo a un vintage (groupby, ranks, cases_replace, grafo, features) sigue
+# bajo `general_root_hdfs` (cambiando con el vintage) — así un vintage viejo
+# nunca recarga salidas computadas con información de su futuro.
+"general_root_hdfs_fixed": HivePath("/data/gcprcmsbx/work/hive/gcprcmsbx_work/rg49392/minerva/ceps_history/all_time"),
 "main_lag_months": MAIN_LAG_IN_MONTHS,  # lag principal en meses (meses de desfase entre ejecución y corte de datos)
 "is_dynamic": IS_DYNAMIC,               # flag de modo dinámico: reutilizar outputs persistidos vs recomputar
 "cohort": COHORT                        # cohorte/entorno de ejecución

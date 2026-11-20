@@ -313,10 +313,18 @@ class Step:
 
 
 def _reload_or_recompute_parquet(self, func: Callable, path: HivePath, label: str) -> DataFrame:
-    """Lee `path` como parquet si `is_dynamic`; si falla, ejecuta `func` y lo guarda."""
+    """Lee `path` como parquet si `is_dynamic`; si falla, ejecuta `func` y lo guarda.
+
+    Guarda anti-corrupción: un parquet SIN marcador `_SUCCESS` es residuo de
+    una escritura interrumpida (el proceso murió a mitad del job) y leerlo
+    devolvería datos parciales sin error — se trata como ausente y se
+    recomputa.
+    """
     try:
         if not self.is_dynamic:
             raise Exception
+        if not _path_exists(HivePath(str(path)).joinpath("_SUCCESS")):
+            raise Exception(f"{path} no tiene marcador _SUCCESS (escritura incompleta)")
         result = self.sqlContext.read.parquet(str(path))
         logger.info("%s data reloaded from %s", label.capitalize(), path)
     except Exception as e:
@@ -334,7 +342,10 @@ def dynamic_unpartitioned_parquet_with_path(path: Union[str, HivePath]) -> Calla
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(self) -> DataFrame:
-            path_key = str(path).split("/")[-2] + "-" + str(path).split("/")[-1]
+            # Etiqueta a partir de los dos últimos segmentos del path;
+            # normaliza separadores para funcionar también con rutas Windows.
+            segments = [s for s in str(path).replace("\\", "/").split("/") if s]
+            path_key = "-".join(segments[-2:]) if segments else "parquet"
             return _reload_or_recompute_parquet(self, func, path, path_key)
         return wrapper
     return decorator
@@ -359,6 +370,151 @@ def dynamic_unpartitioned_parquet(path_key: str) -> Callable:
             return _reload_or_recompute_parquet(self, func, path, path_key)
         return wrapper
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# Marcadores de commit por partición (anti-corrupción tras interrupciones)
+# ---------------------------------------------------------------------------
+#
+# Las escrituras particionadas se hacen como "borra particiones + append"
+# (overwrite_two_partition / overwrite_partition). Si el proceso muere a mitad
+# del job, el directorio de la partición queda con archivos PARCIALES y un
+# `_SUCCESS` raíz obsoleto de la escritura anterior: una recarga posterior
+# leería datos corruptos sin ningún error. Para distinguir una partición
+# completa de una a medias, tras cada escritura exitosa se crea un archivo
+# vacío de commit:
+#
+#   <tabla>/_committed/<info_col>=<valor>[/<proc_col>=<valor>]
+#
+# En la recarga solo se confía en las particiones con marcador; las que no lo
+# tienen se recomputan (su escritura las borra y reescribe completas).
+# NOTA de migración: las particiones escritas ANTES de introducir los
+# marcadores no lo tienen, así que la primera corrida tras el despliegue las
+# recomputa una vez y las marca. Para tablas donde ese recomputo no sea
+# aceptable, el dict de config acepta `"trust_legacy_partitions": True` para
+# desactivar la validación en ESA tabla.
+
+COMMIT_MARKER_DIR = "_committed"
+
+
+def _path_exists(path: Union[str, HivePath]) -> bool:
+    """exists() que funciona en HDFS y en filesystem local.
+
+    `HivePath.exists` usa el CLI de HDFS y traga los errores devolviendo
+    False (ver `hdfs.test`); en ejecuciones locales (tests, local_flow_check)
+    el path no está en HDFS, así que se comprueba también el filesystem local.
+    """
+    try:
+        if HivePath(str(path)).exists():
+            return True
+    except Exception:
+        pass
+    return Path(str(path)).exists()
+
+
+def _sanitize_marker_value(value: Any) -> str:
+    """Valor de partición como nombre de directorio seguro para el marcador."""
+    return str(value).replace("/", "-").replace("\\", "-")
+
+
+def commit_marker_path(
+    table_or_hdfs: Union[str, HivePath],
+    information_date_column: str,
+    information_date: Any,
+    process_date_column: Optional[str] = None,
+    process_date: Any = None,
+) -> HivePath:
+    """Ruta del marcador de commit de una partición (info[, proceso])."""
+    base = HivePath(str(table_or_hdfs)).joinpath(COMMIT_MARKER_DIR)
+    marker = base.joinpath(
+        f"{information_date_column}={_sanitize_marker_value(information_date)}")
+    if process_date_column is not None:
+        marker = marker.joinpath(
+            f"{process_date_column}={_sanitize_marker_value(process_date)}")
+    return marker
+
+
+def write_commit_marker(
+    table_or_hdfs: Union[str, HivePath],
+    information_date_column: str,
+    information_date: Any,
+    process_date_column: Optional[str] = None,
+    process_date: Any = None,
+) -> None:
+    """Crea (vacío) el marcador de commit de una partición ya escrita."""
+    marker = commit_marker_path(table_or_hdfs, information_date_column,
+        information_date, process_date_column, process_date)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    except Exception:
+        # fallback a filesystem local (ejecuciones sin HDFS: tests, local_flow)
+        local_marker = Path(str(marker))
+        local_marker.parent.mkdir(parents=True, exist_ok=True)
+        local_marker.touch()
+
+
+def is_pair_committed(
+    table_or_hdfs: Union[str, HivePath],
+    information_date_column: str,
+    information_date: Any,
+    process_date_column: Optional[str] = None,
+    process_date: Any = None,
+    trust_legacy: bool = False,
+) -> bool:
+    """True si la partición (info[, proceso]) tiene marcador de commit.
+
+    Con `trust_legacy=True` (config `trust_legacy_partitions`) se confía en
+    particiones sin marcador — escape para tablas históricas cuyo recomputo
+    no sea aceptable.
+    """
+    if trust_legacy:
+        return True
+    return _path_exists(commit_marker_path(table_or_hdfs, information_date_column,
+        information_date, process_date_column, process_date))
+
+
+def _committed_sorted_pairs(
+    table_or_hdfs: Union[str, HivePath],
+    information_date_column: str,
+    process_date_column: Optional[str],
+    sorted_pairs: List[Any],
+    trust_legacy: bool = False,
+) -> List[List[Tuple[Any, Any]]]:
+    """Filtra `sorted_pairs` del loader dejando solo pares con commit marker."""
+    committed: List[List[Tuple[Any, Any]]] = []
+    for pairs in sorted_pairs:
+        kept = [
+            (information_date, process_date)
+            for (information_date, process_date) in pairs
+            if is_pair_committed(table_or_hdfs, information_date_column,
+                information_date, process_date_column, process_date,
+                trust_legacy=trust_legacy)
+        ]
+        if kept:
+            committed.append(kept)
+    return committed
+
+
+def _delete_partition_dir(
+    table_or_hdfs: Union[str, HivePath],
+    information_date_column: str,
+    information_date: Any,
+    process_date_column: Optional[str] = None,
+    process_date: Any = None,
+) -> None:
+    """Borra el directorio de una partición (info[, proceso]) incompleta."""
+    partition_dir = HivePath(str(table_or_hdfs)).joinpath(
+        f"{information_date_column}={_sanitize_marker_value(information_date)}")
+    if process_date_column is not None:
+        partition_dir = partition_dir.joinpath(
+            f"{process_date_column}={_sanitize_marker_value(process_date)}")
+    if _path_exists(partition_dir):
+        try:
+            partition_dir.rmdir(recursive=True, skip_trash=True)
+        except Exception:
+            # fallback a filesystem local (ejecuciones sin HDFS)
+            shutil.rmtree(str(partition_dir), ignore_errors=True)
 
 
 def _partition_load_kwargs(config: Dict[str, Any], input_parameters: Dict[str, Any]) -> Dict[str, Any]:
@@ -425,6 +581,11 @@ def _compute_and_overwrite_partition(
             session=self.sqlContext
         )
     overwrite_object.write()
+    # Marcador de commit: solo existe si el job de escritura terminó. Sin él,
+    # la recarga trataría la partición (posiblemente a medias) como válida.
+    write_commit_marker(
+        table_or_hdfs, information_date_column, vintage_date,
+        process_date_column, process_date)
     result = overwrite_object.read()
     logger.info("%s data saved on %s", path_key.capitalize(), table_or_hdfs)
     return result
@@ -458,6 +619,32 @@ def dynamic_partitioned_table_or_parquet(path_key: str) -> Callable:
                     session=self.sqlContext, **load_object_kwargs
                 )
                 result = load_object.df
+                # Guarda anti-corrupción: solo se confía en particiones con
+                # marcador de commit; una partición escrita a medias (proceso
+                # interrumpido) se BORRA (es corrupta por definición) y fuerza
+                # recomputo del vintage en curso en lugar de recargarse.
+                trust_legacy = output_hive[path_key].get("trust_legacy_partitions", False)
+                uncommitted = [
+                    (info, proc)
+                    for pairs in load_object.sorted_pairs
+                    for (info, proc) in pairs
+                    if not is_pair_committed(
+                        table_or_hdfs, load_object_kwargs["information_date_column"],
+                        info, load_object_kwargs["process_date_column"], proc,
+                        trust_legacy=trust_legacy)
+                ]
+                if uncommitted:
+                    logger.warning(
+                        "%s: deleting incomplete partitions (no commit "
+                        "marker): %s", path_key, uncommitted)
+                    for info, proc in uncommitted:
+                        _delete_partition_dir(
+                            table_or_hdfs,
+                            load_object_kwargs["information_date_column"], info,
+                            load_object_kwargs["process_date_column"], proc)
+                    raise Exception(
+                        f"particiones sin marcador de commit borradas "
+                        f"(escritura interrumpida o legacy): {uncommitted}")
                 logger.info("%s data reloaded from %s", path_key.capitalize(), table_or_hdfs)
             except Exception as e:
                 logger.warning("Could not load %s from %s due to %s. Recomputing...", path_key, table_or_hdfs, e)
@@ -569,9 +756,17 @@ def ensure_monthly_partitions(
             load_object = SparkLoadPartitionedTableOrParquet(
                 session=step.sqlContext, **load_kwargs)
             load_object.df   # fuerza la resolución de las particiones existentes
+            # Guarda anti-corrupción: un mes solo cuenta como presente si su
+            # partición seleccionada tiene marcador de commit; una escritura
+            # interrumpida deja la partición a medias y sin marcador, así que
+            # el mes se recomputa en lugar de recargarse corrupto.
+            committed_pairs = _committed_sorted_pairs(
+                table_or_hdfs, information_date_column, process_date_column,
+                load_object.sorted_pairs,
+                trust_legacy=config.get("trust_legacy_partitions", False))
             present_months = {
                 information_date.strftime("%Y-%m")
-                for pairs in load_object.sorted_pairs
+                for pairs in committed_pairs
                 for (information_date, _) in pairs
             }
             logger.info("%s: monthly partitions found for %s",
@@ -605,6 +800,17 @@ def ensure_monthly_partitions(
                     table_or_hdfs=table_or_hdfs,
                     session=step.sqlContext
                 ).write()
+            # Marcadores de commit de las particiones recién escritas: sin
+            # ellos, una interrupción a mitad dejaría meses parciales que la
+            # próxima corrida recargaría como si estuvieran completos.
+            process_date_value = (step.input_parameters["process_date"]
+                if process_date_column is not None else None)
+            written_values = [row[0] for row in
+                new_df.select(information_date_column).distinct().collect()]
+            for written_value in written_values:
+                write_commit_marker(
+                    table_or_hdfs, information_date_column, written_value,
+                    process_date_column, process_date_value)
             load_object = None   # hubo escrituras: hay que releer
             logger.info("%s monthly partitions written in %s",
                 path_key, table_or_hdfs)

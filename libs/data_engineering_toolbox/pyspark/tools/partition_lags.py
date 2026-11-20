@@ -38,6 +38,16 @@ def get_partitions_from_parquet_path(parquet_hdfs: Union[HivePath, str], session
     partition_hdfss = list(parquet_hdfs.listdirs(recursive=True))
     relatives = [str(partition_hdfs.relative_to(parquet_hdfs)).split("/") for partition_hdfs in partition_hdfss]
     #
+    # Ignorar directorios que no son particiones: convención Spark/Hadoop —
+    # todo lo que empieza con "_" o "." (`_temporary` de escrituras
+    # interrumpidas, `_committed` de marcadores de commit, `.sparkStaging`)
+    # no es dato y rompería el parseo clave=valor.
+    relatives = [
+        relative for relative in relatives
+        if all("=" in segment and not segment.startswith(("_", "."))
+               for segment in relative)
+    ]
+    #
     # Caso para archivos no particionados
     if relatives == []:
         return []
